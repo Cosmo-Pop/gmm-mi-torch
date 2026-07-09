@@ -48,7 +48,9 @@ Z = rng.normal(2.0 * Y, 1.0)
 mi_mean, mi_std = estimate_categorical(Z, Y, max_components=3)
 ```
 
-The full hyperparameter set (selection protocols `'batched'`/`'sequential'`, `metric_method='valid'/'aic'/'bic'`, init types, `preprocess='gaussianise'`, `fixed_components_number`, chunking knobs, …) is documented in the `estimate` and `estimate_categorical` docstrings; parameter names follow GMM-MI where a counterpart exists (`reg_covar`, `threshold_fit`, `threshold_components`, `max_components`, …).
+The full hyperparameter set (selection protocols `'batched'`/`'sequential'`, `metric_method='valid'/'aic'/'bic'`, init types, `preprocess='gaussianise'`, `fixed_components_number`, chunking knobs, …) is documented in the `estimate` and `estimate_categorical` docstrings; parameter names follow GMM-MI where a counterpart exists (`reg_covar`, `threshold_fit`, `threshold_components`, `max_components`, …). `estimate(..., return_fit=True)` additionally returns the selected model for inspection and plotting (`gmm_mi_torch.plotting` has the fitted-ellipse and data-vs-model contour helpers used in the walkthrough).
+
+For a guided tour — including the common pitfalls (thresholds, initialisations, hard-boundary data) and how to diagnose them — see [notebooks/walkthrough_and_pitfalls.ipynb](notebooks/walkthrough_and_pitfalls.ipynb), adapted from Davide Piras's GMM-MI walkthrough.
 
 ## Performance
 
@@ -77,6 +79,8 @@ The [validation/](validation/) directory contains the full validation and benchm
 ## License and attribution
 
 This is a port of [GMM-MI](https://github.com/dpiras/GMM-MI) by Davide Piras, Hiranya V. Peiris, Andrew Pontzen, Luisa Lucie-Smith, Ningyuan Guo and Brian Nord, and mirrors its licensing: GPL-3.0 ([LICENSE](LICENSE)) with upstream's non-commercial use condition ([LICENSE_EXT.txt](LICENSE_EXT.txt)). Review before making this repository public.
+
+The walkthrough notebook and the plotting utilities (`gmm_mi_torch/plotting.py`) are forked from GMM-MI originals by Davide Piras, imported into this repository together with their upstream commit history — his authorship of that material is recorded in the git log — and then adapted to the `gmm-mi-torch` API here.
 
 If you use this code, please cite the GMM-MI paper:
 
