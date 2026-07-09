@@ -1,0 +1,264 @@
+--- torch_gmm_mi_shipped.py	2026-07-05 12:20:05.658615257 +0100
++++ torch_gmm_mi.py	2026-07-05 11:12:14.161270558 +0100
+@@ -28,6 +28,12 @@
+ 
+ LOG2PI = math.log(2.0 * math.pi)
+ 
++# torch.multinomial caps the number of categories at 2**24; above this the
++# uniform bootstrap resample falls back to a randint histogram (identically
++# distributed for uniform probabilities).  Hoisted to a module constant so the
++# fallback branch can be exercised at small N by monkeypatching it down.
++_MULTINOMIAL_MAX_CATEGORIES = 1 << 24
++
+ 
+ # ----------------------------------------------------------------------
+ # batched Gaussian machinery
+@@ -876,7 +882,7 @@
+     B = max(n_bootstrap, 1)
+     g = torch.Generator(device=X.device).manual_seed(seed + 10_000)
+     if n_bootstrap >= 1:
+-        if N <= (1 << 24):
++        if N <= _MULTINOMIAL_MAX_CATEGORIES:
+             s = torch.multinomial(
+                 torch.full((B, N), 1.0 / N, dtype=X.dtype, device=X.device),
+                 N, replacement=True, generator=g)
+--- test_torch_gmm_mi_shipped.py	2026-07-05 12:20:05.659627148 +0100
++++ test_torch_gmm_mi.py	2026-07-05 12:18:11.583060297 +0100
+@@ -1,7 +1,13 @@
+ """Tests for the torch GMM-MI port, following the conventions of
+ gmm_mi/tests/test_sample.py (analytic targets, sigma-band assertions)."""
+ 
++import os
++
+ import numpy as np
++import pytest
++import torch
++
++import torch_gmm_mi
+ from torch_gmm_mi import estimate, estimate_categorical
+ 
+ SIGMAS = 3
+@@ -196,3 +202,223 @@
+     mi_mean, mi_std = estimate_categorical(X, Y, max_components=3)
+     assert (mi_target >= mi_mean - SIGMAS * mi_std) and \
+            (mi_target <= mi_mean + SIGMAS * mi_std)
++
++
++# ----------------------------------------------------------------------
++# extended suite (added tests; the 12 above and their tolerances unchanged)
++# ----------------------------------------------------------------------
++
++def test_MI_sequential_analytic():
++    # analytic Gaussian MI, but selected via GMM-MI's original sequential
++    # (increment-k, threshold + patience early-stop) protocol
++    rho = 0.6
++    cov = np.array([[1.0, rho], [rho, 1.0]])
++    rng = np.random.default_rng(0)
++    X = rng.multivariate_normal([0, 0], cov, 10000)
++    analytic_mi = -0.5 * np.log(1 - rho ** 2)
++    mi_mean, mi_std = estimate(X, 'MI', protocol='sequential', max_components=3)
++    assert (analytic_mi >= mi_mean - SIGMAS * mi_std) and \
++           (analytic_mi <= mi_mean + SIGMAS * mi_std)
++
++
++def test_sequential_early_stop_k_regression():
++    # regression pinning the k the sequential early-stop returns on the
++    # 3-component data. This pins observed behaviour (identical on CPU fp64
++    # and CUDA fp32); it does NOT assert the returned k is "correct".
++    X = _three_component_data()
++    _, _, k = estimate(X, 'MI', protocol='sequential', max_components=6,
++                       return_k=True)
++    assert k == 3
++
++
++def test_cMI_dependent_conditioner():
++    # trivariate unit-variance Gaussian with rho_XY=0.5, rho_XZ=0.6,
++    # rho_YZ=0.4; here the conditioner Z is dependent on both X and Y, so
++    # conditioning genuinely changes the association. Targets are the analytic
++    # Gaussian values (pinned, used as given, not re-derived here):
++    #   I(X;Y|Z) = 0.0671910473 nats,  I(X;Y) = 0.1438410362 nats.
++    rho_xy, rho_xz, rho_yz = 0.5, 0.6, 0.4
++    cov = np.array([[1.0, rho_xy, rho_xz],
++                    [rho_xy, 1.0, rho_yz],
++                    [rho_xz, rho_yz, 1.0]])
++    rng = np.random.default_rng(11)
++    X = rng.multivariate_normal([0, 0, 0], cov, 10000)
++    cmi_target, mi_target = 0.0671910473, 0.1438410362
++    cmi_mean, cmi_std = estimate(X, 'cMI', protocol='batched', max_components=3)
++    assert (cmi_target >= cmi_mean - SIGMAS * cmi_std) and \
++           (cmi_target <= cmi_mean + SIGMAS * cmi_std)
++    mi_mean, mi_std = estimate(X[:, :2], 'MI', protocol='batched',
++                               max_components=3)
++    assert (mi_target >= mi_mean - SIGMAS * mi_std) and \
++           (mi_target <= mi_mean + SIGMAS * mi_std)
++
++
++def test_TC_multimodal_vs_MC_target():
++    # total correlation of a genuinely multimodal 3-variable mixture: three
++    # asymmetric, non-collinear components with distinct anisotropic
++    # covariances. This is fit under the DEFAULT responsibility init (as in
++    # test_aic_bic_select_sensible_k), with metric_method='bic' selecting the
++    # true k=3; a collinear/isotropic well-separated layout would instead
++    # defeat the default init and collapse to k=1. Target is the population TC
++    # of the true model, from Monte Carlo at standard error ~1.4e-4 (pinned
++    # ground truth, drawn from the true model, used as given):
++    TC_TARGET = 1.092080
++    weights = np.array([0.3, 0.4, 0.3])
++    means = np.array([[-2.0, -2.0, -1.0],
++                      [0.0, 1.5, 2.0],
++                      [2.5, -1.0, -1.5]])
++    covs = np.array([[[1.0, 0.5, 0.2], [0.5, 1.0, 0.3], [0.2, 0.3, 0.8]],
++                     [[0.6, -0.2, 0.1], [-0.2, 0.7, -0.3], [0.1, -0.3, 0.9]],
++                     [[0.9, 0.4, -0.2], [0.4, 0.8, 0.2], [-0.2, 0.2, 0.7]]])
++    rng = np.random.default_rng(9)
++    counts = rng.multinomial(12000, weights)
++    X = np.concatenate([rng.multivariate_normal(means[c], covs[c], counts[c])
++                        for c in range(3)])
++    rng.shuffle(X)
++    tc_mean, tc_std = estimate(X, 'TC', protocol='batched', max_components=6,
++                               metric_method='bic')
++    assert (TC_TARGET >= tc_mean - SIGMAS * tc_std) and \
++           (TC_TARGET <= tc_mean + SIGMAS * tc_std)
++
++
++def test_KL_nongaussian_marginals_vs_quadrature():
++    # KL between the two 1D marginals of the suite's asymmetric 3-component
++    # data; each marginal is itself a genuine 3-mode (non-Gaussian) mixture.
++    # Fit under the DEFAULT responsibility init with metric_method='bic'
++    # selecting k=3. Targets are the true-marginal KLs from 1D quadrature to
++    # 7 sig figs (pinned, used as given):
++    #   KL[p(x0)||p(x1)] = 0.1725434 nats, KL[p(x1)||p(x0)] = 0.1309184 nats.
++    X = _three_component_data()
++    for quantity, target in (('KL_forward', 0.1725434),
++                             ('KL_reverse', 0.1309184)):
++        kl_mean, kl_std = estimate(X, quantity, protocol='batched',
++                                   max_components=6, metric_method='bic')
++        assert (target >= kl_mean - SIGMAS * kl_std) and \
++               (target <= kl_mean + SIGMAS * kl_std), quantity
++
++
++def test_nchunk_parity_fp64():
++    # sample-dimension chunking must reproduce the single-pass path to
++    # floating-point reduction order (ulp-level at fp64). Forced to fp64
++    # regardless of the harness dtype, with a tight absolute tolerance;
++    # device follows the harness so parity is checked on CPU and CUDA.
++    rng = np.random.default_rng(0)
++    cov = np.array([[1.0, 0.6], [0.6, 1.0]])
++    X = rng.multivariate_normal([0, 0], cov, 4000)
++    common = dict(protocol='batched', max_components=3, n_bootstrap=20,
++                  dtype=torch.float64)
++    m0, s0 = estimate(X, 'MI', n_chunk=None, **common)
++    m1, s1 = estimate(X, 'MI', n_chunk=512, **common)
++    assert abs(m0 - m1) <= 1e-9
++    assert abs(s0 - s1) <= 1e-9
++
++
++def test_category_weights_uniform_regression():
++    # near-balanced two-category data; category_weights='uniform' must
++    # reproduce the Part-2 balanced reference MI (pinned, used as given):
++    # 0.3463397165 nats.
++    rng = np.random.default_rng(8)
++    N = 10000
++    Y = rng.integers(0, 2, N)
++    X = rng.normal(2.0 * Y, 1.0)
++    ref = 0.3463397165
++    mi_mean, mi_std = estimate_categorical(X, Y, max_components=3,
++                                           category_weights='uniform')
++    assert (ref >= mi_mean - SIGMAS * mi_std) and \
++           (ref <= mi_mean + SIGMAS * mi_std)
++
++
++def test_categorical_MI_three_categories():
++    # continuous-categorical MI with three categories; target from 1D
++    # quadrature with the empirical category weights (as the estimator uses)
++    rng = np.random.default_rng(12)
++    N = 15000
++    Y = rng.integers(0, 3, N)
++    centres = np.array([0.0, 3.0, 6.0])
++    X = rng.normal(centres[Y], 1.0)
++    pi = np.array([(Y == c).mean() for c in range(3)])
++    grid = np.linspace(-8, 14, 60001)
++    ps = [np.exp(-0.5 * (grid - centres[c]) ** 2) / np.sqrt(2 * np.pi)
++          for c in range(3)]
++    pbar = sum(pi[c] * ps[c] for c in range(3))
++    mi_target = sum(pi[c] * np.trapezoid(ps[c] * np.log(ps[c] / pbar), grid)
++                    for c in range(3))
++    mi_mean, mi_std = estimate_categorical(X, Y, max_components=4)
++    assert (mi_target >= mi_mean - SIGMAS * mi_std) and \
++           (mi_target <= mi_mean + SIGMAS * mi_std)
++
++
++def test_mc_chunk_not_dividing_n_bootstrap():
++    # mc_chunk=7 does not divide n_bootstrap=50 (the final MC chunk is size 1);
++    # the chunked integration must still recover the analytic Gaussian MI
++    rho = 0.6
++    cov = np.array([[1.0, rho], [rho, 1.0]])
++    rng = np.random.default_rng(0)
++    X = rng.multivariate_normal([0, 0], cov, 10000)
++    analytic_mi = -0.5 * np.log(1 - rho ** 2)
++    mi_mean, mi_std = estimate(X, 'MI', protocol='batched', max_components=3,
++                               n_bootstrap=50, mc_chunk=7)
++    assert (analytic_mi >= mi_mean - SIGMAS * mi_std) and \
++           (analytic_mi <= mi_mean + SIGMAS * mi_std)
++
++
++def test_invalid_argument_paths():
++    # the three documented error paths each raise ValueError
++    rng = np.random.default_rng(0)
++    X = rng.multivariate_normal([0, 0], np.eye(2), 200)
++    Y = rng.integers(0, 2, 200)
++    # gaussianise is rejected for the (non-invariant) KL quantities
++    with pytest.raises(ValueError):
++        estimate(X, 'KL_forward', preprocess='gaussianise', max_components=2)
++    # unknown preprocess
++    with pytest.raises(ValueError):
++        estimate(X, 'MI', preprocess='whiten', max_components=2)
++    # unknown category_weights
++    with pytest.raises(ValueError):
++        estimate_categorical(X[:, 0], Y, category_weights='inverse',
++                             max_components=2)
++
++
++def test_bootstrap_randint_fallback(monkeypatch):
++    # for N above torch.multinomial's 2**24 category cap the uniform bootstrap
++    # falls back to a randint histogram. Monkeypatch the cap down to exercise
++    # the fallback at small N, and check it is distributionally consistent with
++    # the multinomial path: both cover the analytic MI, and their means agree
++    # within the combined bootstrap error.
++    rho = 0.6
++    cov = np.array([[1.0, rho], [rho, 1.0]])
++    rng = np.random.default_rng(0)
++    X = rng.multivariate_normal([0, 0], cov, 5000)
++    analytic_mi = -0.5 * np.log(1 - rho ** 2)
++    m_mn, s_mn = estimate(X, 'MI', protocol='batched', max_components=3, seed=1)
++    monkeypatch.setattr(torch_gmm_mi, '_MULTINOMIAL_MAX_CATEGORIES', 8)
++    m_ri, s_ri = estimate(X, 'MI', protocol='batched', max_components=3, seed=1)
++    assert abs(analytic_mi - m_mn) <= SIGMAS * s_mn
++    assert abs(analytic_mi - m_ri) <= SIGMAS * s_ri
++    combined = (s_mn ** 2 + s_ri ** 2) ** 0.5
++    assert abs(m_mn - m_ri) <= SIGMAS * combined
++
++
++@pytest.mark.skipif(not os.environ.get('GMM_MI_OFFLINE'),
++                    reason='bootstrap-sigma calibration; offline only, not CI')
++def test_bootstrap_sigma_calibration_offline():
++    # GMM-MI-paper-style errorbar calibration. Over many independent datasets
++    # the analytic MI should fall within +-1 bootstrap sigma ~68% of the time
++    # and +-2 sigma ~95%. Bounds are loose (a few dozen repeats are noisy);
++    # the measured coverage is reported in gb10_report.md. Not part of the CI
++    # set (gated on GMM_MI_OFFLINE).
++    rho = 0.6
++    cov = np.array([[1.0, rho], [rho, 1.0]])
++    analytic_mi = -0.5 * np.log(1 - rho ** 2)
++    n_rep = 40
++    within1 = within2 = 0
++    for r in range(n_rep):
++        rng = np.random.default_rng(1000 + r)
++        X = rng.multivariate_normal([0, 0], cov, 5000)
++        m, s = estimate(X, 'MI', protocol='batched', max_components=3, seed=r)
++        z = abs(m - analytic_mi) / s
++        within1 += int(z <= 1.0)
++        within2 += int(z <= 2.0)
++    cov1, cov2 = within1 / n_rep, within2 / n_rep
++    assert 0.45 <= cov1 <= 0.90, cov1
++    assert 0.80 <= cov2 <= 1.0, cov2

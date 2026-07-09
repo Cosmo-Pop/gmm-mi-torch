@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gmm-mi-torch"
+version = "0.1.0"
+description = "PyTorch port of GMM-MI: mutual information with bootstrap errorbars from Gaussian mixture models, GPU-batched"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Hiranya Peiris", email = "hiranya.v.peiris@gmail.com" },
+]
+dependencies = [
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "numpy"]
+
+[project.urls]
+Homepage = "https://github.com/Cosmo-pop/gmm-mi-torch"
+Upstream = "https://github.com/dpiras/GMM-MI"
+
+[tool.setuptools]
+packages = ["gmm_mi_torch"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
