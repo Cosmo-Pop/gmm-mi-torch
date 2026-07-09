@@ -707,9 +707,43 @@ def _rank_gaussianise(X):
     return torch.special.ndtri(p.cpu()).to(p.device)
 
 
+class FittedGMM:
+    """The GMM selected by `estimate`, refitted on the full data.
+
+    Mirrors GMM-MI's fitted-model access for plotting and inspection, with
+    sklearn-style attributes: `weights_` (K,), `means_` (K, d) and
+    `covariances_` (K, d, d) as numpy arrays on the CPU (dead padding
+    components dropped), plus `n_components`. Obtained via
+    `estimate(..., return_fit=True)`.
+    """
+
+    def __init__(self, w, mu, cov):
+        self._w, self._mu, self._cov = w, mu, cov
+        self.weights_ = w.cpu().numpy()
+        self.means_ = mu.cpu().numpy()
+        self.covariances_ = cov.cpu().numpy()
+        self.n_components = int(w.shape[0])
+
+    def sample(self, n_samples, seed=0):
+        """Draw `n_samples` from the mixture; returns a (n_samples, d) numpy array."""
+        g = torch.Generator(device=self._w.device).manual_seed(seed)
+        pts = gmm_sample(self._w.unsqueeze(0), self._mu.unsqueeze(0),
+                         _chol(self._cov.unsqueeze(0)), int(n_samples),
+                         generator=g)
+        return pts[0].cpu().numpy()
+
+    def score_samples(self, X):
+        """Mixture log-density at X of shape (n, d); returns a (n,) numpy array."""
+        Xt = torch.as_tensor(X, dtype=self._mu.dtype, device=self._mu.device)
+        ll = gmm_score(Xt.unsqueeze(0), self._w.unsqueeze(0),
+                       self._mu.unsqueeze(0), _chol(self._cov.unsqueeze(0)))
+        return ll[0].cpu().numpy()
+
+
 def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
              mc_samples=100_000, max_components=20, n_folds=2, n_inits=3,
              reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, seed=0, return_k=False,
+             return_fit=False,
              device='cpu', dtype=torch.float64, em_chunk=8, mc_chunk=8,
              preprocess='none', init_type='random_responsibilities',
              scale=None, fixed_components_number=None, metric_method='valid',
@@ -781,6 +815,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         MC integration.
     return_k : bool, default=False
         If True, also return the selected number of components.
+    return_fit : bool, default=False
+        If True, also return the selected model as a `FittedGMM` (refitted on
+        the full data, warm-started from the CV-selected parameters — the
+        same warm start the bootstrap replicates use), e.g. for plotting.
     device : str, default='cpu'
         Torch device on which to fit and integrate (e.g. 'cuda').
     dtype : torch.dtype, default=torch.float64
@@ -841,6 +879,9 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         Bootstrap standard deviation (None when n_bootstrap=0).
     k : int
         Selected number of components; only if `return_k` is True.
+    fit : FittedGMM
+        The selected model refitted on the full data; only if `return_fit`
+        is True (appended after `k` when both flags are set).
     """
     X = torch.as_tensor(X, dtype=dtype, device=device)
     if preprocess == 'gaussianise':
@@ -879,6 +920,13 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         k_best, (w1, mu1, cov1), _ = sel(X, **kw)
 
     N = X.shape[0]
+    if return_fit:
+        s1 = torch.ones(1, N, dtype=X.dtype, device=X.device)
+        wf, muf, covf, _ = em_fit(X, s1, w1.unsqueeze(0), mu1.unsqueeze(0),
+                                  cov1.unsqueeze(0), reg_covar, threshold_fit,
+                                  max_iter, em_chunk=em_chunk, n_chunk=n_chunk)
+        alive = wf[0] > 0
+        fit = FittedGMM(wf[0][alive], muf[0][alive], covf[0][alive])
     B = max(n_bootstrap, 1)
     g = torch.Generator(device=X.device).manual_seed(seed + 10_000)
     if n_bootstrap >= 1:
@@ -913,7 +961,12 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     vals = torch.cat(vals)                                        # (B,)
     mean = vals.mean().item()
     std = vals.std(unbiased=True).item() if n_bootstrap >= 1 else None
-    return (mean, std, k_best) if return_k else (mean, std)
+    out = (mean, std)
+    if return_k:
+        out += (k_best,)
+    if return_fit:
+        out += (fit,)
+    return out
 
 
 def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,

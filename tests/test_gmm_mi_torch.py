@@ -422,3 +422,23 @@ def test_bootstrap_sigma_calibration_offline():
     cov1, cov2 = within1 / n_rep, within2 / n_rep
     assert 0.45 <= cov1 <= 0.90, cov1
     assert 0.80 <= cov2 <= 1.0, cov2
+
+
+def test_return_fit_model():
+    # return_fit exposes the selected model refitted on the full data;
+    # attributes must be self-consistent and samples must reproduce the
+    # data's covariance. Added for the notebook plotting API.
+    rho = 0.6
+    cov = np.array([[1.0, rho], [rho, 1.0]])
+    rng = np.random.default_rng(0)
+    X = rng.multivariate_normal([0, 0], cov, 5000)
+    mi_mean, mi_std, k, fit = estimate(X, 'MI', max_components=3,
+                                       return_k=True, return_fit=True)
+    assert fit.n_components == len(fit.weights_) == k
+    assert abs(fit.weights_.sum() - 1.0) < 1e-5
+    assert fit.means_.shape == (k, 2)
+    assert fit.covariances_.shape == (k, 2, 2)
+    S = fit.sample(200_000, seed=3)
+    assert S.shape == (200_000, 2)
+    assert np.allclose(np.cov(S.T), cov, atol=0.05)
+    assert np.isfinite(fit.score_samples(X[:100])).all()
