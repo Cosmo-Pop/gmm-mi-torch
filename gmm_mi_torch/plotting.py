@@ -369,6 +369,73 @@ def plot_gmm_contours(gmm, ax=None, fill=False, label='', xlabel='X1', ylabel='X
         draw_ellipse(mean, covariance, weight, ax=ax, fill=fill,
                      component_count=component_count, label=label, **kwargs)
     return ax
+def calculate_summary_and_significance(estimates):
+    """Given an array of estimates, calculate their sample mean, the error on the mean,
+    and the significance with respect to 0.
+    
+    Parameters
+    ----------
+    estimates : 1D array-like
+        The value of all estimates for a certain number of trials. 
+        
+    Returns
+    -------
+    mean_value : float
+        The mean of the estimates.
+    mean_error : float
+        The error on the mean of the estimates.
+    significance : float
+        The distance of the mean with respect to 0.
+    """
+    trials_number = len(estimates)
+    mean_value = np.mean(estimates)
+    mean_error = np.sqrt(np.var(estimates, ddof=1))/np.sqrt(trials_number)
+    # significance is with respect to 0
+    significance = np.mean(estimates) / mean_error
+    return mean_value, mean_error, significance
+
+
+def histogram_estimates(estimates, ax=None, bins=20, alpha=1, title='',
+                   legendsize=25, color='salmon', lw=3, histtype='step'):
+    """Plot the histogram of an array of estimates, centred on 0.
+    
+    Parameters
+    ----------
+    estimates : 1D array-like
+        The estimates whose histogram we plot. 
+    ax : instance of the axes.Axes class from pyplot, default=None
+        The panel where to draw the histogram. 
+    bins : int, default=20
+        Number of histogram bins.
+    alpha : float, default=1
+        Transparency of the histogram line. Must be between 0 and 1.
+    title : string, default=''
+        Title of the panel.
+    legendsize : int, default=25
+         Font size of the legend.
+    color : string, default='salmon'
+        Histogram color.
+    lw : int, default=3
+        Line width of the histogram line.  
+    histtype : {'bar', 'barstacked', 'step', 'stepfilled'}, default='step'
+        The type of histogram to draw.
+        
+    Returns
+    -------
+    None
+    """    
+    fig, ax = choose_ax(ax)
+    mean_value, mean_error, significance = calculate_summary_and_significance(estimates)
+    ax.hist(estimates.flatten(), alpha=alpha, bins=bins, color=color, histtype=histtype, lw=lw,
+            label=(f'MI values, {significance:.1f}' + '$\\sigma$,\n'
+                   + f'{mean_value:.4f}' + '$\\pm$' + f'{mean_error:.4f}')
+            )
+    ax.axvline(0, ls='--', lw=lw, c='black')
+    set_ticksize(ax)
+    set_titles(ax, xlabel='MI [nat]', ylabel='Counts', title=title)
+    set_legend(ax, fontsize=legendsize)
+
+
 def create_heatmap(data, row_labels, col_labels, fsize=30, ax=None,
             cbar_kw={}, cbarlabel="", **kwargs):
     """
