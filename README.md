@@ -48,7 +48,7 @@ Z = rng.normal(2.0 * Y, 1.0)
 mi_mean, mi_std = estimate_categorical(Z, Y, max_components=3)
 ```
 
-The full hyperparameter set (selection protocols `'batched'`/`'sequential'`, `metric_method='valid'/'aic'/'bic'`, init types, `preprocess='gaussianise'`, `fixed_components_number`, chunking knobs, …) is documented in the `estimate` and `estimate_categorical` docstrings; parameter names follow GMM-MI where a counterpart exists (`reg_covar`, `threshold_fit`, `threshold_components`, `max_components`, …). `estimate(..., return_fit=True)` additionally returns the selected model for inspection and plotting (`gmm_mi_torch.plotting` has the fitted-ellipse, data-vs-model contour and MI-matrix heatmap helpers used in the walkthrough).
+The full hyperparameter set (selection protocols `'batched'`/`'sequential'`, `metric_method='valid'/'aic'/'bic'`, init types, `preprocess='gaussianise'`, `fixed_components_number`, chunking knobs, …) is documented in the `estimate` and `estimate_categorical` docstrings; parameter names follow GMM-MI where a counterpart exists (`reg_covar`, `threshold_fit`, `threshold_components`, `max_components`, …). `estimate(..., return_fit=True)` additionally returns the selected model for inspection and plotting (`gmm_mi_torch.plotting` has the fitted-ellipse, data-vs-model contour, MI-matrix heatmap and errorbar-validation helpers used in the walkthrough).
 
 For a guided tour — including the common pitfalls (thresholds, initialisations, hard-boundary data) and how to diagnose them — see [notebooks/walkthrough_and_pitfalls.ipynb](notebooks/walkthrough_and_pitfalls.ipynb), adapted from Davide Piras's GMM-MI walkthrough.
 

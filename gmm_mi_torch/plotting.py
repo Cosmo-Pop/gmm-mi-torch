@@ -436,6 +436,143 @@ def histogram_estimates(estimates, ax=None, bins=20, alpha=1, title='',
     set_legend(ax, fontsize=legendsize)
 
 
+def swap_leg_handles(ax, i1=-1, i2=-2):
+    """Swap legend handles and labels.
+    
+    Parameters
+    ----------
+    ax : instance of the axes.Axes class from pyplot
+        The panel whose legend is going to be affected
+    i1 : int, default=-1
+        The first index to swap.
+    i2 : int, default=-2
+        The first index to swap.
+                
+    Returns
+    -------
+    handles : sequence of `.Artist` (see pyplot docs)
+        The swapped handles.
+    labels : list of str
+        The swapped labels.
+    """      
+    handles, labels = ax.get_legend_handles_labels()
+    handles[i1], handles[i2] = handles[i2], handles[i1] 
+    labels[i1], labels[i2] = labels[i2], labels[i1] 
+    return handles, labels
+
+def plot_multivariate_normal(ax=None, mean=0, cov=1, alpha=1, color='black', lw=5, ls='--'):
+    """Plot Gaussian distribution in 1D.
+    
+    Parameters
+    ----------
+    ax : instance of the axes.Axes class from pyplot, default=None
+        The panel where to draw the Gaussian. 
+    mean : float, default=0
+        The mean of the Gaussian distribution.
+    cov : float, default=1
+        The covariance of the Gaussian distribution.        
+    alpha : float, default=2
+        Transparency of the line. Must be between 0 and 1.
+    color : string, default='black'
+        Line color.
+    lw : int, default=5
+        Line width. 
+    ls : string, default='--'
+        Line style. Check pyplot for possible values.
+        
+    Returns
+    -------
+    None
+    """
+    from scipy.stats import multivariate_normal
+    fig, ax = choose_ax(ax)
+    x = np.linspace(mean-3, mean+3, 1000, endpoint=False)
+    y = multivariate_normal.pdf(x, mean=mean, cov=cov)
+    ax.plot(x, y, c=color, ls=ls, lw=lw, alpha=alpha, label=r'$\mathcal{N}(0, 1)$')
+
+    
+def plot_bias_chi2_histogram(estimates, analytic, ax=None, bins=20, alpha=0.5, show_title=True, show_legend=True,
+                             legendsize=44, color='grey', lw=3, histtype='bar', savefig=False, savepath='./', 
+                             labelfontsize=60, labelcolor='black', hide_ylabel=False, ds=''):
+    """Plot the histogram of the bias of estimates, centred on 0.
+    Also calculate reduced chi2.
+    
+    Parameters
+    ----------
+    estimates : array-like of shape (n_estimates, 2)
+        The estimates whose bias we histogram. 
+        First column is the MI estimate,
+        second column is the MI error.
+    analytic : float
+        The analytic MI value.
+    ax : instance of the axes.Axes class from pyplot, default=None
+        The panel where to draw the histogram. 
+    bins : int, default=20
+        Number of histogram bins.
+    alpha : float, default=0.5
+        Transparency of the histogram line. Must be between 0 and 1.
+    show_title : bool, default=True
+        Whether to display the title with bias and chi2 results.
+    show_legend : bool, default=True
+        Whether to display the legend.
+    legendsize : int, default=44
+         Font size of the legend.
+    color : string, default='grey'
+        Histogram color.
+    lw : int, default=3
+        Line width of the histogram line.  
+    histtype : {'bar', 'barstacked', 'step', 'stepfilled'}, default='bar'
+        The type of histogram to draw.
+    savefig : bool, default=False
+        Whether to save or not the figure as a pdf file (for the paper).
+    savepath : string, default='./'
+        The path where to save the figure. Only used if savefig is True.  
+    labelfontsize : int, default=60
+        Fontsize of labels and title.
+    labelcolor : string, default='black'
+        Color of labels and title.
+    hide_ylabel : bool, default=False
+        Whether to paint the ylabel white, so that it's hidden.
+        Only for the paper.
+    ds : string, default=''
+        The dataset which is being analysed.
+        
+    Returns
+    -------
+    biases : np.array of shape (n_estimates)
+        The biases of the estimates.
+    red_chi2 : float
+        The reduced chi2 of the estimates.
+    df : int
+        The number of degrees of freedom.
+    """  
+    biases = np.array((estimates[:, 0]-analytic)/(estimates[:, 1]))
+    chi2 = np.sum(biases**2)
+    df = len(estimates)-1    
+    red_chi2 = chi2/df
+    fig, ax = choose_ax(ax)
+    ax.hist(biases, alpha=alpha, bins=bins, 
+             label='GMM-MI', color=color, density='True')
+    plot_multivariate_normal(ax=ax)    
+    if show_title:
+        title = (f'{ds}: {np.mean(biases):.2f}' + '$\\pm$'
+                 + f'{np.std(biases):.2f}, ' + '$\\chi^2_{{red}}$'
+                 + f'={red_chi2:.2f} with {df} dof')
+    else:
+        title = ''
+    set_titles(ax, xlabel='Standardized residual', ylabel='Probability', title=title, 
+               fontsize=labelfontsize, color=labelcolor)
+    if hide_ylabel:
+        ax.set_ylabel(ylabel='Probability', fontsize=labelfontsize, color='white')
+    if show_legend:
+        handles, labels = swap_leg_handles(ax, i1=-1, i2=-2)
+        set_legend(ax, fontsize=legendsize, handles=handles, labels=labels, frameon=False, loc='upper left')
+    set_ticksize(ax, labelsize=45, size=12)
+    if savefig:
+        plt.savefig(savepath, bbox_inches='tight')
+    return biases, red_chi2, df
+
+
 def create_heatmap(data, row_labels, col_labels, fsize=30, ax=None,
             cbar_kw={}, cbarlabel="", **kwargs):
     """
