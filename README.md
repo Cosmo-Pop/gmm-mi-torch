@@ -76,7 +76,7 @@ The [validation/](validation/) directory contains the full validation and benchm
 
 ## License and attribution
 
-This is a port of [GMM-MI](https://github.com/dpiras/GMM-MI) by Davide Piras et al., and mirrors its licensing: GPL-3.0 ([LICENSE](LICENSE)) with upstream's non-commercial use condition ([LICENSE_EXT.txt](LICENSE_EXT.txt)). Review before making this repository public.
+This is a port of [GMM-MI](https://github.com/dpiras/GMM-MI) by Davide Piras, Hiranya V. Peiris, Andrew Pontzen, Luisa Lucie-Smith, Ningyuan Guo and Brian Nord, and mirrors its licensing: GPL-3.0 ([LICENSE](LICENSE)) with upstream's non-commercial use condition ([LICENSE_EXT.txt](LICENSE_EXT.txt)). Review before making this repository public.
 
 If you use this code, please cite the GMM-MI paper:
 
