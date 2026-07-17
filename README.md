@@ -54,7 +54,7 @@ For a guided tour — including the common pitfalls (thresholds, initialisations
 
 ## Performance
 
-Benchmarked on an NVIDIA GB10 (DGX Spark) against the sklearn-based GMM-MI reference on a 3-component bivariate mixture (N=20 000, `max_components=8`, 50 bootstrap realisations); full tables in [validation/gb10_report.md](validation/gb10_report.md):
+Benchmarked on an NVIDIA GB10 (DGX Spark) against the sklearn-based GMM-MI reference on a 3-component bivariate mixture (N=20 000, `max_components=8`, 50 bootstrap realisations). A distilled summary of the whole validation and benchmark campaign — correctness, fp32, calibration, performance, large-N scaling, known limitations — is in [docs/validation_summary.pdf](docs/validation_summary.pdf); full tables in [validation/gb10_report.md](validation/gb10_report.md):
 
 | Config | model selection | bootstrap |
 |---|---|---|
@@ -74,7 +74,7 @@ GMM_MI_DEVICE=cuda GMM_MI_DTYPE=float32 GMM_MI_EM_CHUNK=1000 pytest   # GPU, flo
 
 The suite (24 tests) checks analytic Gaussian targets, Monte-Carlo/quadrature targets for multimodal and non-Gaussian cases, chunking parity, categorical MI, and error paths; `tests/conftest.py` routes the whole suite to a device/dtype via the `GMM_MI_*` environment variables. One additional statistical test — bootstrap-errorbar coverage calibration over 40 independent datasets — is slow and therefore gated behind `GMM_MI_OFFLINE=1`.
 
-The [validation/](validation/) directory contains the full validation and benchmark report from the port's GB10 acceptance run ([validation/README.md](validation/README.md) explains its contents and provenance), kept in the repository for team review while it is private.
+For most readers, [docs/validation_summary.pdf](docs/validation_summary.pdf) is the right entry point to the validation results. The [validation/](validation/) directory additionally contains the full working report from the port's GB10 acceptance run ([validation/README.md](validation/README.md) explains its contents and provenance), kept in the repository for team review while it is private.
 
 ## License and attribution
 
