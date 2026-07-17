@@ -62,9 +62,9 @@ A = story.append
 
 A(Paragraph('gmm-mi-torch: validation and benchmark summary', TITLE))
 A(Paragraph('Distilled from the GB10 acceptance campaign, July 2026. '
-            'Full working logs, task-scoped diffs and bench scripts: '
-            '<font face="Courier">validation/</font> in this repository.',
-            SUB))
+            'Full working logs, task-scoped diffs and bench scripts are '
+            'preserved in the repository\'s development history (the '
+            '<font face="Courier">validation/</font> directory).', SUB))
 
 A(Paragraph('1. What was validated', H1))
 A(Paragraph(
@@ -240,9 +240,10 @@ for item in [
 
 A(Spacer(1, 6))
 A(Paragraph(
-    'Provenance: distilled from validation/gb10_report.md (Parts 1-6 of the '
-    'GB10 acceptance campaign) and the executed walkthrough notebook; '
-    'regenerate with docs/make_validation_summary.py.', CAP))
+    'Provenance: distilled from gb10_report.md, Parts 1-6 of the GB10 '
+    'acceptance campaign (validation/ in the repository\'s development '
+    'history), and the executed walkthrough notebook; regenerate with '
+    'docs/make_validation_summary.py.', CAP))
 
 SimpleDocTemplate(OUT, pagesize=A4,
                   leftMargin=18 * mm, rightMargin=18 * mm,
