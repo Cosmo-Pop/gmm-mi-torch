@@ -18,9 +18,9 @@ OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 styles = getSampleStyleSheet()
 H1 = ParagraphStyle('H1x', parent=styles['Heading1'], fontSize=15,
-                    spaceBefore=14, spaceAfter=6)
+                    spaceBefore=14, spaceAfter=6, keepWithNext=1)
 H2 = ParagraphStyle('H2x', parent=styles['Heading2'], fontSize=12,
-                    spaceBefore=10, spaceAfter=4)
+                    spaceBefore=10, spaceAfter=4, keepWithNext=1)
 BODY = ParagraphStyle('Bodyx', parent=styles['Normal'], fontSize=9.5,
                       leading=13, spaceAfter=5)
 BULL = ParagraphStyle('Bullx', parent=BODY, leftIndent=14, bulletIndent=4)
@@ -54,7 +54,8 @@ def tbl(header, rows, widths=None, bold_row=None):
         style.append(('BACKGROUND', (0, bold_row + 1), (-1, bold_row + 1),
                       colors.HexColor('#f0ede8')))
     t.setStyle(TableStyle(style))
-    return t
+    # all tables here are small: never split one across a page break
+    return KeepTogether(t)
 
 
 story = []
