@@ -78,7 +78,7 @@ The [validation/](validation/) directory contains the full validation and benchm
 
 ## License and attribution
 
-This is a port of [GMM-MI](https://github.com/dpiras/GMM-MI) by Davide Piras, Hiranya V. Peiris, Andrew Pontzen, Luisa Lucie-Smith, Ningyuan Guo and Brian Nord, and mirrors its licensing: GPL-3.0 ([LICENSE](LICENSE)) with upstream's non-commercial use condition ([LICENSE_EXT.txt](LICENSE_EXT.txt)). Review before making this repository public.
+This is a port of [GMM-MI](https://github.com/dpiras/GMM-MI) by Davide Piras, Hiranya V. Peiris, Andrew Pontzen, Luisa Lucie-Smith, Ningyuan Guo and Brian Nord, distributed under the GPL-3.0 ([LICENSE](LICENSE)). Upstream GMM-MI additionally carries a non-commercial use condition; this repository is distributed without it, in agreement with the upstream author.
 
 The walkthrough notebook and the plotting utilities (`gmm_mi_torch/plotting.py`) are forked from GMM-MI originals by Davide Piras, imported into this repository together with their upstream commit history — his authorship of that material is recorded in the git log — and then adapted to the `gmm-mi-torch` API here.
 
