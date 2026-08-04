@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-import gmm_mi_torch
+import gmm_mi_torch.estimator
 from gmm_mi_torch import estimate, estimate_categorical
 
 SIGMAS = 3
@@ -391,7 +391,7 @@ def test_bootstrap_randint_fallback(monkeypatch):
     X = rng.multivariate_normal([0, 0], cov, 5000)
     analytic_mi = -0.5 * np.log(1 - rho ** 2)
     m_mn, s_mn = estimate(X, 'MI', protocol='batched', max_components=3, seed=1)
-    monkeypatch.setattr(gmm_mi_torch, '_MULTINOMIAL_MAX_CATEGORIES', 8)
+    monkeypatch.setattr(gmm_mi_torch.estimator, '_MULTINOMIAL_MAX_CATEGORIES', 8)
     m_ri, s_ri = estimate(X, 'MI', protocol='batched', max_components=3, seed=1)
     assert abs(analytic_mi - m_mn) <= SIGMAS * s_mn
     assert abs(analytic_mi - m_ri) <= SIGMAS * s_ri
