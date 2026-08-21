@@ -38,9 +38,8 @@ X = rng.multivariate_normal([0, 0], cov, 10_000)
 # defaults: CPU, float64, batched selection protocol
 mi_mean, mi_std = estimate(X, 'MI')
 
-# GPU, float32, chunks tuned for throughput
-mi_mean, mi_std = estimate(X, 'MI', device='cuda', dtype=torch.float32,
-                           em_chunk=48, mc_chunk=50)
+# GPU, float32; replicate batches are sized automatically from free device memory
+mi_mean, mi_std = estimate(X, 'MI', device='cuda', dtype=torch.float32)
 
 # continuous-categorical MI
 Y = rng.integers(0, 2, 10_000)
@@ -62,6 +61,8 @@ Benchmarked on an NVIDIA GB10 (DGX Spark) against the sklearn-based GMM-MI refer
 | gmm-mi-torch, CPU fp64 | 11.5 s | 1.9 s |
 | gmm-mi-torch, CUDA fp32 (tuned chunks) | **0.90 s** | **0.17 s** |
 
+On CUDA the replicate batches (`em_chunk`, `mc_chunk`) default to `'auto'`: each stage's batch is sized to fill half of the free device memory from a measured peak-memory model, with a floor of 32 replicates (per-replicate cost is flat above that), and a CUDA out-of-memory error halves the batch and retries. Results are batch-size invariant, so the setting only trades memory against speed; pass an integer to pin it. On CPU `'auto'` keeps the previous default of 8.
+
 Sample-dimension chunking (`n_chunk`) extends the reachable scale to N=10⁸, d=8 (total correlation in 23 min / 77.5 GiB at fp32 on 128 GB unified memory). One hardware caveat: on GPUs with rate-limited fp64 throughput (e.g. GB10), CUDA fp64 is slower than CPU fp64 — use fp32 on such devices (validated: the full test suite passes at fp32).
 
 ## Tests
@@ -72,7 +73,7 @@ pytest                                                    # CPU, float64
 GMM_MI_DEVICE=cuda GMM_MI_DTYPE=float32 GMM_MI_EM_CHUNK=1000 pytest   # GPU, float32
 ```
 
-The suite (24 tests) checks analytic Gaussian targets, Monte-Carlo/quadrature targets for multimodal and non-Gaussian cases, chunking parity, categorical MI, and error paths; `tests/conftest.py` routes the whole suite to a device/dtype via the `GMM_MI_*` environment variables. One additional statistical test — bootstrap-errorbar coverage calibration over 40 independent datasets — is slow and therefore gated behind `GMM_MI_OFFLINE=1`.
+The suite (28 tests) checks analytic Gaussian targets, Monte-Carlo/quadrature targets for multimodal and non-Gaussian cases, chunking parity, categorical MI, and error paths; `tests/conftest.py` routes the whole suite to a device/dtype via the `GMM_MI_*` environment variables. One additional statistical test — bootstrap-errorbar coverage calibration over 40 independent datasets — is slow and therefore gated behind `GMM_MI_OFFLINE=1`.
 
 For most readers, [docs/validation_summary.pdf](docs/validation_summary.pdf) is the right entry point to the validation results. The [validation/](validation/) directory additionally contains the full working report from the port's GB10 acceptance run ([validation/README.md](validation/README.md) explains its contents and provenance), kept in the repository for team review while it is private.
 

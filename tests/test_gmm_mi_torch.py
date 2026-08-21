@@ -442,3 +442,80 @@ def test_return_fit_model():
     assert S.shape == (200_000, 2)
     assert np.allclose(np.cov(S.T), cov, atol=0.05)
     assert np.isfinite(fit.score_samples(X[:100])).all()
+
+
+def test_auto_chunk_sizing(monkeypatch):
+    # CPU keeps the historical default (capped at the item count); CUDA takes
+    # half the free memory, floored at 32 and capped at the item count
+    E = gmm_mi_torch.estimator
+    assert E._auto_chunk(100, 10**6, 'cpu') == 8
+    assert E._auto_chunk(3, 10**6, 'cpu') == 3
+    monkeypatch.setattr(torch.cuda, 'mem_get_info',
+                        lambda dev=None: (2 * 10**9, 4 * 10**9))
+    assert E._auto_chunk(1000, 10**7, 'cuda') == 100
+    assert E._auto_chunk(1000, 10**9, 'cuda') == 32
+    assert E._auto_chunk(20, 10**6, 'cuda') == 20
+    with pytest.raises(ValueError):
+        E._resolve_chunk('big', 10, 1, 'cpu')
+    with pytest.raises(ValueError):
+        E._resolve_chunk(0, 10, 1, 'cpu')
+
+
+def test_em_chunk_parity_fp64():
+    # em_chunk only partitions independent replicates, so 'auto' and any
+    # fixed value must agree to reduction-order precision. mc_chunk is held
+    # fixed so the MC sample stream is identical. Forced to fp64; device
+    # follows the harness.
+    rng = np.random.default_rng(0)
+    cov = np.array([[1.0, 0.6], [0.6, 1.0]])
+    X = rng.multivariate_normal([0, 0], cov, 4000)
+    common = dict(protocol='batched', max_components=3, n_bootstrap=20,
+                  dtype=torch.float64, mc_chunk=4)
+    m0, s0 = estimate(X, 'MI', em_chunk=3, **common)
+    m1, s1 = estimate(X, 'MI', em_chunk='auto', **common)
+    m2, s2 = estimate(X, 'MI', em_chunk=1000, **common)
+    assert abs(m0 - m1) <= 1e-9 and abs(m0 - m2) <= 1e-9
+    assert abs(s0 - s1) <= 1e-9 and abs(s0 - s2) <= 1e-9
+
+
+def test_mc_chunk_auto_within_mc_noise():
+    # same fits, possibly different MC sample stream (on CUDA 'auto' differs
+    # from 8): agreement at the Monte-Carlo noise level, well inside the
+    # bootstrap errorbar
+    rng = np.random.default_rng(0)
+    cov = np.array([[1.0, 0.6], [0.6, 1.0]])
+    X = rng.multivariate_normal([0, 0], cov, 10000)
+    common = dict(protocol='batched', max_components=3, n_bootstrap=20,
+                  em_chunk=8)
+    m0, s0 = estimate(X, 'MI', mc_chunk=8, **common)
+    m1, s1 = estimate(X, 'MI', mc_chunk='auto', **common)
+    assert abs(m0 - m1) < 5e-3
+    assert abs(s0 - s1) < 5e-3
+
+
+def test_chunk_oom_fallback(monkeypatch):
+    # a CUDA out-of-memory error inside a chunk halves the chunk and retries:
+    # the result is unchanged and a RuntimeWarning is raised (CPU-only test;
+    # the error is injected)
+    E = gmm_mi_torch.estimator
+    orig = E._em_fit_core
+    calls = []
+
+    def flaky(X, s, *args, **kwargs):
+        calls.append(s.shape[0])
+        if s.shape[0] > 4:
+            raise torch.cuda.OutOfMemoryError("synthetic")
+        return orig(X, s, *args, **kwargs)
+
+    rng = np.random.default_rng(0)
+    X = torch.as_tensor(rng.multivariate_normal([0, 0], [[1.0, 0.6], [0.6, 1.0]], 2000))
+    g = torch.Generator().manual_seed(0)
+    w0, mu0, cov0 = E._init_params(X, 3, 16, 1e-6, generator=g)
+    s = torch.ones(16, X.shape[0], dtype=X.dtype)
+    ref = E.em_fit(X, s, w0, mu0, cov0, em_chunk=4)
+    monkeypatch.setattr(E, '_em_fit_core', flaky)
+    with pytest.warns(RuntimeWarning):
+        out = E.em_fit(X, s, w0, mu0, cov0, em_chunk=16)
+    assert calls[:3] == [16, 8, 4]
+    for a, b in zip(ref, out):
+        assert torch.equal(a, b)

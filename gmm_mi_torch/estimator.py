@@ -24,6 +24,8 @@ Design notes
 """
 
 import math
+import warnings
+
 import torch
 
 LOG2PI = math.log(2.0 * math.pi)
@@ -33,6 +35,73 @@ LOG2PI = math.log(2.0 * math.pi)
 # distributed for uniform probabilities).  Hoisted to a module constant so the
 # fallback branch can be exercised at small N by monkeypatching it down.
 _MULTINOMIAL_MAX_CATEGORIES = 1 << 24
+
+# Auto-sizing of the replicate chunks (em_chunk / mc_chunk = 'auto').  Peak
+# memory of one EM iteration is replicates x N_eff x K x itemsize x (4d+3),
+# and of one MC chunk replicates x mc_samples x K x itemsize x (3d+1); both
+# measured on GB10 to within 2% over d=1..8, K=5..20, fp32/fp64
+# (scoping/bench/bench_mem.py).  The models below carry one extra unit of
+# slack.  Per-replicate EM cost is flat above a batch of ~32, so the CUDA
+# floor sits there; CPU keeps the historical default.
+_AUTO_CHUNK_MEM_FRACTION = 0.5      # of the free device memory at call time
+_AUTO_CHUNK_MIN = 32
+_AUTO_CHUNK_CPU_DEFAULT = 8
+
+
+def _auto_chunk(n_items, bytes_per_item, device, default=_AUTO_CHUNK_CPU_DEFAULT):
+    """Chunk size for `n_items` replicates costing `bytes_per_item` each.
+
+    `default` on CPU; on CUDA, as many items as fit in a fraction of the free
+    device memory, floored at _AUTO_CHUNK_MIN and capped at n_items.
+    """
+    dev = torch.device(device)
+    if dev.type != 'cuda':
+        return max(1, min(int(n_items), int(default)))
+    free, _ = torch.cuda.mem_get_info(dev)
+    n = int(free * _AUTO_CHUNK_MEM_FRACTION // max(int(bytes_per_item), 1))
+    return max(1, min(int(n_items), max(_AUTO_CHUNK_MIN, n)))
+
+
+def _resolve_chunk(value, n_items, bytes_per_item, device):
+    """Turn an `em_chunk` / `mc_chunk` argument ('auto' or int) into an int."""
+    if isinstance(value, str):
+        if value != 'auto':
+            raise ValueError(f"chunk must be a positive int or 'auto'; found '{value}'")
+        return _auto_chunk(n_items, bytes_per_item, device)
+    value = int(value)
+    if value < 1:
+        raise ValueError(f"chunk must be a positive int or 'auto'; found {value}")
+    return value
+
+
+def _em_bytes_per_replicate(N, K, d, dtype, n_chunk=None):
+    n_eff = N if n_chunk is None else min(N, int(n_chunk))
+    return n_eff * K * dtype.itemsize * (4 * d + 4)
+
+
+def _mc_bytes_per_replicate(mc_samples, K, d, dtype):
+    return mc_samples * K * dtype.itemsize * (3 * d + 2)
+
+
+def _run_chunked(n, chunk, fn):
+    """Apply fn(slice) over [0, n) in chunks of `chunk`, halving the chunk
+    and retrying on a CUDA out-of-memory error.  Results are chunk-invariant,
+    so the retry changes only peak memory."""
+    outs, i = [], 0
+    chunk = max(1, min(int(chunk), int(n)))
+    while i < n:
+        try:
+            outs.append(fn(slice(i, i + chunk)))
+        except torch.cuda.OutOfMemoryError:
+            if chunk == 1:
+                raise
+            chunk = max(1, chunk // 2)
+            torch.cuda.empty_cache()
+            warnings.warn(f"CUDA out of memory; retrying with chunk={chunk}",
+                          RuntimeWarning, stacklevel=3)
+            continue
+        i += chunk
+    return outs
 
 
 # ----------------------------------------------------------------------
@@ -317,7 +386,8 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
     reg_covar, threshold_fit, max_iter, n_chunk
         As in `estimate`.
     em_chunk : int, default=8
-        Replicates per batch.
+        Replicates per batch. A CUDA out-of-memory error halves it and
+        retries (with a RuntimeWarning); results are chunk-invariant.
 
     Returns
     -------
@@ -327,11 +397,10 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
         Final weighted mean per-sample log-likelihood.
     """
     R = s.shape[0]
-    if R <= em_chunk:
-        return _em_fit_core(X, s, w, mu, cov, reg_covar, threshold_fit, max_iter, n_chunk)
-    outs = [_em_fit_core(X, s[i:i+em_chunk], w[i:i+em_chunk], mu[i:i+em_chunk],
-                         cov[i:i+em_chunk], reg_covar, threshold_fit, max_iter, n_chunk)
-            for i in range(0, R, em_chunk)]
+    outs = _run_chunked(R, em_chunk, lambda sl: _em_fit_core(
+        X, s[sl], w[sl], mu[sl], cov[sl], reg_covar, threshold_fit, max_iter, n_chunk))
+    if len(outs) == 1:
+        return outs[0]
     return tuple(torch.cat([o[j] for o in outs]) for j in range(4))
 
 
@@ -744,7 +813,7 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
              mc_samples=100_000, max_components=20, n_folds=2, n_inits=3,
              reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, seed=0, return_k=False,
              return_fit=False,
-             device='cpu', dtype=torch.float64, em_chunk=8, mc_chunk=8,
+             device='cpu', dtype=torch.float64, em_chunk='auto', mc_chunk='auto',
              preprocess='none', init_type='random_responsibilities',
              scale=None, fixed_components_number=None, metric_method='valid',
              threshold_components=1e-5, n_chunk=None):
@@ -824,13 +893,20 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     dtype : torch.dtype, default=torch.float64
         Working precision. float32 is validated and much faster on GPUs with
         limited fp64 throughput; float64 is the reference precision.
-    em_chunk : int, default=8
+    em_chunk : int or 'auto', default='auto'
         Number of EM replicates (CV fits or bootstrap realisations) processed
-        per batch. Larger values are faster on GPU at higher peak memory; set
-        to the full replicate count to run EM as a single batch.
-    mc_chunk : int, default=8
+        per batch. Larger values are faster on GPU at higher peak memory
+        (results are chunk-invariant). 'auto' keeps 8 on CPU; on CUDA it
+        sizes each stage's batch to fill half of the free device memory from
+        the measured peak-memory model (replicates x N x K x (4d+4) x
+        itemsize), floored at 32 — where the per-replicate cost flattens out —
+        and capped at the stage's replicate count. A CUDA out-of-memory error
+        during EM halves the chunk and retries, with a RuntimeWarning.
+    mc_chunk : int or 'auto', default='auto'
         Number of bootstrap replicates whose MC integration is evaluated per
-        batch. Same trade-off as `em_chunk`.
+        batch; 'auto' as for `em_chunk` (model mc_samples x K x (3d+2) x
+        itemsize). The MC sample stream is drawn per chunk, so estimates
+        differ across `mc_chunk` values at the Monte-Carlo noise level.
     preprocess : {'none', 'gaussianise'}, default='none'
         'gaussianise' applies a per-variable rank-probit transform before
         fitting. MI, cMI and TC are invariant under per-variable
@@ -898,18 +974,28 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         assert X.shape[1] == 2
     if quantity == 'cMI':
         assert X.shape[1] >= 3
+    N, d = X.shape
+    IF = n_inits * n_folds
+    if fixed_components_number is not None:
+        k_sel, r_sel = int(fixed_components_number), IF
+    elif protocol == 'sequential':
+        k_sel, r_sel = max_components, IF
+    else:
+        k_sel, r_sel = max_components, max_components * IF
+    em_chunk_sel = _resolve_chunk(
+        em_chunk, r_sel, _em_bytes_per_replicate(N, k_sel, d, dtype, n_chunk), device)
     if fixed_components_number is not None:
         k_best = int(fixed_components_number)
         _, (w1, mu1, cov1) = _cv_fit_for_k(X, k_best, n_folds, n_inits, reg_covar,
-                                           threshold_fit, max_iter, seed, em_chunk=em_chunk,
+                                           threshold_fit, max_iter, seed, em_chunk=em_chunk_sel,
                                            init_type=init_type, scale=scale,
                                            n_chunk=n_chunk)
     else:
         sel = select_sequential if protocol == 'sequential' else select_batched
         kw = dict(max_components=max_components, n_folds=n_folds, n_inits=n_inits, reg_covar=reg_covar,
                   threshold_fit=threshold_fit, max_iter=max_iter, seed=seed,
-              threshold_components=threshold_components,
-                  em_chunk=em_chunk, init_type=init_type, scale=scale,
+                  threshold_components=threshold_components,
+                  em_chunk=em_chunk_sel, init_type=init_type, scale=scale,
                   n_chunk=n_chunk)
         if protocol == 'sequential':
             if metric_method != 'valid':
@@ -919,15 +1005,19 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
             kw['metric_method'] = metric_method
         k_best, (w1, mu1, cov1), _ = sel(X, **kw)
 
-    N = X.shape[0]
+    B = max(n_bootstrap, 1)
+    K = w1.shape[0]
+    em_chunk_boot = _resolve_chunk(
+        em_chunk, B, _em_bytes_per_replicate(N, K, d, dtype, n_chunk), device)
+    mc_chunk = _resolve_chunk(
+        mc_chunk, B, _mc_bytes_per_replicate(mc_samples, K, d, dtype), device)
     if return_fit:
         s1 = torch.ones(1, N, dtype=X.dtype, device=X.device)
         wf, muf, covf, _ = em_fit(X, s1, w1.unsqueeze(0), mu1.unsqueeze(0),
                                   cov1.unsqueeze(0), reg_covar, threshold_fit,
-                                  max_iter, em_chunk=em_chunk, n_chunk=n_chunk)
+                                  max_iter, em_chunk=em_chunk_boot, n_chunk=n_chunk)
         alive = wf[0] > 0
         fit = FittedGMM(wf[0][alive], muf[0][alive], covf[0][alive])
-    B = max(n_bootstrap, 1)
     g = torch.Generator(device=X.device).manual_seed(seed + 10_000)
     if n_bootstrap >= 1:
         if N <= _MULTINOMIAL_MAX_CATEGORIES:
@@ -944,21 +1034,18 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
             1, s, torch.ones(B, N, dtype=X.dtype, device=X.device))
     else:
         s = torch.ones(1, N, dtype=X.dtype, device=X.device)
-    K = w1.shape[0]
     w0 = w1.unsqueeze(0).expand(B, K).contiguous()
-    mu0 = mu1.unsqueeze(0).expand(B, K, X.shape[1]).contiguous()
-    cov0 = cov1.unsqueeze(0).expand(B, K, X.shape[1], X.shape[1]).contiguous()
+    mu0 = mu1.unsqueeze(0).expand(B, K, d).contiguous()
+    cov0 = cov1.unsqueeze(0).expand(B, K, d, d).contiguous()
     w, mu, cov, _ = em_fit(X, s, w0, mu0, cov0, reg_covar, threshold_fit, max_iter,
-                           em_chunk=em_chunk, n_chunk=n_chunk)
+                           em_chunk=em_chunk_boot, n_chunk=n_chunk)
 
     chol = _chol(cov)
-    vals = []
-    for i in range(0, B, mc_chunk):
-        sl = slice(i, i + mc_chunk)
+
+    def _mc(sl):
         pts = gmm_sample(w[sl], mu[sl], chol[sl], mc_samples, generator=g)
-        vals.append(_INTEGRANDS[quantity](pts, w[sl], mu[sl], cov[sl],
-                                          chol[sl]).mean(1))
-    vals = torch.cat(vals)                                        # (B,)
+        return _INTEGRANDS[quantity](pts, w[sl], mu[sl], cov[sl], chol[sl]).mean(1)
+    vals = torch.cat(_run_chunked(B, mc_chunk, _mc))              # (B,)
     mean = vals.mean().item()
     std = vals.std(unbiased=True).item() if n_bootstrap >= 1 else None
     out = (mean, std)
@@ -973,7 +1060,7 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
                          mc_samples=100_000, max_components=10, n_folds=2, n_inits=3,
                          reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, seed=0,
                          return_k=False, device='cpu', dtype=torch.float64,
-                         em_chunk=8, mc_chunk=8,
+                         em_chunk='auto', mc_chunk='auto',
                          init_type='random_responsibilities', scale=None,
                          fixed_components_number=None, metric_method='valid',
                          category_weights='empirical', n_chunk=None):
@@ -1034,22 +1121,31 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     logpi = torch.log(pi)
     B = max(n_bootstrap, 1)
     fits, k_bests = [], []
+    IF = n_inits * n_folds
     for ci in range(C):
         Xc = X[Y == cats[ci]]
         Nc = Xc.shape[0]
         seed_c = seed + 997 * ci
         if fixed_components_number is not None:
+            k_sel, r_sel = int(fixed_components_number), IF
+        elif protocol == 'sequential':
+            k_sel, r_sel = max_components, IF
+        else:
+            k_sel, r_sel = max_components, max_components * IF
+        em_chunk_c = _resolve_chunk(
+            em_chunk, r_sel, _em_bytes_per_replicate(Nc, k_sel, 1, dtype, n_chunk), device)
+        if fixed_components_number is not None:
             k_c = int(fixed_components_number)
             _, (w1, mu1, cov1) = _cv_fit_for_k(
                 Xc, k_c, n_folds, n_inits, reg_covar, threshold_fit, max_iter, seed_c,
-                em_chunk=em_chunk, init_type=init_type, scale=scale,
+                em_chunk=em_chunk_c, init_type=init_type, scale=scale,
                 n_chunk=n_chunk)
         else:
             sel = (select_sequential if protocol == 'sequential'
                    else select_batched)
             kw = dict(max_components=max_components, n_folds=n_folds, n_inits=n_inits, reg_covar=reg_covar,
                       threshold_fit=threshold_fit, max_iter=max_iter, seed=seed_c, threshold_components=1e-5,
-                      em_chunk=em_chunk, init_type=init_type, scale=scale,
+                      em_chunk=em_chunk_c, init_type=init_type, scale=scale,
                       n_chunk=n_chunk)
             if protocol != 'sequential':
                 kw['metric_method'] = metric_method
@@ -1066,25 +1162,31 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         else:
             s = torch.ones(1, Nc, dtype=X.dtype, device=X.device)
         K = w1.shape[0]
+        em_chunk_b = _resolve_chunk(
+            em_chunk, B, _em_bytes_per_replicate(Nc, K, 1, dtype, n_chunk), device)
         w0 = w1.unsqueeze(0).expand(B, K).contiguous()
         mu0 = mu1.unsqueeze(0).expand(B, K, 1).contiguous()
         cov0 = cov1.unsqueeze(0).expand(B, K, 1, 1).contiguous()
         w, mu, cov, _ = em_fit(Xc, s, w0, mu0, cov0, reg_covar, threshold_fit, max_iter,
-                               em_chunk=em_chunk, n_chunk=n_chunk)
+                               em_chunk=em_chunk_b, n_chunk=n_chunk)
         fits.append((w, mu, cov, _chol(cov)))
 
     g = torch.Generator(device=X.device).manual_seed(seed + 20_000)
+    K_max = max(f[0].shape[1] for f in fits)
+    mc_chunk = _resolve_chunk(
+        mc_chunk, B, C * _mc_bytes_per_replicate(mc_samples, K_max, 1, dtype), device)
     vals = torch.zeros(B, dtype=X.dtype, device=X.device)
     for ci in range(C):
         w, mu, cov, chol = fits[ci]
-        for i in range(0, B, mc_chunk):
-            sl = slice(i, i + mc_chunk)
+
+        def _mc(sl):
             pts = gmm_sample(w[sl], mu[sl], chol[sl], mc_samples, generator=g)
             scores = torch.stack(
                 [gmm_score(pts, fits[cj][0][sl], fits[cj][1][sl],
                            fits[cj][3][sl]) for cj in range(C)])   # (C,b,S)
             log_pbar = torch.logsumexp(scores + logpi[:, None, None], dim=0)
-            vals[sl] += pi[ci] * (scores[ci] - log_pbar).mean(1)
+            return pi[ci] * (scores[ci] - log_pbar).mean(1)
+        vals += torch.cat(_run_chunked(B, mc_chunk, _mc))
     mean = vals.mean().item()
     std = vals.std(unbiased=True).item() if n_bootstrap >= 1 else None
     return (mean, std, k_bests) if return_k else (mean, std)
