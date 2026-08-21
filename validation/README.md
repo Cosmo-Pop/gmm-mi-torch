@@ -45,3 +45,7 @@ default (v0.1.1), all run on the same GB10 with `PYTHONPATH=<repo> python <scrip
 - `bench_bw.py` — elementwise vs `logsumexp` bandwidth calibration; MI under both
   selection protocols.
 - `bench_accept_A.py` — acceptance run for the `'auto'` chunk default (72.8 s → 46.1 s).
+- `bench_sweep.py` — self-contained hardware sweep (synthetic hard pair): `estimate()` wall
+  time vs `em_chunk` at float32 and float64, plus the EM-step saturation curve; writes
+  `<out>.json` / `<out>.md`. Intended for running on other GPUs (A100, GH200) and comparing
+  against the GB10 numbers above. `--quick` is a one-minute smoke test.
