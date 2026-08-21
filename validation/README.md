@@ -49,3 +49,4 @@ default (v0.1.1), all run on the same GB10 with `PYTHONPATH=<repo> python <scrip
   time vs `em_chunk` at float32 and float64, plus the EM-step saturation curve; writes
   `<out>.json` / `<out>.md`. Intended for running on other GPUs (A100, GH200) and comparing
   against the GB10 numbers above. `--quick` is a one-minute smoke test.
+- `sweep_gh200.{json,md}` — `bench_sweep.py` output on an Isambard-AI GH200 120GB (132 SMs, torch 2.11.0+cu128, 2026-08-22), for comparison with `sweep_gb10*`.
