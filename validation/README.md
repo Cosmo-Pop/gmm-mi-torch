@@ -24,3 +24,24 @@ that one-line rename to run against the installed package.
   the report's timing/memory tables.
 - `time_cpu.txt`, `time_cuda.txt` — `/usr/bin/time -v` logs of the final full
   suite runs (CPU float64 and CUDA float32).
+
+## Throughput scoping (August 2026)
+
+Scripts behind the "parallelise MI over pairs" scoping and the `em_chunk='auto'`
+default (v0.1.1), all run on the same GB10 with `PYTHONPATH=<repo> python <script>`:
+
+- `bench_mem.py` — peak CUDA memory per replicate for one EM iteration and one
+  MC chunk; source of the memory model in `estimator.py` (EM: N×K×itemsize×(4d+3),
+  MC: mc_samples×K×itemsize×(3d+1), measured to within 2% for d=1..8, K=5..20, fp32/fp64).
+- `bench_single.py` — one N=20k pair at the beta tester's settings: phase breakdown
+  (selection / bootstrap / MC) and wall time vs `em_chunk`.
+- `bench_iters.py` — per-iteration trace of the active replicate count (straggler
+  tail) and per-replicate EM cost vs batch size.
+- `bench_smallN.py` — the batch-size saturation curve at N=2k, 5k, 20k.
+- `bench_prof.py` — the pair-stacking proxy: 4×300 replicates serially vs 1200 in one
+  batch (1.02× on GB10).
+- `bench_gemm.py` — GEMM-formulated E/M-step prototypes vs the current kernels, and
+  the sequential-protocol timing.
+- `bench_bw.py` — elementwise vs `logsumexp` bandwidth calibration; MI under both
+  selection protocols.
+- `bench_accept_A.py` — acceptance run for the `'auto'` chunk default (72.8 s → 46.1 s).

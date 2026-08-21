@@ -40,7 +40,7 @@ _MULTINOMIAL_MAX_CATEGORIES = 1 << 24
 # memory of one EM iteration is replicates x N_eff x K x itemsize x (4d+3),
 # and of one MC chunk replicates x mc_samples x K x itemsize x (3d+1); both
 # measured on GB10 to within 2% over d=1..8, K=5..20, fp32/fp64
-# (scoping/bench/bench_mem.py).  The models below carry one extra unit of
+# (validation/bench_mem.py).  The models below carry one extra unit of
 # slack.  Per-replicate EM cost is flat above a batch of ~32, so the CUDA
 # floor sits there; CPU keeps the historical default.
 _AUTO_CHUNK_MEM_FRACTION = 0.5      # of the free device memory at call time
