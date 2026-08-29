@@ -591,3 +591,60 @@ def test_chol_escalation_recovers():
     with pytest.warns(RuntimeWarning):
         L = E._chol(cov)
     assert torch.isfinite(L).all()
+
+
+def test_gemm_step_matches_legacy_step_fp64():
+    # one EM step: the GEMM kernels must reproduce the legacy kernels to
+    # reduction-order precision at float64 (CPU)
+    E = gmm_mi_torch.estimator
+    torch.manual_seed(0)
+    X = torch.randn(1500, 3, dtype=torch.float64)
+    g = torch.Generator().manual_seed(0)
+    w, mu, cov = E._init_params(X, 4, 6, 1e-6, generator=g)
+    s = torch.rand(6, 1500, dtype=torch.float64) + 0.5
+    chol = E._chol(cov)
+    logw = torch.log(w.clamp_min(1e-300))
+    Xr = X.expand(6, 1500, 3)
+    lj = logw.unsqueeze(1) + E.log_gauss(Xr, mu, chol)
+    ll_n = torch.logsumexp(lj, -1)
+    resp_l = torch.exp(lj - ll_n.unsqueeze(-1))
+    ll_l = (s * ll_n).sum(1) / s.sum(1)
+    wl, mul, covl = E._m_step(Xr, resp_l.clone(), s, 1e-6)
+    F = E._features(X)
+    resp_g, ll_g = E._estep_gemm(F, s, w, mu, cov)
+    assert (resp_g - resp_l).abs().max() < 1e-12
+    assert (ll_g - ll_l).abs().max() < 1e-12
+    wg, mug, covg = E._mstep_gemm(F, resp_g, s, 1e-6, 3)
+    assert (wg - wl).abs().max() < 1e-12
+    assert (mug - mul).abs().max() < 1e-12
+    assert (covg - covl).abs().max() < 1e-12
+    ll_c, wc, muc, covc = E._em_step_gemm_nchunked(X, s, w, mu, cov, 1e-6, 400)
+    assert (ll_c - ll_g).abs().max() < 1e-12
+    assert (covc - covg).abs().max() < 1e-12
+
+
+def test_gemm_legacy_estimate_parity_fp64(monkeypatch):
+    # full estimate(): both kernels, same seed, must agree at float64. The
+    # trajectories differ only by floating-point reduction order, so the
+    # convergence stop can flip by at most a knife-edge iteration.
+    E = gmm_mi_torch.estimator
+    rng = np.random.default_rng(0)
+    cov = np.array([[1.0, 0.6], [0.6, 1.0]])
+    X2 = rng.multivariate_normal([0, 0], cov, 4000)
+    X3 = rng.multivariate_normal([0, 0, 0], np.eye(3), 3000)
+    for X, quantity, kw in [
+            (X2, 'MI', dict(protocol='batched', max_components=3)),
+            (X2, 'MI', dict(protocol='batched', max_components=3, n_chunk=700)),
+            (X3, 'TC', dict(protocol='sequential', max_components=2)),
+    ]:
+        out = {}
+        for kernel in ('gemm', 'legacy'):
+            monkeypatch.setattr(E, '_EM_KERNEL', kernel)
+            out[kernel] = estimate(X, quantity, n_bootstrap=10, return_k=True,
+                                   dtype=torch.float64, **kw)
+        monkeypatch.setattr(E, '_EM_KERNEL', 'gemm')
+        mg, sg, kg = out['gemm']
+        ml, sl, kl = out['legacy']
+        assert kg == kl
+        assert abs(mg - ml) < 1e-6
+        assert abs(sg - sl) < 1e-6

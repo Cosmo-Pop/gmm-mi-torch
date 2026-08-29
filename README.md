@@ -61,9 +61,11 @@ Benchmarked on an NVIDIA GB10 (DGX Spark) against the sklearn-based GMM-MI refer
 | gmm-mi-torch, CPU fp64 | 11.5 s | 1.9 s |
 | gmm-mi-torch, CUDA fp32 (tuned chunks) | **0.90 s** | **0.17 s** |
 
+Since v0.2.0 the EM inner loop evaluates Gaussian log-densities and M-step moments as matrix products against per-sample quadratic features (the classic GMM-GEMM formulation), which is several times faster than the previous broadcast kernels on both CPU and GPU at identical (float64 reduction-order) results; set `GMM_MI_TORCH_EM_KERNEL=legacy` to fall back to the previous kernels for one release. Inputs are standardised internally (estimates are invariant; fitted models are returned in original units), which also removes float32 factorisation failures on unstandardised data.
+
 On CUDA the replicate batches (`em_chunk`, `mc_chunk`) default to `'auto'`: each stage's batch is sized to fill half of the free device memory from a measured peak-memory model, with a floor of 32 replicates (per-replicate cost is flat above that), and a CUDA out-of-memory error halves the batch and retries. Results are batch-size invariant, so the setting only trades memory against speed; pass an integer to pin it. On CPU `'auto'` keeps the previous default of 8.
 
-Sample-dimension chunking (`n_chunk`) extends the reachable scale to N=10⁸, d=8 (total correlation in 23 min / 77.5 GiB at fp32 on 128 GB unified memory). One hardware caveat: on GPUs with rate-limited fp64 throughput (e.g. GB10), CUDA fp64 is slower than CPU fp64 — use fp32 on such devices (validated: the full test suite passes at fp32).
+Sample-dimension chunking (`n_chunk`) extends the reachable scale to N=10⁸, d=8 (total correlation in 23 min / 77.5 GiB at fp32 on 128 GB unified memory). One hardware caveat: on GPUs with rate-limited fp64 throughput (e.g. GB10), CUDA fp64 is slower than CPU fp64 — use fp32 on such devices (validated: the full test suite passes at fp32). On data-centre GPUs with full-rate fp64 (A100/H100/GH200 class), float64 costs only ~1.4x float32 end-to-end and avoids all reduced-precision caveats — prefer it there, especially for near-zero MI or spike-like marginals.
 
 ## Tests
 
@@ -73,7 +75,7 @@ pytest                                                    # CPU, float64
 GMM_MI_DEVICE=cuda GMM_MI_DTYPE=float32 GMM_MI_EM_CHUNK=1000 pytest   # GPU, float32
 ```
 
-The suite (28 tests) checks analytic Gaussian targets, Monte-Carlo/quadrature targets for multimodal and non-Gaussian cases, chunking parity, categorical MI, and error paths; `tests/conftest.py` routes the whole suite to a device/dtype via the `GMM_MI_*` environment variables. One additional statistical test — bootstrap-errorbar coverage calibration over 40 independent datasets — is slow and therefore gated behind `GMM_MI_OFFLINE=1`.
+The suite (35 tests) checks analytic Gaussian targets, Monte-Carlo/quadrature targets for multimodal and non-Gaussian cases, chunking parity, categorical MI, and error paths; `tests/conftest.py` routes the whole suite to a device/dtype via the `GMM_MI_*` environment variables. One additional statistical test — bootstrap-errorbar coverage calibration over 40 independent datasets — is slow and therefore gated behind `GMM_MI_OFFLINE=1`.
 
 For most readers, [docs/validation_summary.pdf](docs/validation_summary.pdf) is the right entry point to the validation results. The [validation/](validation/) directory additionally contains the full working report from the port's GB10 acceptance run ([validation/README.md](validation/README.md) explains its contents and provenance), kept in the repository for team review while it is private.
 

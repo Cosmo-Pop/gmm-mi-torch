@@ -23,10 +23,34 @@ Design notes
                    padding to a common tensor shape), argmax validation LL.
 """
 
+import functools
 import math
+import os
 import warnings
 
 import torch
+
+# EM kernel implementation: 'gemm' evaluates Gaussian log-densities and
+# M-step moments as matrix products against per-sample quadratic features
+# (the Kaldi / Machlica-et-al formulation) — several times faster and far
+# lighter on memory traffic than the broadcast 'legacy' kernels, which are
+# kept for one release as a parity reference and escape hatch.
+_EM_KERNEL = os.environ.get('GMM_MI_TORCH_EM_KERNEL', 'gemm')
+
+
+def _full_precision(fn):
+    """Pin float32 matmuls to full precision for the duration of a call:
+    frameworks that set torch's matmul precision to 'high'/'medium' (TF32,
+    10-bit mantissas) would silently degrade the GEMM-formulated EM."""
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        prev = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision('highest')
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            torch.set_float32_matmul_precision(prev)
+    return wrapped
 
 LOG2PI = math.log(2.0 * math.pi)
 
@@ -76,6 +100,9 @@ def _resolve_chunk(value, n_items, bytes_per_item, device):
 
 def _em_bytes_per_replicate(N, K, d, dtype, n_chunk=None):
     n_eff = N if n_chunk is None else min(N, int(n_chunk))
+    if _EM_KERNEL == 'gemm':
+        # one live (R,N,K) buffer plus GEMM workspace and slack
+        return n_eff * K * dtype.itemsize * 3
     return n_eff * K * dtype.itemsize * (4 * d + 4)
 
 
@@ -247,6 +274,167 @@ def marginal_score(X_full, w, mu, cov, idx):
     """
     mu_m, cov_m = marginal_params(mu, cov, idx)
     return gmm_score(X_full[..., list(idx)], w, mu_m, _chol(cov_m))
+
+
+# ----------------------------------------------------------------------
+# GEMM-formulated EM kernels
+# ----------------------------------------------------------------------
+# log w_k N(x|mu_k, Sigma_k) is a quadratic form in x, so with per-sample
+# features F(x) = [x, x_i x_j (i<=j)] it is one matmul against per-component
+# coefficients; the M-step moments are the transposed matmul resp^T F.  The
+# only (R,N,K)-sized tensor alive is the responsibilities themselves.
+# Numerical safeguards (data standardised in estimate(); coefficients and
+# moment accumulation at float64) keep the expansion's Chan-Golub-LeVeque
+# cancellation below float32 round-off elsewhere.
+
+
+def _features(X):
+    """Quadratic features [x, x_i x_j (i<=j)] of X (..., d): (..., d + d(d+1)/2)."""
+    d = X.shape[-1]
+    iu = torch.triu_indices(d, d, device=X.device)
+    return torch.cat([X, X[..., iu[0]] * X[..., iu[1]]], -1)
+
+
+def _tri_inv(L):
+    """Batched inverse of lower-triangular (..., d, d) by forward
+    substitution in pure tensor ops: batched cusolver routines
+    (cholesky_inverse / solve_triangular) are rate-limited on some GPUs,
+    while d^2 vectorised element ops are effectively free for small d."""
+    d = L.shape[-1]
+    inv_diag = 1.0 / torch.diagonal(L, dim1=-2, dim2=-1)   # (...,d)
+    Y = torch.zeros_like(L)
+    for j in range(d):
+        Y[..., j, j] = inv_diag[..., j]
+        for i in range(j + 1, d):
+            Y[..., i, j] = -(L[..., i, j:i] * Y[..., j:i, j]).sum(-1)                 * inv_diag[..., i]
+    return Y
+
+
+def _gauss_coef(w, mu, cov):
+    """GEMM coefficients of the weighted log-density quadratic form.
+
+    Returns coef (R,K,q), const (R,K) with
+    log w_k N(x|mu_k, cov_k) = _features(x) . coef_k + const_k.
+    The factorisation and inversion run at the native dtype (batched
+    float64 cusolver is rate-limited on some GPUs); a consistently-used,
+    slightly perturbed precision matrix is just the density of a slightly
+    different Gaussian, so only the *assembly* of the quadratic form — where
+    the expansion's terms cancel — needs float64, and gets it.
+    """
+    dt = cov.dtype
+    d = cov.shape[-1]
+    L = _chol(cov)
+    Y = _tri_inv(L)
+    P = (Y.transpose(-2, -1) @ Y).double()                 # (R,K,d,d)
+    logdet = torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1).double()
+    mu64 = mu.double()
+    Pm = (P @ mu64.unsqueeze(-1)).squeeze(-1)              # (R,K,d)
+    c = (mu64 * Pm).sum(-1)                                # (R,K)
+    iu = torch.triu_indices(d, d, device=cov.device)
+    off = (iu[0] != iu[1]).to(P.dtype)
+    Pq = P[..., iu[0], iu[1]] * (1.0 + off)                # doubled off-diagonals
+    coef = torch.cat([Pm, -0.5 * Pq], -1)                  # (R,K,q)
+    logw = torch.where(w > 0, torch.log(w.double().clamp_min(1e-300)),
+                       torch.full_like(c, -torch.inf))
+    const = logw - 0.5 * (c + d * LOG2PI) - logdet
+    return coef.to(dt), const.to(dt)
+
+
+def _estep_gemm(F, s, w, mu, cov):
+    """Responsibilities (Ra,N,K) and weighted mean log-likelihood (Ra,)."""
+    coef, const = _gauss_coef(w, mu, cov)
+    lj = torch.matmul(F.unsqueeze(0), coef.transpose(1, 2))
+    lj += const.unsqueeze(1)                               # (Ra,N,K)
+    m = lj.amax(-1, keepdim=True)
+    lj.sub_(m).exp_()
+    Z = lj.sum(-1, keepdim=True)
+    ll_n = (m + Z.log()).squeeze(-1)
+    resp = lj.div_(Z)
+    ll = (s * ll_n).sum(1) / s.sum(1)
+    return resp, ll
+
+
+def _mstep_from_moments(S, Nk, ssum, reg_covar, d, dt):
+    """Finalise the M-step from float64 moments S=(resp*s)^T F, Nk, s.sum(1)."""
+    dev = S.device
+    dead = Nk < 1e-10
+    Nks = Nk.clamp_min(1e-10).unsqueeze(-1)
+    m1 = S[..., :d] / Nks                                  # (R,K,d)
+    M2 = S[..., d:] / Nks
+    iu = torch.triu_indices(d, d, device=dev)
+    cov = torch.zeros(*S.shape[:-1], d, d, dtype=S.dtype, device=dev)
+    cov[..., iu[0], iu[1]] = M2
+    cov[..., iu[1], iu[0]] = M2
+    cov = cov - m1.unsqueeze(-1) * m1.unsqueeze(-2)
+    eye = torch.eye(d, dtype=S.dtype, device=dev)
+    cov = cov + reg_covar * eye
+    w = torch.where(dead, torch.zeros_like(Nk), Nk / ssum.double().unsqueeze(-1))
+    w = w / w.sum(-1, keepdim=True).clamp_min(1e-30)
+    m1 = torch.where(dead[..., None], torch.zeros_like(m1), m1)
+    cov = torch.where(dead[..., None, None], eye.expand_as(cov), cov)
+    return w.to(dt), m1.to(dt), cov.to(dt)
+
+
+_MSTEP_BLOCK = 512
+
+
+def _moment_gemm(wr, F):
+    """S = wr^T F accumulated at float64: one GEMM at float64 input, else
+    block-wise float32 GEMMs reduced in float64 (accumulation error scales
+    with sqrt(block) instead of sqrt(N), at plain-SGEMM cost)."""
+    R, N, K = wr.shape
+    q = F.shape[-1]
+    if F.dtype == torch.float64:
+        return torch.matmul(wr.transpose(1, 2), F.unsqueeze(0))
+    nb = N // _MSTEP_BLOCK
+    S = torch.zeros(R, K, q, dtype=torch.float64, device=F.device)
+    if nb > 0:
+        N0 = nb * _MSTEP_BLOCK
+        wrb = (wr[:, :N0].transpose(1, 2).reshape(R, K, nb, _MSTEP_BLOCK)
+               .permute(0, 2, 1, 3))                       # (R,nb,K,b)
+        Fb = F[:N0].reshape(nb, _MSTEP_BLOCK, q)
+        S += torch.matmul(wrb, Fb.unsqueeze(0)).double().sum(1)
+    if N % _MSTEP_BLOCK:
+        N0 = nb * _MSTEP_BLOCK
+        S += torch.matmul(wr[:, N0:].transpose(1, 2), F[N0:].unsqueeze(0)).double()
+    return S
+
+
+def _mstep_gemm(F, resp, s, reg_covar, d):
+    """M-step via resp^T F; consumes resp in place. float64 accumulation."""
+    wr = resp.mul_(s.unsqueeze(-1))
+    S = _moment_gemm(wr, F)
+    return _mstep_from_moments(S, wr.sum(1).double(), s.sum(1), reg_covar, d,
+                               F.dtype)
+
+
+def _em_step_gemm_nchunked(X, s, w, mu, cov, reg_covar, n_chunk):
+    """One GEMM EM iteration streamed over sample chunks (float64 moments)."""
+    Ra, N = s.shape
+    d = X.shape[-1]
+    K = w.shape[-1]
+    dt, dev = X.dtype, X.device
+    coef, const = _gauss_coef(w, mu, cov)
+    q = coef.shape[-1]
+    S = torch.zeros(Ra, K, q, dtype=torch.float64, device=dev)
+    Nk = torch.zeros(Ra, K, dtype=torch.float64, device=dev)
+    ll_sum = torch.zeros(Ra, dtype=torch.float64, device=dev)
+    for i in range(0, N, n_chunk):
+        Fc = _features(X[i:i+n_chunk])
+        sc = s[:, i:i+n_chunk]
+        lj = torch.matmul(Fc.unsqueeze(0), coef.transpose(1, 2))
+        lj += const.unsqueeze(1)
+        m = lj.amax(-1, keepdim=True)
+        lj.sub_(m).exp_()
+        Z = lj.sum(-1, keepdim=True)
+        ll_n = (m + Z.log()).squeeze(-1)
+        wr = lj.div_(Z).mul_(sc.unsqueeze(-1))
+        Nk += wr.sum(1).double()
+        S += _moment_gemm(wr, Fc)
+        ll_sum += (sc * ll_n).sum(1).double()
+    ll = (ll_sum / s.sum(1).double()).to(dt)
+    w_new, mu_new, cov_new = _mstep_from_moments(S, Nk, s.sum(1), reg_covar, d, dt)
+    return ll, w_new, mu_new, cov_new
 
 
 # ----------------------------------------------------------------------
@@ -494,12 +682,21 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
     ll_out = torch.full((R,), -torch.inf, dtype=X.dtype, device=dev)
     prev = torch.full((R,), -torch.inf, dtype=X.dtype, device=dev)
     sa = s
+    gemm = _EM_KERNEL == 'gemm'
+    F = _features(X) if gemm and n_chunk is None else None
     for _ in range(max_iter):
         Ra = ai.shape[0]
-        chol = _chol(cov)
-        logw = torch.where(w > 0, torch.log(w.clamp_min(1e-300)),
-                           torch.full_like(w, -torch.inf))
-        if n_chunk is None:
+        if gemm:
+            if n_chunk is None:
+                resp, ll = _estep_gemm(F, sa, w, mu, cov)
+                w, mu, cov = _mstep_gemm(F, resp, sa, reg_covar, X.shape[-1])
+            else:
+                ll, w, mu, cov = _em_step_gemm_nchunked(X, sa, w, mu, cov,
+                                                        reg_covar, n_chunk)
+        elif n_chunk is None:
+            chol = _chol(cov)
+            logw = torch.where(w > 0, torch.log(w.clamp_min(1e-300)),
+                               torch.full_like(w, -torch.inf))
             Xr = X.expand(Ra, N, X.shape[-1])
             logjoint = logw.unsqueeze(1) + log_gauss(Xr, mu, chol)  # (Ra,N,K)
             ll_n = torch.logsumexp(logjoint, dim=-1)                # (Ra,N)
@@ -507,6 +704,9 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
             ll = (sa * ll_n).sum(1) / sa.sum(1)
             w, mu, cov = _m_step(Xr, resp, sa, reg_covar)
         else:
+            chol = _chol(cov)
+            logw = torch.where(w > 0, torch.log(w.clamp_min(1e-300)),
+                               torch.full_like(w, -torch.inf))
             ll, w, mu, cov = _em_step_nchunked(X, sa, w, mu, cov, chol,
                                                logw, reg_covar, n_chunk)
         done = (ll - prev).abs() < threshold_fit
@@ -545,6 +745,16 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None):
     torch.Tensor of shape (n_replicates,)
     """
     R, N = s_val.shape
+    if _EM_KERNEL == 'gemm':
+        coef, const = _gauss_coef(w, mu, cov)
+        acc = torch.zeros(R, dtype=X.dtype, device=X.device)
+        for i in range(0, N, n_chunk or N):
+            Fc = _features(X[i:i+(n_chunk or N)])
+            lj = torch.matmul(Fc.unsqueeze(0), coef.transpose(1, 2))
+            lj += const.unsqueeze(1)
+            acc = acc + (s_val[:, i:i+(n_chunk or N)]
+                         * torch.logsumexp(lj, -1)).sum(1)
+        return acc / s_val.sum(1).clamp_min(1e-30)
     chol = _chol(cov)
     if n_chunk is None:
         ll_n = gmm_score(X.expand(R, N, X.shape[-1]), w, mu, chol)
@@ -835,6 +1045,7 @@ class FittedGMM:
         return ll[0].cpu().numpy()
 
 
+@_full_precision
 def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
              mc_samples=100_000, max_components=20, n_folds=2, n_inits=3,
              reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, seed=0, return_k=False,
@@ -1114,6 +1325,7 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     return out
 
 
+@_full_precision
 def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
                          mc_samples=100_000, max_components=10, n_folds=2, n_inits=3,
                          reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, seed=0,
