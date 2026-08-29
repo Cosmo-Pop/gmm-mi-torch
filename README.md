@@ -65,6 +65,47 @@ Since v0.2.0 the EM inner loop evaluates Gaussian log-densities and M-step momen
 
 On CUDA the replicate batches (`em_chunk`, `mc_chunk`) default to `'auto'`: each stage's batch is sized to fill half of the free device memory from a measured peak-memory model, with a floor of 32 replicates (per-replicate cost is flat above that), and a CUDA out-of-memory error halves the batch and retries. Results are batch-size invariant, so the setting only trades memory against speed; pass an integer to pin it. On CPU `'auto'` keeps the previous default of 8.
 
+### Many pairs, many GPUs
+
+A single `estimate()` call already fills one GPU, so on one device the fastest way through a grid of variable pairs is simply a loop. On a node with several GPUs, run one worker process per GPU and give each worker its own device:
+
+```python
+import multiprocessing as mp
+import os
+from concurrent.futures import ProcessPoolExecutor
+
+N_GPUS = 4  # GPUs available to this job
+
+
+def init_worker(counter, n_gpus):
+    # runs in each child before any CUDA use: pin this worker to one GPU
+    with counter.get_lock():
+        idx = counter.value
+        counter.value += 1
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(idx % n_gpus)
+
+
+def one_pair(task):
+    import torch
+    from gmm_mi_torch import estimate
+    (i, j), X = task
+    mi, sigma = estimate(X, "MI", device="cuda", dtype=torch.float64)
+    return i, j, mi, sigma
+
+
+if __name__ == "__main__":
+    tasks = [((i, j), X[:, [i, j]]) for i, j in pairs]   # your pair list
+    ctx = mp.get_context("spawn")   # fork is unsafe once CUDA is involved
+    counter = ctx.Value("i", 0)
+    with ProcessPoolExecutor(max_workers=N_GPUS, mp_context=ctx,
+                             initializer=init_worker,
+                             initargs=(counter, N_GPUS)) as pool:
+        for i, j, mi, sigma in pool.map(one_pair, tasks):
+            print(i, j, mi, sigma)
+```
+
+The `spawn` start method and the environment variable set in the initializer matter: CUDA contexts do not survive `fork`, and a worker must be pinned to its GPU before the first CUDA call. On one GPU this pool buys nothing — leave `max_workers` at the GPU count, never higher. Process pools also do not work from inside a notebook (the workers cannot import functions defined there); keep this pattern in a script.
+
 Sample-dimension chunking (`n_chunk`) extends the reachable scale to N=10⁸, d=8 (total correlation in 23 min / 77.5 GiB at fp32 on 128 GB unified memory). One hardware caveat: on GPUs with rate-limited fp64 throughput (e.g. GB10), CUDA fp64 is slower than CPU fp64 — use fp32 on such devices (validated: the full test suite passes at fp32). On data-centre GPUs with full-rate fp64 (A100/H100/GH200 class), float64 costs only ~1.4x float32 end-to-end and avoids all reduced-precision caveats — prefer it there, especially for near-zero MI or spike-like marginals.
 
 ## Tests
