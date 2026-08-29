@@ -30,11 +30,10 @@ import warnings
 
 import torch
 
-# EM kernel implementation: 'gemm' evaluates Gaussian log-densities and
-# M-step moments as matrix products against per-sample quadratic features
-# (the Kaldi / Machlica-et-al formulation) — several times faster and far
-# lighter on memory traffic than the broadcast 'legacy' kernels, which are
-# kept for one release as a parity reference and escape hatch.
+# EM kernel implementation. 'gemm' evaluates the Gaussian log-densities
+# and the M-step moments as matrix products against per-sample quadratic
+# features (see the kernel section below); 'legacy' selects the previous
+# broadcast kernels. Both give the same results.
 _EM_KERNEL = os.environ.get('GMM_MI_TORCH_EM_KERNEL', 'gemm')
 
 
@@ -99,6 +98,7 @@ def _resolve_chunk(value, n_items, bytes_per_item, device):
 
 
 def _em_bytes_per_replicate(N, K, d, dtype, n_chunk=None):
+    """Peak memory per EM replicate, from the measured model above."""
     n_eff = N if n_chunk is None else min(N, int(n_chunk))
     if _EM_KERNEL == 'gemm':
         # one live (R,N,K) buffer plus GEMM workspace and slack
@@ -107,6 +107,7 @@ def _em_bytes_per_replicate(N, K, d, dtype, n_chunk=None):
 
 
 def _mc_bytes_per_replicate(mc_samples, K, d, dtype):
+    """Peak memory per MC-integration replicate, from the model above."""
     return mc_samples * K * dtype.itemsize * (3 * d + 2)
 
 
@@ -279,13 +280,16 @@ def marginal_score(X_full, w, mu, cov, idx):
 # ----------------------------------------------------------------------
 # GEMM-formulated EM kernels
 # ----------------------------------------------------------------------
-# log w_k N(x|mu_k, Sigma_k) is a quadratic form in x, so with per-sample
-# features F(x) = [x, x_i x_j (i<=j)] it is one matmul against per-component
-# coefficients; the M-step moments are the transposed matmul resp^T F.  The
-# only (R,N,K)-sized tensor alive is the responsibilities themselves.
-# Numerical safeguards (data standardised in estimate(); coefficients and
-# moment accumulation at float64) keep the expansion's Chan-Golub-LeVeque
-# cancellation below float32 round-off elsewhere.
+# log w_k N(x|mu_k, Sigma_k) is a quadratic form in x, so against per-sample
+# features F(x) = [x, x_i x_j (i<=j)] it is one matrix product with
+# per-component coefficients, and the M-step moments are the transposed
+# product resp^T F (Machlica, Vanek & Zajic 2011). The only tensor of shape
+# (n_replicates, n_samples, n_components) is the responsibilities.
+# The expanded quadratic form cancels almost completely for points inside a
+# component, so the coefficients are assembled at float64 and the moments
+# accumulated at float64 (see _gauss_coef and _moment_gemm); the data are
+# standardised in estimate(), which bounds the magnitudes entering the
+# cancellation (Chan, Golub & LeVeque 1983).
 
 
 def _features(X):
@@ -297,9 +301,10 @@ def _features(X):
 
 def _tri_inv(L):
     """Batched inverse of lower-triangular (..., d, d) by forward
-    substitution in pure tensor ops: batched cusolver routines
-    (cholesky_inverse / solve_triangular) are rate-limited on some GPUs,
-    while d^2 vectorised element ops are effectively free for small d."""
+    substitution in plain tensor ops. The library routines
+    (cholesky_inverse, solve_triangular) are slow on some GPUs when batched
+    over many small matrices; d^2 vectorised element operations are cheap
+    at the small d used here."""
     d = L.shape[-1]
     inv_diag = 1.0 / torch.diagonal(L, dim1=-2, dim2=-1)   # (...,d)
     Y = torch.zeros_like(L)
@@ -315,11 +320,12 @@ def _gauss_coef(w, mu, cov):
 
     Returns coef (R,K,q), const (R,K) with
     log w_k N(x|mu_k, cov_k) = _features(x) . coef_k + const_k.
-    The factorisation and inversion run at the native dtype (batched
-    float64 cusolver is rate-limited on some GPUs); a consistently-used,
-    slightly perturbed precision matrix is just the density of a slightly
-    different Gaussian, so only the *assembly* of the quadratic form — where
-    the expansion's terms cancel — needs float64, and gets it.
+    The factorisation and inversion run at the native dtype; the quadratic
+    form is then assembled at float64. The assembly is where precision
+    matters: the expansion's terms cancel almost completely, so low-precision
+    arithmetic there corrupts the log-density itself, whereas a small error
+    in the precision matrix only evaluates the density of a slightly
+    perturbed Gaussian.
     """
     dt = cov.dtype
     d = cov.shape[-1]
@@ -951,6 +957,7 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
 # ----------------------------------------------------------------------
 
 def _integrand_MI(pts, w, mu, cov, chol):
+    """log p(x,y) - log p(x) - log p(y) at the sampled points."""
     joint = gmm_score(pts, w, mu, chol)
     mx = marginal_score(pts, w, mu, cov, [0])
     my = marginal_score(pts, w, mu, cov, [1])
@@ -958,6 +965,7 @@ def _integrand_MI(pts, w, mu, cov, chol):
 
 
 def _integrand_cMI(pts, w, mu, cov, chol):
+    """log p(x,y,z) + log p(z) - log p(x,z) - log p(y,z)."""
     d = pts.shape[-1]
     zs = list(range(2, d))
     joint = gmm_score(pts, w, mu, chol)
@@ -968,6 +976,7 @@ def _integrand_cMI(pts, w, mu, cov, chol):
 
 
 def _integrand_TC(pts, w, mu, cov, chol):
+    """log p(x) - sum_i log p(x_i)."""
     joint = gmm_score(pts, w, mu, chol)
     marg = sum(marginal_score(pts, w, mu, cov, [i])
                for i in range(pts.shape[-1]))
