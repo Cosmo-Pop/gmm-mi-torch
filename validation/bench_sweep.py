@@ -37,7 +37,7 @@ def sync():
 
 
 def device_info(dev):
-    info = dict(torch=torch.__version__, python=platform.python_version(),
+    info = dict(torch=torch.__version__, em_kernel=getattr(E, '_EM_KERNEL', 'legacy'), python=platform.python_version(),
                 gmm_mi_torch=getattr(gmm_mi_torch, '__version__', 'n/a'),
                 device=dev, matmul_precision=torch.get_float32_matmul_precision(),
                 allow_tf32=torch.backends.cuda.matmul.allow_tf32)
@@ -75,13 +75,20 @@ def saturation(Xt, dtype, batches, K=20):
         w, mu, cov = E._init_params(Xt, K, Ra, 1e-6, generator=g, em_chunk=Ra)
         s = torch.ones(Ra, N, device=Xt.device, dtype=dtype)
 
-        def step():
-            chol = E._chol(cov)
-            logw = torch.log(w.clamp_min(1e-300))
-            Xr = Xt.expand(Ra, N, d)
-            lj = logw.unsqueeze(1) + E.log_gauss(Xr, mu, chol)
-            ll_n = torch.logsumexp(lj, -1)
-            return E._m_step(Xr, torch.exp(lj - ll_n.unsqueeze(-1)), s, 1e-6)
+        if getattr(E, '_EM_KERNEL', 'legacy') == 'gemm':
+            F = E._features(Xt)
+
+            def step():
+                resp, _ = E._estep_gemm(F, s, w, mu, cov)
+                return E._mstep_gemm(F, resp, s, 1e-6, d)
+        else:
+            def step():
+                chol = E._chol(cov)
+                logw = torch.log(w.clamp_min(1e-300))
+                Xr = Xt.expand(Ra, N, d)
+                lj = logw.unsqueeze(1) + E.log_gauss(Xr, mu, chol)
+                ll_n = torch.logsumexp(lj, -1)
+                return E._m_step(Xr, torch.exp(lj - ll_n.unsqueeze(-1)), s, 1e-6)
         step(); sync(); t = time.perf_counter()
         for _ in range(5):
             step()
