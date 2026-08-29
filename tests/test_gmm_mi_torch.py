@@ -519,3 +519,75 @@ def test_chunk_oom_fallback(monkeypatch):
     assert calls[:3] == [16, 8, 4]
     for a, b in zip(ref, out):
         assert torch.equal(a, b)
+
+
+def test_unstandardised_collinear_fp32_regression():
+    # float32 used to abort with a Cholesky error on strongly correlated
+    # unstandardised pairs (beta-tester failure mode): covariance entries of
+    # order 1e4 round to an indefinite matrix, and an absolute reg_covar=1e-6
+    # is 1000x too small to save it. With internal standardisation (plus the
+    # escalation fallback) the fit must complete.
+    rng = np.random.default_rng(1)
+    x = rng.normal(0, 1, 5000)
+    X_raw = np.column_stack([x * 100 + 500,
+                             x * 100 + 500 + rng.normal(0, 0.1, 5000)])
+    m_raw, s_raw = estimate(X_raw, 'MI', dtype=torch.float32, n_bootstrap=8,
+                            max_components=8)
+    assert np.isfinite(m_raw) and np.isfinite(s_raw)
+    assert m_raw > 3.0        # near-collinear pair: MI is large
+
+
+def test_mi_affine_invariance_fp64():
+    # MI is exactly invariant under per-variable affine maps; at float64 the
+    # rounding of the map is far below EM's sensitivity on a well-conditioned
+    # pair, so raw and rescaled inputs must agree tightly
+    rho = 0.6
+    cov = np.array([[1.0, rho], [rho, 1.0]])
+    rng = np.random.default_rng(0)
+    X = rng.multivariate_normal([0, 0], cov, 5000)
+    common = dict(max_components=3, n_bootstrap=10, dtype=torch.float64)
+    m1, s1 = estimate(X, 'MI', **common)
+    m2, s2 = estimate(X * [10.0, 0.1] + [100.0, -5.0], 'MI', **common)
+    assert abs(m1 - m2) < 1e-6
+    assert abs(s1 - s2) < 1e-6
+
+
+def test_kl_shared_affine_invariance():
+    # KL between the two 1D marginals is invariant under a common affine map
+    # of both columns; the internal standardisation must therefore share one
+    # scale between the columns for the KL quantities.
+    rng = np.random.default_rng(0)
+    X = np.column_stack([rng.normal(0.0, 1.0, 6000),
+                         rng.normal(0.5, 1.3, 6000)])
+    common = dict(max_components=3, n_bootstrap=10)
+    k1, _ = estimate(X, 'KL_forward', **common)
+    k2, _ = estimate(X * 3.0 + 7.0, 'KL_forward', **common)
+    assert k1 > 0.05          # the marginals genuinely differ
+    assert abs(k1 - k2) < 5e-3
+
+
+def test_return_fit_original_units():
+    # the fit runs on standardised data; the returned model must be in the
+    # caller's units, including strongly mismatched column scales
+    rho = 0.6
+    cov = np.array([[1.0, rho], [rho, 1.0]])
+    rng = np.random.default_rng(0)
+    X = rng.multivariate_normal([0, 0], cov, 5000) * [10.0, 0.1] + [100.0, -5.0]
+    _, _, fit = estimate(X, 'MI', max_components=3, n_bootstrap=5,
+                         return_fit=True)
+    S = fit.sample(200_000, seed=3)
+    C_data, C_fit = np.cov(X.T), np.cov(S.T)
+    assert np.allclose(C_fit, C_data, rtol=0.1, atol=1e-3)
+    mean_fit = (fit.weights_[:, None] * fit.means_).sum(0)
+    assert np.allclose(mean_fit, X.mean(0), atol=[0.5, 0.005])
+
+
+def test_chol_escalation_recovers():
+    # a slightly indefinite covariance must be repaired by escalating
+    # diagonal regularisation, with a RuntimeWarning, not abort
+    E = gmm_mi_torch.estimator
+    cov = torch.tensor([[[[1.0, 1.0 + 1e-6], [1.0 + 1e-6, 1.0]]]],
+                       dtype=torch.float64)
+    with pytest.warns(RuntimeWarning):
+        L = E._chol(cov)
+    assert torch.isfinite(L).all()

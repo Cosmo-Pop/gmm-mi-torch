@@ -109,12 +109,38 @@ def _run_chunked(n, chunk, fn):
 # ----------------------------------------------------------------------
 
 def _chol(cov):
-    """Cholesky of (R,K,d,d), with dead components (zero cov) padded to I."""
+    """Cholesky of (R,K,d,d) covariances.
+
+    Dead components (zero cov) are padded to I.  A component whose
+    factorisation fails — round-off can make a near-degenerate covariance
+    indefinite, especially at float32 — gets escalating diagonal
+    regularisation scaled to its own mean variance until the factorisation
+    succeeds (with a RuntimeWarning): the per-component analogue of GMM-MI's
+    refit-at-larger-reg_covar fallback, without abandoning the whole fit.
+    """
     d = cov.shape[-1]
     eye = torch.eye(d, dtype=cov.dtype, device=cov.device)
     dead = cov.abs().sum(dim=(-2, -1)) < 1e-30            # (R,K)
     safe = torch.where(dead[..., None, None], eye.expand_as(cov), cov)
-    return torch.linalg.cholesky(safe)
+    L, info = torch.linalg.cholesky_ex(safe)
+    if not bool(info.any()):
+        return L
+    scale = torch.diagonal(safe, dim1=-2, dim2=-1).mean(-1)   # (R,K)
+    bump = 1e-6
+    for _ in range(10):
+        bad = info > 0
+        safe = torch.where(bad[..., None, None],
+                           safe + (bump * scale)[..., None, None] * eye, safe)
+        L, info = torch.linalg.cholesky_ex(safe)
+        if not bool(info.any()):
+            warnings.warn(
+                f"{int(bad.sum())} covariance factorisation(s) needed extra "
+                f"diagonal regularisation (up to {bump:g} x mean variance)",
+                RuntimeWarning, stacklevel=2)
+            return L
+        bump *= 10.0
+    raise RuntimeError("covariance factorisation failed even after diagonal "
+                       "regularisation up to 1e4 x mean variance")
 
 
 def log_gauss(X, mu, chol):
@@ -871,7 +897,11 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         Constant added to the diagonal of every covariance matrix to prevent
         singularities. Smaller values perturb the estimate less but risk
         failed Cholesky factorisations; 1e-6 is safe at float32, where
-        GMM-MI's 1e-15 would regularise nothing.
+        GMM-MI's 1e-15 would regularise nothing. The data are internally
+        standardised (see Notes), so this floor is relative to each
+        variable's variance; a component whose factorisation still fails
+        receives escalating diagonal regularisation automatically (with a
+        RuntimeWarning) instead of aborting the fit.
     threshold_fit : float, default=1e-5
         EM convergence threshold on the change in mean per-sample
         log-likelihood. Smaller values give more converged fits at the cost
@@ -958,6 +988,18 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     fit : FittedGMM
         The selected model refitted on the full data; only if `return_fit`
         is True (appended after `k` when both flags are set).
+
+    Notes
+    -----
+    The data are standardised internally before fitting: each variable is
+    affinely mapped to zero mean and unit variance (the KL quantities use a
+    single map shared by both columns, under which KL is invariant). All
+    estimated quantities are exactly invariant under these maps, and the
+    `return_fit` model is transformed back, so the standardisation is
+    unobservable except through `reg_covar` (now a scale-free floor), the
+    `scale` argument of the minmax/randomized k-means initialisers (now in
+    standardised units), and the absence of float32 failures on
+    unstandardised data.
     """
     X = torch.as_tensor(X, dtype=dtype, device=device)
     if preprocess == 'gaussianise':
@@ -970,6 +1012,20 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     elif preprocess != 'none':
         raise ValueError(f"preprocess must be 'none' or 'gaussianise'; "
                          f"found '{preprocess}'")
+    # Internal per-variable affine standardisation.  MI, cMI and TC are
+    # exactly invariant under per-variable affine maps, and the KL quantities
+    # under a map shared by both columns, so no estimated quantity changes;
+    # it makes `reg_covar` a scale-free floor and prevents float32 Cholesky
+    # failures on unstandardised, strongly correlated pairs.  The fitted
+    # model returned by `return_fit` is mapped back to the original units.
+    if quantity in ('KL_forward', 'KL_reverse'):
+        col_mean = X.mean().expand(X.shape[1]).contiguous()
+        col_std = X.std().expand(X.shape[1]).contiguous()
+    else:
+        col_mean = X.mean(0)
+        col_std = X.std(0)
+    col_std = torch.where(col_std > 0, col_std, torch.ones_like(col_std))
+    X = (X - col_mean) / col_std
     if quantity in ('MI', 'KL_forward', 'KL_reverse'):
         assert X.shape[1] == 2
     if quantity == 'cMI':
@@ -1017,7 +1073,9 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
                                   cov1.unsqueeze(0), reg_covar, threshold_fit,
                                   max_iter, em_chunk=em_chunk_boot, n_chunk=n_chunk)
         alive = wf[0] > 0
-        fit = FittedGMM(wf[0][alive], muf[0][alive], covf[0][alive])
+        fit = FittedGMM(wf[0][alive],
+                        muf[0][alive] * col_std + col_mean,
+                        covf[0][alive] * (col_std[:, None] * col_std[None, :]))
     g = torch.Generator(device=X.device).manual_seed(seed + 10_000)
     if n_bootstrap >= 1:
         if N <= _MULTINOMIAL_MAX_CATEGORIES:
@@ -1109,6 +1167,10 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         Selected component count per category; only if `return_k` is True.
     """
     X = torch.as_tensor(X, dtype=dtype, device=device).reshape(-1, 1)
+    # shared affine standardisation of the continuous variable: MI with a
+    # categorical variable is invariant, and reg_covar becomes scale-free
+    x_std = X.std()
+    X = (X - X.mean()) / torch.where(x_std > 0, x_std, torch.ones_like(x_std))
     Y = torch.as_tensor(Y, device=device).reshape(-1)
     cats = torch.unique(Y)
     C = cats.shape[0]
