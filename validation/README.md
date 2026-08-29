@@ -56,3 +56,4 @@ default (v0.1.1), all run on the same GB10 with `PYTHONPATH=<repo> python <scrip
 - `bench_gemm_step.py` — GEMM-vs-legacy EM-step parity at float64 and the per-step
   timing behind the v0.2.0 numbers (206 -> 61.6 ms at Ra=300, N=20k, K=20, d=2,
   fp32 on GB10).
+- `sweep_gh200_v020.{json,md}` — `bench_sweep.py` on the same Isambard-AI GH200 at v0.2.0 (GEMM EM kernels), for comparison with `sweep_gh200` (v0.1.1) and `sweep_gb10_v020`.
