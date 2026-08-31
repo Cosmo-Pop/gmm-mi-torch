@@ -6,5 +6,5 @@ plotting helpers live in `gmm_mi_torch.plotting`.
 """
 from .estimator import FittedGMM, estimate, estimate_categorical
 
-__version__ = '0.2.0'   # keep in sync with pyproject.toml
+__version__ = '0.2.1'   # keep in sync with pyproject.toml
 __all__ = ['FittedGMM', 'estimate', 'estimate_categorical', '__version__']

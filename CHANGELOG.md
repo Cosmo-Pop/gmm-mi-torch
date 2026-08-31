@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1 (2026-08-31)
+
+- Fix an abort ("covariance factorisation failed even after diagonal
+  regularisation") on float32 fits of zero-inflated variable pairs, found in
+  beta testing. Two causes: float32 moment accumulation could round a
+  collapsed component's variance below the `reg_covar` floor (the M-step now
+  restores the floor on the diagonal), and the repair bump was scaled by the
+  mean diagonal entry, which is negative for exactly the components that
+  need repairing (now the largest absolute entry). Non-finite covariances
+  are additionally reset to identity instead of blocking the repair loop.
+
 ## 0.2.0 (2026-08-29)
 
 - The EM inner loop evaluates Gaussian log-densities and M-step moments as

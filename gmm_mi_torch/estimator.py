@@ -149,11 +149,19 @@ def _chol(cov):
     d = cov.shape[-1]
     eye = torch.eye(d, dtype=cov.dtype, device=cov.device)
     dead = cov.abs().sum(dim=(-2, -1)) < 1e-30            # (R,K)
-    safe = torch.where(dead[..., None, None], eye.expand_as(cov), cov)
+    broken = ~torch.isfinite(cov).all(dim=(-2, -1))       # (R,K)
+    safe = torch.where((dead | broken)[..., None, None], eye.expand_as(cov),
+                       cov)
     L, info = torch.linalg.cholesky_ex(safe)
     if not bool(info.any()):
+        if bool(broken.any()):
+            warnings.warn(f"{int(broken.sum())} non-finite covariance(s) "
+                          f"reset to identity", RuntimeWarning, stacklevel=2)
         return L
-    scale = torch.diagonal(safe, dim1=-2, dim2=-1).mean(-1)   # (R,K)
+    # positive by construction: a corrupted component can have a negative or
+    # near-zero mean diagonal, which must not flip the bump's sign
+    scale = torch.diagonal(safe, dim1=-2, dim2=-1).abs().amax(-1)
+    scale = scale.clamp_min(torch.finfo(cov.dtype).tiny)      # (R,K)
     bump = 1e-6
     for _ in range(10):
         bad = info > 0
@@ -163,8 +171,8 @@ def _chol(cov):
         if not bool(info.any()):
             warnings.warn(
                 f"{int(bad.sum())} covariance factorisation(s) needed extra "
-                f"diagonal regularisation (up to {bump:g} x mean variance)",
-                RuntimeWarning, stacklevel=2)
+                f"diagonal regularisation (up to {bump:g} x largest "
+                f"diagonal entry)", RuntimeWarning, stacklevel=2)
             return L
         bump *= 10.0
     raise RuntimeError("covariance factorisation failed even after diagonal "
@@ -374,6 +382,10 @@ def _mstep_from_moments(S, Nk, ssum, reg_covar, d, dt):
     cov = cov - m1.unsqueeze(-1) * m1.unsqueeze(-2)
     eye = torch.eye(d, dtype=S.dtype, device=dev)
     cov = cov + reg_covar * eye
+    # the accumulated M2 - m1^2 can round below the reg_covar floor for a
+    # component collapsed onto near-duplicate points; restore the floor
+    diag = torch.diagonal(cov, dim1=-2, dim2=-1)
+    diag.clamp_(min=reg_covar)
     w = torch.where(dead, torch.zeros_like(Nk), Nk / ssum.double().unsqueeze(-1))
     w = w / w.sum(-1, keepdim=True).clamp_min(1e-30)
     m1 = torch.where(dead[..., None], torch.zeros_like(m1), m1)
