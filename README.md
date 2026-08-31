@@ -16,8 +16,17 @@ Errorbars come from a bootstrap: multinomial-count sample weights over `n_bootst
 
 ## Installation
 
+Optionally start from a fresh environment:
+
 ```bash
-git clone git@github.com:Cosmo-pop/gmm-mi-torch.git
+conda create -n gmm-mi-torch python=3.11
+conda activate gmm-mi-torch
+```
+
+(or `python -m venv .venv && source .venv/bin/activate`). Then:
+
+```bash
+git clone git@github.com:Cosmo-Pop/gmm-mi-torch.git
 cd gmm-mi-torch
 pip install .          # or: pip install -e .[test]
 ```
@@ -61,7 +70,7 @@ Benchmarked on an NVIDIA GB10 (DGX Spark) against the sklearn-based GMM-MI refer
 | gmm-mi-torch, CPU fp64 | 11.5 s | 1.9 s |
 | gmm-mi-torch, CUDA fp32 (tuned chunks) | **0.90 s** | **0.17 s** |
 
-Since v0.2.0 the EM inner loop evaluates Gaussian log-densities and M-step moments as matrix products against per-sample quadratic features (the classic GMM-GEMM formulation), which is several times faster than the previous broadcast kernels on both CPU and GPU at identical (float64 reduction-order) results; set `GMM_MI_TORCH_EM_KERNEL=legacy` to fall back to the previous kernels for one release. Inputs are standardised internally (estimates are invariant; fitted models are returned in original units), which also removes float32 factorisation failures on unstandardised data.
+Since v0.2.0 the EM inner loop evaluates Gaussian log-densities and M-step moments as matrix products against per-sample quadratic features — a GMM log-density is a quadratic form in the sample, so scoring N samples against K components is one matrix multiplication, and the M-step moments are the transposed one; see [Machlica, Vaněk & Zajíc (2011)](https://ieeexplore.ieee.org/document/6118944) for the formulation and the comments in `gmm_mi_torch/estimator.py` (kernel section) for the numerical safeguards, which follow [Chan, Golub & LeVeque (1983)](https://www.tandfonline.com/doi/abs/10.1080/00031305.1983.10483115). This is several times faster than the previous broadcast kernels on both CPU and GPU at identical (float64 reduction-order) results; set `GMM_MI_TORCH_EM_KERNEL=legacy` to fall back to the previous kernels for one release. Inputs are standardised internally (estimates are invariant; fitted models are returned in original units), which also removes float32 factorisation failures on unstandardised data.
 
 On CUDA the replicate batches (`em_chunk`, `mc_chunk`) default to `'auto'`: each stage's batch is sized to fill half of the free device memory from a measured peak-memory model, with a floor of 32 replicates (per-replicate cost is flat above that), and a CUDA out-of-memory error halves the batch and retries. Results are batch-size invariant, so the setting only trades memory against speed; pass an integer to pin it. On CPU `'auto'` keeps the previous default of 8.
 
@@ -94,7 +103,9 @@ def one_pair(task):
 
 
 if __name__ == "__main__":
-    tasks = [((i, j), X[:, [i, j]]) for i, j in pairs]   # your pair list
+    X = load_my_data()                     # (n_samples, n_variables) array
+    pairs = [(i, j) for i in range(X.shape[1]) for j in range(i + 1, X.shape[1])]
+    tasks = [((i, j), X[:, [i, j]]) for i, j in pairs]
     ctx = mp.get_context("spawn")   # fork is unsafe once CUDA is involved
     counter = ctx.Value("i", 0)
     with ProcessPoolExecutor(max_workers=N_GPUS, mp_context=ctx,
