@@ -2,6 +2,7 @@
 gmm_mi/tests/test_sample.py (analytic targets, sigma-band assertions)."""
 
 import os
+import warnings
 
 import numpy as np
 import pytest
@@ -648,3 +649,60 @@ def test_gemm_legacy_estimate_parity_fp64(monkeypatch):
         assert kg == kl
         assert abs(mg - ml) < 1e-6
         assert abs(sg - sl) < 1e-6
+
+
+def test_mstep_covariance_floor():
+    # float32 moment accumulation can round M2 - m1^2 below the reg_covar
+    # floor for a component collapsed onto near-duplicate points; the M-step
+    # must restore the floor on the diagonal
+    E = gmm_mi_torch.estimator
+    Nk = torch.tensor([[100.0]], dtype=torch.float64)
+    m1, M2 = 1.0, 1.0 - 2e-6            # variance -2e-6 before regularisation
+    S = torch.tensor([[[m1, M2]]], dtype=torch.float64) * 100.0
+    ssum = torch.tensor([100.0])
+    w, mu, cov = E._mstep_from_moments(S, Nk, ssum, 1e-6, 1, torch.float64)
+    assert cov[0, 0, 0, 0].item() >= 1e-6
+
+
+def test_chol_corrupted_component_recovers():
+    # covariances observed in a failing beta-test fit: a component whose
+    # diagonal has gone negative (so a mean-based bump scale would be
+    # negative and never heal it), and a non-finite component. Both must be
+    # repaired with a RuntimeWarning, not abort.
+    E = gmm_mi_torch.estimator
+    neg = torch.tensor([[[[-1.59e-6, -7.6e-8], [-7.6e-8, 1.03e-6]]]],
+                       dtype=torch.float64)
+    with pytest.warns(RuntimeWarning):
+        L = E._chol(neg)
+    assert torch.isfinite(L).all()
+    nan = torch.tensor([[[[float('nan'), 0.0], [0.0, 1.0]]]],
+                       dtype=torch.float64)
+    with pytest.warns(RuntimeWarning):
+        L = E._chol(nan)
+    assert torch.isfinite(L).all()
+
+
+def test_spike_pair_fp32_end_to_end():
+    # beta-test regression: a pair of zero-inflated variables at float32 with
+    # the tester's settings used to abort ("covariance factorisation failed
+    # even after diagonal regularisation"). Needs the full-strength
+    # configuration to trip, so it is skipped on plain CPU runs where it is
+    # slow; the mechanisms are unit-tested above.
+    if os.environ.get('GMM_MI_DEVICE') != 'cuda' and \
+            not os.environ.get('GMM_MI_OFFLINE'):
+        pytest.skip('full-strength run; covered on CUDA and offline suites')
+    rng = np.random.default_rng(0)
+
+    def zi(p, scale=0.1, N=5000):
+        return np.where(rng.random(N) < p, 0.0,
+                        np.abs(rng.normal(0, scale, N)))
+
+    zi(0.8)
+    rng.normal(0, 1, 5000)              # matches the failing realisation
+    X = np.column_stack([zi(0.8), zi(0.7)])
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        m, s = estimate(X, 'MI', dtype=torch.float32, n_bootstrap=20,
+                        max_components=20, n_inits=5, n_folds=3,
+                        mc_samples=10_000)
+    assert np.isfinite(m) and np.isfinite(s)
