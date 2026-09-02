@@ -83,7 +83,9 @@ import multiprocessing as mp
 import os
 from concurrent.futures import ProcessPoolExecutor
 
-N_GPUS = 4  # GPUs available to this job
+import torch
+
+N_GPUS = max(torch.cuda.device_count(), 1)   # GPUs visible to this job
 
 
 def init_worker(counter, n_gpus):
@@ -95,7 +97,6 @@ def init_worker(counter, n_gpus):
 
 
 def one_pair(task):
-    import torch
     from gmm_mi_torch import estimate
     (i, j), X = task
     mi, sigma = estimate(X, "MI", device="cuda", dtype=torch.float64)
@@ -115,7 +116,7 @@ if __name__ == "__main__":
             print(i, j, mi, sigma)
 ```
 
-The `spawn` start method and the environment variable set in the initializer matter: CUDA contexts do not survive `fork`, and a worker must be pinned to its GPU before the first CUDA call. On one GPU this pool buys nothing — leave `max_workers` at the GPU count, never higher. Process pools also do not work from inside a notebook (the workers cannot import functions defined there); keep this pattern in a script.
+The `spawn` start method and the environment variable set in the initializer matter: CUDA contexts do not survive `fork`, and a worker must be pinned to its GPU before the first CUDA call. On one GPU this pool degenerates to a single worker and buys nothing over a plain loop — leave `max_workers` at the GPU count, never higher (a worker pinned to a GPU that does not exist crashes the pool). Process pools also do not work from inside a notebook (the workers cannot import functions defined there); keep this pattern in a script.
 
 Sample-dimension chunking (`n_chunk`) extends the reachable scale to N=10⁸, d=8 (total correlation in 23 min / 77.5 GiB at fp32 on 128 GB unified memory). One hardware caveat: on GPUs with rate-limited fp64 throughput (e.g. GB10), CUDA fp64 is slower than CPU fp64 — use fp32 on such devices (validated: the full test suite passes at fp32). On data-centre GPUs with full-rate fp64 (A100/H100/GH200 class), float64 costs only ~1.4x float32 end-to-end and avoids all reduced-precision caveats — prefer it there, especially for near-zero MI or spike-like marginals.
 
