@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.2 (2026-10-16)
+
+Documentation release; no code changes.
+
+- README: optional fresh-environment steps, references for the GEMM
+  formulation, self-contained multi-GPU example (also shipped as
+  `examples/mi_grid_multigpu.py`; must be run as a script, not pasted into
+  an interactive session).
+- Benchmarks refreshed at v0.2.1: the README micro-benchmark re-measured
+  (CUDA fp32 selection 0.90 -> 0.21 s on the GB10), and real-data beta
+  numbers added (75-pair MI grid, N = 30,000: 53 min on 16 CPU cores vs
+  7.5 min fp32 / 5.1 min fp64 on one A100).
+- `docs/validation_summary.pdf` regenerated with a section covering
+  v0.1.1 - v0.2.1 and the beta-test validation.
+
 ## 0.2.1 (2026-08-31)
 
 - Fix an abort ("covariance factorisation failed even after diagonal

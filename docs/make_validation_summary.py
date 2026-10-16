@@ -157,22 +157,23 @@ A(Paragraph(
     'Benchmark workload: 3-component bivariate mixture, N = 20 000, '
     'selection over k = 1..8 (3 initialisations x 2 folds), 50 bootstrap '
     'realisations. Reference: sklearn-based GMM-MI on the same CPU.', BODY))
-A(tbl(['Config (em_chunk/mc_chunk)', 'Model selection', 'Bootstrap phase'],
+A(tbl(['Config', 'Model selection', 'Bootstrap phase'],
       [['GMM-MI reference (sklearn, CPU)', '15.4 s', '10.1 s'],
-       ['gmm-mi-torch, CPU fp64 (8/8)', '11.5 s', '1.9 s'],
-       ['gmm-mi-torch, CPU fp32 (8/8)', '4.6 s', '0.95 s'],
-       ['gmm-mi-torch, CUDA fp32 (8/8)', '1.9 s', '0.24 s'],
-       ['gmm-mi-torch, CUDA fp32 (48/48)', '0.90 s', '0.17 s']],
+       ['v0.1.0, CPU fp64 (8/8)', '11.5 s', '1.9 s'],
+       ['v0.1.0, CUDA fp32 (48/48)', '0.90 s', '0.17 s'],
+       ['v0.2.1, CPU fp64 (auto)', '2.0 s', '0.9 s'],
+       ['v0.2.1, CUDA fp32 (auto)', '0.21 s', '0.13 s']],
       widths=[210, 105, 105], bold_row=4))
 A(Paragraph(
-    'Best GPU config: 17x faster selection and 59x faster bootstrap than '
-    'the reference. The torch port already beats sklearn on CPU at float64, '
-    'because the batched-replicate EM does in one pass what sklearn does '
-    'across loops. Setting em_chunk to the full replicate count (here 48) '
-    'runs EM as a single batch and roughly halves GPU wall time. Hardware '
-    'caveat: on GPUs with rate-limited float64 throughput (such as the '
-    'GB10), CUDA float64 is slower than CPU float64 - use float32 on such '
-    'devices (validated above).', BODY))
+    'At v0.2.1 (GEMM-formulated EM, auto-sized chunks; Section 9) the best '
+    'GPU configuration is roughly 70x faster selection and 80x faster '
+    'bootstrap than the reference, with no chunk tuning. The torch port '
+    'beats sklearn on CPU at float64, because the batched-replicate EM does '
+    'in one pass what sklearn does across loops. Hardware caveat: on GPUs '
+    'with rate-limited float64 throughput (such as the GB10), CUDA float64 '
+    'is slower than CPU float64 - use float32 there. On data-centre GPUs '
+    '(A100/H100/GH200 class) float64 costs about the same as float32, or '
+    'less, and is the recommended dtype.', BODY))
 
 A(Paragraph('6. Large-N scaling (n_chunk)', H1))
 A(Paragraph(
@@ -239,10 +240,51 @@ for item in [
 ]:
     A(Paragraph(item, BULL, bulletText='-'))
 
+A(Paragraph('9. Post-campaign updates (v0.1.1 - v0.2.1, Aug-Oct 2026)', H1))
+A(Paragraph(
+    'Driven by two beta-test reports on real astrophysical MI grids '
+    '(photometric colours / emission lines / VAE latents x stellar-'
+    'population properties, 75-350 pairs per grid, N = 5,000-30,000, '
+    'A100 GPU vs many-core CPU GMM-MI):', BODY))
+for item in [
+    'v0.1.1: em_chunk / mc_chunk default to \'auto\' - on CUDA each '
+    'stage\'s replicate batch is sized from the free device memory '
+    '(measured peak-memory model, floor 32); a CUDA out-of-memory error '
+    'halves the batch and retries. Results are chunk-invariant.',
+    'v0.2.0: the EM inner loop evaluates log-densities and M-step moments '
+    'as matrix products against per-sample quadratic features (Machlica, '
+    'Vanek & Zajic 2011), with coefficients assembled and moments '
+    'accumulated at float64 (Chan, Golub & LeVeque 1983). Float64 parity '
+    'with the previous kernels at reduction-order precision; about 3x '
+    'faster per EM iteration on GPU and 2x on CPU. Inputs are standardised '
+    'internally (estimates invariant; fitted models returned in original '
+    'units), which removes float32 factorisation failures on '
+    'unstandardised data; failed factorisations are repaired per component '
+    'with escalating diagonal regularisation.',
+    'v0.2.1: fixes a float32 abort on zero-inflated variable pairs found '
+    'in beta (collapsed-component variance rounding below the reg_covar '
+    'floor; the repair bump could carry the wrong sign).',
+    'Cross-hardware references (validation/sweep_*): a hard selection '
+    'problem (N = 20k, k up to 20, 300 selection replicates, 100-replicate '
+    'bootstrap) runs in 13.5 s fp32 on the GB10 and 1.9 s fp32 / 2.1 s '
+    'fp64 on a GH200.',
+    'Beta validation: agreement with CPU GMM-MI at r > 0.999 across the '
+    'grids, bootstrap errorbars matching to a few per cent, and float64 '
+    'results reproducing across library versions to better than 1e-6 nat. '
+    'The only >= 2-sigma discrepancies sit at MI near 0, where both codes '
+    'share the estimator\'s intrinsic finite-N positive bias (observed to '
+    'fall roughly as N to the -0.6). Final timing (75-pair grid, '
+    'N = 30,000): 53 min on 16 CPU cores vs 7.5 min (fp32) / 5.1 min '
+    '(fp64) on one A100 - 114-168x less compute, with float64 the faster '
+    'dtype on that hardware.',
+]:
+    A(Paragraph(item, BULL, bulletText='-'))
+
 A(Spacer(1, 6))
 A(Paragraph(
     'Provenance: distilled from the campaign\'s full working report '
-    '(gb10_report.md, Parts 1-6) and the executed walkthrough notebook; '
+    '(gb10_report.md, Parts 1-6), the validation/sweep_* references, the '
+    'beta-test reports, and the executed walkthrough notebook; '
     'regenerate with docs/make_validation_summary.py.', CAP))
 
 SimpleDocTemplate(OUT, pagesize=A4,
