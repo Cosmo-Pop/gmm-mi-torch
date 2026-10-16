@@ -62,13 +62,15 @@ For a guided tour — including the common pitfalls (thresholds, initialisations
 
 ## Performance
 
-Benchmarked on an NVIDIA GB10 (DGX Spark) against the sklearn-based GMM-MI reference on a 3-component bivariate mixture (N=20 000, `max_components=8`, 50 bootstrap realisations). A distilled summary of the whole validation and benchmark campaign — correctness, fp32, calibration, performance, large-N scaling, known limitations — is in [docs/validation_summary.pdf](docs/validation_summary.pdf); full tables in [validation/gb10_report.md](validation/gb10_report.md):
+Benchmarked on an NVIDIA GB10 (DGX Spark) against the sklearn-based GMM-MI reference on a 3-component bivariate mixture (N=20 000, `max_components=8`, 50 bootstrap realisations); gmm-mi-torch numbers are v0.2.1 with default (`'auto'`) chunks. A distilled summary of the whole validation and benchmark campaign — correctness, fp32, calibration, performance, large-N scaling, known limitations — is in [docs/validation_summary.pdf](docs/validation_summary.pdf); full tables in [validation/gb10_report.md](validation/gb10_report.md) and the `validation/sweep_*` files:
 
 | Config | model selection | bootstrap |
 |---|---|---|
 | GMM-MI (sklearn, CPU) | 15.4 s | 10.1 s |
-| gmm-mi-torch, CPU fp64 | 11.5 s | 1.9 s |
-| gmm-mi-torch, CUDA fp32 (tuned chunks) | **0.90 s** | **0.17 s** |
+| gmm-mi-torch, CPU fp64 | 2.0 s | 0.9 s |
+| gmm-mi-torch, CUDA fp32 | **0.21 s** | **0.13 s** |
+
+On real data at production scale (beta test, October 2026): a 75-pair MI grid between VAE latents and galaxy properties, N = 30,000, `max_components=20`, 100 bootstrap realisations per pair — GMM-MI on 16 CPU cores: 53 min wall-clock; gmm-mi-torch on one A100: 7.5 min at float32, **5.1 min at float64** (114–168× less compute), with MI agreeing everywhere except the usual ≥2σ scatter at MI ≈ 0 and bootstrap errorbars matching to ~10%. On data-centre GPUs float64 is the faster dtype; the GB10-class caveat below is about rate-limited-fp64 hardware only.
 
 Since v0.2.0 the EM inner loop evaluates Gaussian log-densities and M-step moments as matrix products against per-sample quadratic features — a GMM log-density is a quadratic form in the sample, so scoring N samples against K components is one matrix multiplication, and the M-step moments are the transposed one; see [Machlica, Vaněk & Zajíc (2011)](https://ieeexplore.ieee.org/document/6118944) for the formulation and the comments in `gmm_mi_torch/estimator.py` (kernel section) for the numerical safeguards, which follow [Chan, Golub & LeVeque (1983)](https://www.tandfonline.com/doi/abs/10.1080/00031305.1983.10483115). This is several times faster than the previous broadcast kernels on both CPU and GPU at identical (float64 reduction-order) results; set `GMM_MI_TORCH_EM_KERNEL=legacy` to fall back to the previous kernels for one release. Inputs are standardised internally (estimates are invariant; fitted models are returned in original units), which also removes float32 factorisation failures on unstandardised data.
 
