@@ -134,6 +134,10 @@ The suite (35 tests) checks analytic Gaussian targets, Monte-Carlo/quadrature ta
 
 For most readers, [docs/validation_summary.pdf](docs/validation_summary.pdf) is the right entry point to the validation results. The [validation/](validation/) directory additionally contains the full working report from the port's GB10 acceptance run ([validation/README.md](validation/README.md) explains its contents and provenance), kept in the repository for team review while it is private.
 
+## Acknowledgements
+
+Benedict Van Den Bussche beta-tested the port extensively on production-scale astrophysical MI grids against the reference implementation; the chunk auto-sizing, the float32 robustness fixes and the validation numbers quoted above all trace back to his reports. Davide Piras reviewed the repository and road-tested the examples.
+
 ## License and attribution
 
 This is a port of [GMM-MI](https://github.com/dpiras/GMM-MI) by Davide Piras, Hiranya V. Peiris, Andrew Pontzen, Luisa Lucie-Smith, Ningyuan Guo and Brian Nord, distributed under the GPL-3.0 ([LICENSE](LICENSE)). Upstream GMM-MI additionally carries a non-commercial use condition; this repository is distributed without it, in agreement with the upstream author.
