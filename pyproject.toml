@@ -20,7 +20,7 @@ dependencies = [
 test = ["pytest", "numpy"]
 
 [project.urls]
-Homepage = "https://github.com/Cosmo-pop/gmm-mi-torch"
+Homepage = "https://github.com/Cosmo-Pop/gmm-mi-torch"
 Upstream = "https://github.com/dpiras/GMM-MI"
 
 [tool.setuptools]
