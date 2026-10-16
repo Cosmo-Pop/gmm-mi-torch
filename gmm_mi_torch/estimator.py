@@ -64,8 +64,10 @@ _MULTINOMIAL_MAX_CATEGORIES = 1 << 24
 # and of one MC chunk replicates x mc_samples x K x itemsize x (3d+1); both
 # measured on GB10 to within 2% over d=1..8, K=5..20, fp32/fp64
 # (validation/bench_mem.py).  The models below carry one extra unit of
-# slack.  Per-replicate EM cost is flat above a batch of ~32, so the CUDA
-# floor sits there; CPU keeps the historical default.
+# slack; the EM model describes the legacy kernels, and the GEMM kernels
+# use the smaller model in _em_bytes_per_replicate.  The CUDA floor of 32
+# keeps small problems reasonably batched; 'auto' normally sizes far above
+# it.  CPU keeps the historical default.
 _AUTO_CHUNK_MEM_FRACTION = 0.5      # of the free device memory at call time
 _AUTO_CHUNK_MIN = 32
 _AUTO_CHUNK_CPU_DEFAULT = 8
@@ -1161,8 +1163,8 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         (results are chunk-invariant). 'auto' keeps 8 on CPU; on CUDA it
         sizes each stage's batch to fill half of the free device memory from
         the measured peak-memory model (replicates x N x K x (4d+4) x
-        itemsize), floored at 32 — where the per-replicate cost flattens out —
-        and capped at the stage's replicate count. A CUDA out-of-memory error
+        itemsize), floored at 32 and capped at the stage's replicate
+        count. A CUDA out-of-memory error
         during EM halves the chunk and retries, with a RuntimeWarning.
     mc_chunk : int or 'auto', default='auto'
         Number of bootstrap replicates whose MC integration is evaluated per

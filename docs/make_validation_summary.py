@@ -62,7 +62,8 @@ story = []
 A = story.append
 
 A(Paragraph('gmm-mi-torch: validation and benchmark summary', TITLE))
-A(Paragraph('Distilled from the GB10 acceptance campaign, July 2026. '
+A(Paragraph('Distilled from the GB10 acceptance campaign, July 2026, '
+            'with post-campaign updates through October 2026 (Section 9). '
             'The full working logs, task-scoped diffs and bench scripts '
             'of the campaign are archived by the maintainers and '
             'available on request.', SUB))
@@ -291,5 +292,5 @@ SimpleDocTemplate(OUT, pagesize=A4,
                   leftMargin=18 * mm, rightMargin=18 * mm,
                   topMargin=16 * mm, bottomMargin=16 * mm,
                   title='gmm-mi-torch: validation and benchmark summary',
-                  author='Cosmo-pop / gmm-mi-torch').build(story)
+                  author='Cosmo-Pop / gmm-mi-torch').build(story)
 print(f'wrote {OUT}')
