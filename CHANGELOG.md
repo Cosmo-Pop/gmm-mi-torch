@@ -1,5 +1,106 @@
 # Changelog
 
+## 0.3.1 (2026-10-20)
+
+Mechanical fix release addressing the no-design-decision findings of the
+2026-10-20 adversarial review of v0.3.0 (the larger items — the GEMM
+kernels' origin-moment cancellation, the gaussianise tie policy on
+zero-inflated data, the dtype-cast/standardisation ordering, FittedGMM's
+factorisation units, MC chunk reproducibility semantics and the memory
+models — are held for design decisions). Estimates for a given seed are
+unchanged on valid input; the one reporting change is that `return_k` now
+counts the live components of the returned model.
+
+### Entry validation and input handling
+
+- Non-finite input (NaN/inf) is rejected with a ValueError at both entry
+  points. With `preprocess='gaussianise'`, NaN rows used to rank silently
+  as the largest values and fabricate MI on independent data (0.33 nats
+  measured where the truth is 0, no warning); on the 'none' path a single
+  NaN poisoned every replicate through the sample-weight product, defeated
+  the EM stop test (exactly max_iter 'non-finite covariance reset to
+  identity' warnings per stage) and died in a path-dependent far-away
+  IndexError. Non-finite category labels are rejected too: torch.unique
+  made every NaN its own category, surfacing as a misleading n_folds
+  error. `select_batched` now raises the sequential path's informative
+  RuntimeError when no validation metric is finite, instead of an
+  IndexError from the parsimony mask.
+- Integer arguments (seed, n_bootstrap, mc_samples, max_components,
+  n_folds, n_inits, max_iter, fixed_components_number) are coerced with
+  operator.index at entry: numpy integer seeds — what `rng.integers`
+  yields in seed sweeps — crashed `_cv_masks` with 'TypeError: an integer
+  is required', and a float mc_samples/n_bootstrap crashed only after the
+  selection and bootstrap EM were already paid for. Floors are enforced:
+  max_iter >= 1 (0 silently returned the random init, every bootstrap
+  replicate identical and the errorbar pure MC noise), reg_covar > 0
+  (0 let collapsed components through to garbage estimates or
+  factorisation failures), mc_samples/max_components/n_inits/
+  fixed_components_number >= 1, n_bootstrap >= 0, threshold_components
+  >= 0 (negative made the parsimony mask all-False -> IndexError).
+- The protocol/metric_method compatibility rules run before the fixed-k
+  shortcut (a typo'd metric_method ran silently when
+  fixed_components_number was set, contradicting the 0.3.0 'raise at
+  entry' claim), and the public `select_batched`/`select_sequential`
+  validate fold feasibility as the estimators do (n_folds > N silently
+  returned k=1 with every metric -inf).
+- pandas DataFrames (and any `__array__` container) are accepted for X,
+  as the 'array-like' docstring promised; read-only arrays are copied so
+  torch does not warn. String/object category labels are factorised
+  through numpy's unique (categories in sorted label order) instead of
+  dying in torch.as_tensor with a raw TypeError, and the
+  smallest-category fold error names the offending label.
+
+### Precision pin, autograd, reporting
+
+- `_full_precision` speaks torch >= 2.9's per-backend fp32_precision API.
+  Once user code had set any of those knobs — the documented way to
+  enable TF32 since 2.9 — the legacy getter raised RuntimeError ('mix of
+  the legacy and new APIs') and every public entry point crashed, even on
+  CPU. The pin now saves, sets to 'ieee' and restores the generic,
+  cuda.matmul and mkldnn.matmul settings exactly (the legacy-setter
+  restore used to rewrite the mkldnn backend for a caller who had only
+  enabled CUDA TF32), falling back to the legacy get/set pair on older
+  torch. A CUDA-gated test asserts a TF32-sensitive GEMM result inside
+  em_fit under both APIs — the old test asserted a flag string and was
+  structurally blind to both defects.
+- `estimate` and `estimate_categorical` run under torch.no_grad() and
+  detach the input after as_tensor: an input carrying requires_grad
+  (model latents taken without .detach() — the primary use case) built
+  and retained the EM autograd graph of every iteration (measured 5-30x
+  peak CUDA memory, growing with iteration count) and return_fit=True
+  then crashed in FittedGMM on .numpy(). em_fit and val_ll are unchanged:
+  differentiating a log-likelihood with respect to the parameters remains
+  possible.
+- `return_k` reports the live component count of the model that is
+  actually bootstrapped, MC-integrated and returned: the 0.3.0 dead-
+  component slice could silently return a smaller model under the
+  selected/requested k (fixed_components_number=6 returning a 5-component
+  fit). A RuntimeWarning fires when a requested fixed_components_number
+  loses components during the CV fit.
+- The gaussianise tie warning and the return_fit warning attribute to the
+  caller's frame instead of the decorator line inside estimator.py, so
+  Python's once-per-location filtering distinguishes call sites and
+  module-keyed warning filters match the caller.
+
+### Packaging, tests, validation scripts
+
+- `[test]` extra: numpy >= 2.0 (np.trapezoid is 2.0-only; three
+  categorical tests failed on numpy 1.x) and scipy (two rank-probit
+  oracle tests import scipy.stats, previously only in the [plot] extra),
+  so the documented `pip install -e ".[test]" && pytest` passes in a
+  fresh environment.
+- The 8 bench scripts under validation/ crashed on 0.3.0's `_chol` tuple
+  return before any measurement (only bench.py had been updated); all
+  call sites unpack the tuple now and validation/README.md records the
+  broken window.
+- README: the test-count sentence no longer double-counts the
+  offline-gated test and names both gated tests; the dependency sentence
+  matches the [test] extra.
+- test_mc_chunk_auto_within_mc_noise compared mc_chunk=8 against CPU
+  'auto' (= 8): bitwise the same run, so it could never fail on the
+  documented default pytest invocation. It now compares mc_chunk=3
+  against 'auto', which differ on every leg of the test matrix.
+
 ## 0.3.0 (2026-10-20)
 
 Fix release addressing the 2026-10-16 adversarial review. Three intentional
