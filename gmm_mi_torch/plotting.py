@@ -163,7 +163,11 @@ def find_contours(contour_levels):
     if any(cl not in [1,2,3] for cl in contour_levels):
         raise ValueError(f'Contour levels must be either 1, 2 and 3; current contour levels are {contour_levels}.')
     assert len(contour_levels) <= 3, 'Length of contour levels cannot exceed 3'
-    ranges_dict = {1: np.sqrt(0.77), 2: np.sqrt(5.991), 3: np.sqrt(10.597)}
+    # chi2(2 dof) quantiles: 2.2958 at 0.6827 (1 sigma), 5.991 at 0.95,
+    # 10.597 at 0.995. Upstream GMM-MI uses 0.77 = chi2_2.ppf(0.32) for the
+    # 1-sigma level — an inverted quantile whose ellipse encloses 32% of the
+    # mass; corrected here (the default contour_levels=[2] is unaffected).
+    ranges_dict = {1: np.sqrt(2.2958), 2: np.sqrt(5.991), 3: np.sqrt(10.597)}
     ranges = []
     for cl in contour_levels:
         ranges.append(ranges_dict[cl])
