@@ -1,12 +1,13 @@
 """Scale test: N=200000, d=8 correlated Gaussian, TC, chunk tuning + peak mem."""
 
+import os
 import sys
 import time
 
 import numpy as np
 import torch
 
-sys.path.insert(0, "/home/hvp20/GMM-MI torch port")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bench import run_once, make_data
 
 

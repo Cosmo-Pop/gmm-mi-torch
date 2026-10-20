@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gmm-mi-torch"
-version = "0.2.2"
+version = "0.3.0"
 description = "PyTorch port of GMM-MI: mutual information with bootstrap errorbars from Gaussian mixture models, GPU-batched"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -18,6 +18,9 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest", "numpy"]
+# gmm_mi_torch.plotting imports these (torch's dependency tree does not
+# guarantee numpy); the estimators themselves need only torch
+plot = ["numpy", "matplotlib", "scipy"]
 
 [project.urls]
 Homepage = "https://github.com/Cosmo-Pop/gmm-mi-torch"

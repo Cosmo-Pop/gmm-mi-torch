@@ -5,14 +5,15 @@ target is accumulated in fp64. Usage:
     python bench_nchunk.py <N> <n_chunk> [em_chunk] [init_type]
 """
 
+import os
 import sys
 import time
 
 import numpy as np
 import torch
 
-sys.path.insert(0, "/home/hvp20/GMM-MI torch port")
-from torch_gmm_mi import estimate
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from gmm_mi_torch import estimate
 
 
 def make_data_gpu(N, d=8, seed=7, dtype=torch.float32):

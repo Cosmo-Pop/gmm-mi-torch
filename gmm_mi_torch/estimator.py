@@ -1374,9 +1374,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         same way. Larger values are faster on GPU at higher peak memory
         (results are chunk-invariant). 'auto' keeps 8 on CPU; on CUDA it
         sizes each stage's batch to fill half of the free device memory from
-        the measured peak-memory model (replicates x N x K x (4d+4) x
-        itemsize), floored at 32 and capped at the stage's replicate
-        count. A CUDA out-of-memory error
+        the measured peak-memory model: replicates x N_eff x K x itemsize
+        x 3 for the default GEMM kernels, x (4d+4) for the legacy kernels
+        (N_eff = min(N, n_chunk)), floored at 32 and capped at the stage's
+        replicate count. A CUDA out-of-memory error
         during EM halves the chunk and retries, with a RuntimeWarning.
     mc_chunk : int or 'auto', default='auto'
         Number of bootstrap replicates whose MC integration is evaluated per
@@ -1572,7 +1573,7 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     """Estimate MI between a continuous variable and a categorical variable.
 
     Port of GMM-MI's fit_categorical/estimate_categorical semantics
-    (Appendix B of Piras et al. 2022): a 1D GMM p(x|c) is fitted per
+    (Appendix B of Piras et al. 2023): a 1D GMM p(x|c) is fitted per
     category, each with full component selection, and
 
         MI = sum_c pi_c E_{x~p(x|c)}[ log p(x|c) - log sum_c' pi_c' p(x|c') ]

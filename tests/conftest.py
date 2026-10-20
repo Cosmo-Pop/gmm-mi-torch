@@ -4,6 +4,9 @@ GMM_MI_DEVICE=cpu|cuda, GMM_MI_DTYPE=float64|float32, GMM_MI_REG=<float>,
 GMM_MI_EM_CHUNK=<int> (defaults reproduce the original suite: cpu, float64,
 module-default reg and chunks).  Wraps gmm_mi_torch.estimate and
 gmm_mi_torch.estimate_categorical before the test module imports them.
+Only those two entry points are routed: tests that call estimator
+internals directly (the guard-path and unit tests) always run on CPU at
+float64, whatever the variables say.
 """
 
 import os

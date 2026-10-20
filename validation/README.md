@@ -6,11 +6,12 @@ repository for team review while it is private; this directory can be pruned or
 moved before a public release.
 
 At the time these were produced the module was a flat file named
-`torch_gmm_mi.py` (now `gmm_mi_torch/__init__.py`, contents identical) and the
-test suite was `test_torch_gmm_mi.py` (now `tests/test_gmm_mi_torch.py`,
-identical up to the import rename). File names inside the artifacts reflect the
-old layout; the bench scripts likewise do `import torch_gmm_mi` and would need
-that one-line rename to run against the installed package.
+`torch_gmm_mi.py` (its contents now live in `gmm_mi_torch/estimator.py`) and
+the test suite was `test_torch_gmm_mi.py` (now `tests/test_gmm_mi_torch.py`,
+identical up to the import rename). File names inside the artifacts reflect
+the old layout. The bench scripts have since been repointed at the package
+(`gmm_mi_torch.estimator`), so they run against the current code; the
+numbers recorded in the reports remain those of the versions stated there.
 
 - `gb10_report.md` — the full report, Parts 1–6: fp32/CUDA validation of the
   original port, benchmark and scale tables, the extensions
