@@ -1494,6 +1494,63 @@ def test_return_fit_huge_scale_fp32():
     assert fit.covariances_[0][0, 0] > 1e38
 
 
+def test_mc_chunk_bitwise_invariance():
+    # review finding: the MC sample stream used to be sliced per replicate
+    # chunk, and mc_chunk='auto' is sized from free device memory at call
+    # time, so a fixed seed did not reproduce on a busy GPU. Replicates now
+    # draw from their own seeded streams: results are independent of
+    # mc_chunk (bitwise on CPU; on CUDA the integrand's batched reductions
+    # keep same-seed agreement at fp noise).
+    rng = np.random.default_rng(0)
+    X = rng.multivariate_normal([0, 0], [[1, .6], [.6, 1]], 3000)
+    common = dict(protocol='batched', max_components=2, n_bootstrap=8,
+                  mc_samples=5000, seed=3, em_chunk=8)
+    ref = estimate(X, 'MI', mc_chunk=8, **common)
+    for c in (1, 3, 'auto'):
+        out = estimate(X, 'MI', mc_chunk=c, **common)
+        if os.environ.get('GMM_MI_DEVICE', 'cpu') == 'cpu':
+            assert out == ref, c
+        else:
+            assert abs(out[0] - ref[0]) < 1e-4, c
+            assert abs(out[1] - ref[1]) < 1e-4, c
+
+
+def test_mc_oom_retry_stream_invariant(monkeypatch):
+    # an out-of-memory retry inside the MC stage used to re-draw a different
+    # sample stream; with per-replicate generators the retried run must
+    # return exactly the uncontended result
+    E = gmm_mi_torch.estimator
+    rng = np.random.default_rng(0)
+    X = rng.multivariate_normal([0, 0], [[1, .6], [.6, 1]], 2000)
+    common = dict(max_components=2, n_bootstrap=8, mc_samples=4000, seed=1,
+                  em_chunk=8, mc_chunk=8, device='cpu', dtype=torch.float64)
+    ref = estimate(X, 'MI', **common)
+    state = {'failed': False}
+    orig = E.gmm_score
+
+    def flaky(pts, w, mu, chol):
+        if not state['failed'] and pts.shape[0] > 2:
+            state['failed'] = True
+            raise torch.cuda.OutOfMemoryError('synthetic')
+        return orig(pts, w, mu, chol)
+
+    monkeypatch.setattr(E, 'gmm_score', flaky)
+    with pytest.warns(RuntimeWarning, match='retrying'):
+        out = estimate(X, 'MI', **common)
+    assert out == ref
+
+
+def test_seed_and_bootstrap_bounds():
+    # the per-replicate stream offsets require |seed| <= 2**62 and
+    # n_bootstrap <= the category stride; both are rejected at entry
+    rng = np.random.default_rng(0)
+    X = rng.multivariate_normal([0, 0], np.eye(2), 100)
+    with pytest.raises(ValueError, match='seed'):
+        estimate(X, 'MI', seed=1 << 63, max_components=2)
+    with pytest.raises(ValueError, match='n_bootstrap'):
+        estimate(X, 'MI', n_bootstrap=(1 << 20) + 1, max_components=2)
+
+
 def test_gaussianise_ties_average_rank_regression():
     # review finding: positional (double-argsort) tie-breaking mapped a tied
     # block to a monotone probit ramp in row order, fabricating MI whenever

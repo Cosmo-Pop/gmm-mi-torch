@@ -128,6 +128,16 @@ LOG2PI = math.log(2.0 * math.pi)
 # fallback branch can be exercised at small N by monkeypatching it down.
 _MULTINOMIAL_MAX_CATEGORIES = 1 << 24
 
+# Per-replicate Monte-Carlo streams: bootstrap replicate r draws its MC
+# samples from a generator seeded seed + _MC_SEED_OFFSET + r (estimate), or
+# + ci * _MC_CAT_STRIDE + r per category ci (estimate_categorical), so the
+# draws are independent of mc_chunk and of the OOM halve-and-retry by
+# construction. n_bootstrap is capped at _MC_CAT_STRIDE and |seed| at 2**62
+# at entry so the offsets stay inside torch.Generator.manual_seed's range
+# and category streams cannot collide.
+_MC_SEED_OFFSET = 50_000
+_MC_CAT_STRIDE = 1 << 20
+
 # Auto-sizing of the replicate chunks (em_chunk / mc_chunk = 'auto').  Peak
 # memory of one EM iteration is replicates x N_eff x K x itemsize x (4d+3),
 # and of one MC chunk replicates x mc_samples x K x itemsize x (3d+1); both
@@ -208,7 +218,15 @@ def _validate_entry_args(seed, n_bootstrap, mc_samples, max_components,
     Python ints (torch.Generator.manual_seed and torch factory sizes reject
     numpy integers and floats)."""
     seed = _index_arg(seed, 'seed')
+    if abs(seed) > 1 << 62:
+        raise ValueError(f"|seed| must be <= 2**62 so the internal stream "
+                         f"offsets stay within torch.Generator.manual_seed's "
+                         f"range; found {seed}")
     n_bootstrap = _index_arg(n_bootstrap, 'n_bootstrap', 0)
+    if n_bootstrap > _MC_CAT_STRIDE:
+        raise ValueError(f"n_bootstrap must be <= {_MC_CAT_STRIDE} (the "
+                         f"per-replicate MC stream stride); found "
+                         f"{n_bootstrap}")
     mc_samples = _index_arg(mc_samples, 'mc_samples', 1)
     max_components = _index_arg(max_components, 'max_components', 1)
     n_folds = _index_arg(n_folds, 'n_folds')   # >= 2 checked by _validate_folds
@@ -1509,7 +1527,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         via `threshold_fit` well before this.
     seed : int, default=0
         Seed controlling initialisations, CV splits, bootstrap resampling and
-        MC integration.
+        MC integration. Fixed-seed results are bitwise reproducible on CPU,
+        including with 'auto' chunk sizing; on CUDA, `em_chunk` changes the
+        matmul reduction order, so same-seed runs agree to floating-point
+        noise unless `em_chunk` is pinned to an integer.
     return_k : bool, default=False
         If True, also return the selected number of components.
     return_fit : bool, default=False
@@ -1538,8 +1559,9 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     mc_chunk : int or 'auto', default='auto'
         Number of bootstrap replicates whose MC integration is evaluated per
         batch; 'auto' as for `em_chunk` (model mc_samples x K x (3d+2) x
-        itemsize). The MC sample stream is drawn per chunk, so estimates
-        differ across `mc_chunk` values at the Monte-Carlo noise level.
+        itemsize). Each replicate draws its MC samples from its own seeded
+        stream, so results are independent of `mc_chunk` and of the
+        out-of-memory retry.
     preprocess : {'none', 'gaussianise'}, default='none'
         'gaussianise' applies a per-variable rank-probit transform before
         fitting. MI, cMI and TC are invariant under per-variable
@@ -1752,7 +1774,13 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     chol, cov = _chol(cov)
 
     def _mc(sl):
-        pts = gmm_sample(w[sl], mu[sl], chol[sl], mc_samples, generator=g)
+        # each replicate draws from its own seeded stream, so the samples
+        # are independent of mc_chunk and of the OOM halve-and-retry
+        pts = torch.cat([
+            gmm_sample(w[r:r + 1], mu[r:r + 1], chol[r:r + 1], mc_samples,
+                       generator=torch.Generator(device=X.device).manual_seed(
+                           seed + _MC_SEED_OFFSET + r))
+            for r in range(sl.start, min(sl.stop, B))])
         return _INTEGRANDS[quantity](pts, w[sl], mu[sl], cov[sl], chol[sl]).mean(1)
     vals = torch.cat(_run_chunked(B, mc_chunk, _mc))              # (B,)
     mean = vals.mean().item()
@@ -1909,6 +1937,12 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     for ci in range(C):
         Xc = X[Y == cats[ci]]
         Nc = Xc.shape[0]
+        # known, low-risk stream coincidence (pre-dating v0.4.0): category
+        # ci+10's init stream at K=30 equals category ci's bootstrap stream
+        # (997*10 + 30 = 10_000); it needs >= 11 categories AND
+        # max_components >= 30 (default 10) and the streams drive different
+        # data, so it is documented rather than re-seeded under the
+        # validated init/bootstrap offsets
         seed_c = seed + 997 * ci
         k_c, (w1, mu1, cov1) = _select_and_fit(
             Xc, protocol, fixed_components_number, max_components, n_folds,
@@ -1930,7 +1964,6 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         chol, cov = _chol(cov)
         fits.append((w, mu, cov, chol))
 
-    g = torch.Generator(device=X.device).manual_seed(seed + 20_000)
     K_max = max(f[0].shape[1] for f in fits)
     mc_chunk = _resolve_chunk(
         mc_chunk, B, C * _mc_bytes_per_replicate(mc_samples, K_max, 1, dtype), device)
@@ -1938,8 +1971,17 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     for ci in range(C):
         w, mu, cov, chol = fits[ci]
 
-        def _mc(sl):
-            pts = gmm_sample(w[sl], mu[sl], chol[sl], mc_samples, generator=g)
+        def _mc(sl, ci=ci, w=w, mu=mu, chol=chol):
+            # per-(category, replicate) seeded streams, as in estimate's MC
+            # stage; the category stride keeps the streams collision-free
+            # for any n_bootstrap the entry validation admits
+            pts = torch.cat([
+                gmm_sample(w[r:r + 1], mu[r:r + 1], chol[r:r + 1],
+                           mc_samples,
+                           generator=torch.Generator(device=X.device)
+                           .manual_seed(seed + _MC_SEED_OFFSET
+                                        + ci * _MC_CAT_STRIDE + r))
+                for r in range(sl.start, min(sl.stop, B))])
             scores = torch.stack(
                 [gmm_score(pts, fits[cj][0][sl], fits[cj][1][sl],
                            fits[cj][3][sl]) for cj in range(C)])   # (C,b,S)
