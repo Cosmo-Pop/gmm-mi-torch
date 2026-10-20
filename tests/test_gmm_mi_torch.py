@@ -920,6 +920,118 @@ def test_categorical_bootstrap_randint_fallback(monkeypatch):
     assert abs(m_mn - m_ri) <= SIGMAS * combined
 
 
+def test_selection_slices_dead_padding(monkeypatch):
+    # the batched protocol returns parameters padded to K=max_components;
+    # the dead components used to ride through the bootstrap, refit and MC
+    # stages (~6.7x waste at k=3/max=20) and shrink the auto-sized chunks.
+    # Every em_fit call after selection must run at the alive count.
+    E = gmm_mi_torch.estimator
+    seen_K = []
+    orig = E.em_fit
+
+    def spy(X, s, w, mu, cov, *args, **kwargs):
+        seen_K.append(w.shape[1])
+        return orig(X, s, w, mu, cov, *args, **kwargs)
+
+    monkeypatch.setattr(E, 'em_fit', spy)
+    rng = np.random.default_rng(0)
+    cov = np.array([[1.0, 0.6], [0.6, 1.0]])
+    X = rng.multivariate_normal([0, 0], cov, 2000)
+    _, _, k, fit = estimate(X, 'MI', protocol='batched', max_components=6,
+                            n_bootstrap=3, mc_samples=2000, return_k=True,
+                            return_fit=True)
+    assert seen_K[0] == 6                      # selection fits all k at once
+    assert all(K <= k for K in seen_K[1:])     # refit + bootstrap: alive only
+    assert fit.n_components <= k
+
+
+def test_val_ll_replicate_chunking_and_oom_fallback(monkeypatch):
+    # val_ll used to score all replicates in one unguarded shot, outside the
+    # em_chunk batching and the OOM retry: chunked scoring must be exact,
+    # and an injected OOM must halve the chunk and recover the same result
+    E = gmm_mi_torch.estimator
+    torch.manual_seed(0)
+    X = torch.randn(500, 2, dtype=torch.float64)
+    g = torch.Generator().manual_seed(0)
+    w, mu, cov = E._init_params(X, 3, 12, 1e-6, generator=g)
+    s = torch.rand(12, 500, dtype=torch.float64)
+    ref = E.val_ll(X, s, w, mu, cov)
+    assert torch.allclose(ref, E.val_ll(X, s, w, mu, cov, em_chunk=5),
+                          atol=1e-12)
+    calls = []
+    orig = E._val_ll_core
+
+    def flaky(X, s_val, *args, **kwargs):
+        calls.append(s_val.shape[0])
+        if s_val.shape[0] > 4:
+            raise torch.cuda.OutOfMemoryError("synthetic")
+        return orig(X, s_val, *args, **kwargs)
+
+    monkeypatch.setattr(E, '_val_ll_core', flaky)
+    with pytest.warns(RuntimeWarning):
+        out = E.val_ll(X, s, w, mu, cov, em_chunk=12)
+    assert calls[:3] == [12, 6, 3]
+    assert torch.allclose(ref, out, atol=1e-12)
+
+
+def test_init_params_oom_fallback(monkeypatch):
+    # _init_params' replicate chunking now runs under the same OOM guard as
+    # em_fit: an injected OOM halves the chunk; results are chunk-invariant
+    E = gmm_mi_torch.estimator
+    torch.manual_seed(0)
+    X = torch.randn(1000, 2, dtype=torch.float64)
+    g = torch.Generator().manual_seed(0)
+    ref = E._init_params(X, 3, 16, 1e-6, generator=g, em_chunk=4)
+    calls = []
+    orig = E._m_step
+
+    def flaky(Xr, resp, s, reg):
+        calls.append(resp.shape[0])
+        if resp.shape[0] > 4:
+            raise torch.cuda.OutOfMemoryError("synthetic")
+        return orig(Xr, resp, s, reg)
+
+    monkeypatch.setattr(E, '_m_step', flaky)
+    g = torch.Generator().manual_seed(0)
+    with pytest.warns(RuntimeWarning):
+        out = E._init_params(X, 3, 16, 1e-6, generator=g, em_chunk=16)
+    assert calls[:3] == [16, 8, 4]
+    for a, b in zip(ref, out):
+        assert torch.equal(a, b)
+
+
+def test_full_precision_pinned_at_kernel_boundary(monkeypatch):
+    # direct em_fit/val_ll calls must run under full-precision float32
+    # matmuls even when the ambient setting is TF32, and restore the
+    # ambient setting afterwards (estimate was already pinned; the kernels
+    # used to run under whatever the process had set)
+    E = gmm_mi_torch.estimator
+    seen = []
+    orig = E._em_fit_core
+
+    def probe(*args, **kwargs):
+        seen.append(torch.get_float32_matmul_precision())
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(E, '_em_fit_core', probe)
+    torch.manual_seed(0)
+    X = torch.randn(300, 2, dtype=torch.float32)
+    g = torch.Generator().manual_seed(0)
+    w, mu, cov = E._init_params(X, 2, 2, 1e-6, generator=g)
+    s = torch.ones(2, 300, dtype=torch.float32)
+    prev = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision('medium')
+        E.em_fit(X, s, w, mu, cov)
+        assert seen and all(p == 'highest' for p in seen)
+        assert torch.get_float32_matmul_precision() == 'medium'
+        v = E.val_ll(X, s, w, mu, cov)
+        assert torch.isfinite(v).all()
+        assert torch.get_float32_matmul_precision() == 'medium'
+    finally:
+        torch.set_float32_matmul_precision(prev)
+
+
 def test_gaussianise_ties_average_rank_regression():
     # review finding: positional (double-argsort) tie-breaking mapped a tied
     # block to a monotone probit ramp in row order, fabricating MI whenever

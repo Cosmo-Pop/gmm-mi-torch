@@ -44,7 +44,16 @@ if _EM_KERNEL not in ('gemm', 'legacy'):
 def _full_precision(fn):
     """Pin float32 matmuls to full precision for the duration of a call:
     frameworks that set torch's matmul precision to 'high'/'medium' (TF32,
-    10-bit mantissas) would silently degrade the GEMM-formulated EM."""
+    10-bit mantissas) would silently degrade the GEMM-formulated EM.
+
+    Applied to estimate/estimate_categorical and, so that direct kernel
+    calls are covered too, at the cancellation-critical kernel boundaries
+    em_fit and val_ll (the decorator is reentrant: nesting saves and
+    restores the ambient value). torch's matmul precision is PROCESS-GLOBAL,
+    not thread-local: concurrent callers in other threads of the same
+    process will also run these calls' matmuls at 'highest', and the
+    save/restore can race with theirs. Use processes, not threads, for
+    parallel estimates (see examples/mi_grid_multigpu.py)."""
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
         prev = torch.get_float32_matmul_precision()
@@ -492,7 +501,9 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
                               (scale defaults to 1, as in GMM-MI).
     active_k: optional (R,) tensor of active component counts per replicate
     (for the batched-over-k protocol); components >= active_k[r] are dead.
-    The initial M-step / assignment stats run in replicate chunks of `em_chunk`.
+    The initial M-step / assignment stats run in replicate chunks of
+    `em_chunk`, under the same halve-and-retry CUDA out-of-memory guard as
+    `em_fit` (results are chunk-invariant).
     """
     N, d = X.shape
     dev, dt = X.device, X.dtype
@@ -507,12 +518,13 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
             comp = torch.arange(K, device=dev).view(1, 1, K)
             resp = resp * (comp < active_k.view(R, 1, 1))
         resp = resp / resp.sum(-1, keepdim=True).clamp_min(1e-30)
-        outs = []
-        for i in range(0, R, em_chunk):
-            r = resp[i:i+em_chunk]
+
+        def _init_mstep(sl):
+            r = resp[sl]
             c = r.shape[0]
-            outs.append(_m_step(X.expand(c, N, d), r,
-                                torch.ones(c, N, dtype=dt, device=dev), reg_covar))
+            return _m_step(X.expand(c, N, d), r,
+                           torch.ones(c, N, dtype=dt, device=dev), reg_covar)
+        outs = _run_chunked(R, em_chunk, _init_mstep)
         return tuple(torch.cat([o[j] for o in outs]) for j in range(3))
 
     if init_type == 'minmax':
@@ -557,9 +569,9 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
             C = torch.where((cnt > 0)[..., None], Cn, C)
         # hard-assignment statistics on the full dataset, chunked over R
         x2 = (X ** 2).sum(-1)                                         # (N,)
-        outs = []
-        for i in range(0, R, em_chunk):
-            Cc, al = C[i:i+em_chunk], alive[i:i+em_chunk]
+
+        def _assign_stats(sl):
+            Cc, al = C[sl], alive[sl]
             c = Cc.shape[0]
             d2 = (x2.view(1, N, 1) + (Cc ** 2).sum(-1).unsqueeze(1)
                   - 2.0 * torch.einsum('nd,rkd->rnk', X, Cc))
@@ -580,7 +592,8 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
             w = w / w.sum(-1, keepdim=True).clamp_min(1e-30)
             mu = torch.where(dead[..., None], torch.zeros_like(mu), mu)
             cov = torch.where(dead[..., None, None], eye.expand_as(cov), cov)
-            outs.append((w, mu, cov))
+            return w, mu, cov
+        outs = _run_chunked(R, em_chunk, _assign_stats)
         w, mu, cov = (torch.cat([o[j] for o in outs]) for j in range(3))
         if init_type == 'randomized_kmeans':
             s = 1.0 if scale is None else float(scale)
@@ -617,6 +630,7 @@ def _m_step(X, resp, s, reg_covar):
     return w, mu, cov
 
 
+@_full_precision
 def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, em_chunk=8,
            n_chunk=None):
     """Weighted EM over a leading replicate dimension, in replicate chunks.
@@ -770,7 +784,8 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
     return w_out, mu_out, cov_out, ll_out
 
 
-def val_ll(X, s_val, w, mu, cov, n_chunk=None):
+@_full_precision
+def val_ll(X, s_val, w, mu, cov, n_chunk=None, em_chunk=None):
     """Weighted mean per-sample log-likelihood of X under each replicate.
 
     Parameters
@@ -783,6 +798,10 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None):
         Mixture parameters, shapes (R, K), (R, K, d), (R, K, d, d).
     n_chunk : int, optional
         Stream over samples in chunks of this size (as in `estimate`).
+    em_chunk : int, optional
+        Replicates scored per batch, under the same halve-and-retry CUDA
+        out-of-memory guard as `em_fit`; results are chunk-invariant.
+        None scores all replicates in one batch.
 
     Returns
     -------
@@ -790,6 +809,15 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None):
         -inf for a replicate whose weights are all zero (an empty validation
         fold scores worse than any real fit, instead of a spurious 0).
     """
+    R = s_val.shape[0]
+    outs = _run_chunked(R, R if em_chunk is None else em_chunk,
+                        lambda sl: _val_ll_core(X, s_val[sl], w[sl], mu[sl],
+                                                cov[sl], n_chunk))
+    return outs[0] if len(outs) == 1 else torch.cat(outs)
+
+
+def _val_ll_core(X, s_val, w, mu, cov, n_chunk=None):
+    """`val_ll` for one replicate batch."""
     R, N = s_val.shape
     if _EM_KERNEL == 'gemm':
         coef, const = _gauss_coef(w, mu, cov)
@@ -865,7 +893,8 @@ def _cv_fit_for_k(X, K, n_folds, n_inits, reg_covar, threshold_fit, max_iter, se
                                  init_type=init_type, scale=scale, em_chunk=em_chunk)
     w, mu, cov, _ = em_fit(X, train, w0, mu0, cov0, reg_covar, threshold_fit, max_iter,
                            em_chunk=em_chunk, n_chunk=n_chunk)
-    v = val_ll(X, val, w, mu, cov, n_chunk=n_chunk)       # (I*F,)
+    v = val_ll(X, val, w, mu, cov, n_chunk=n_chunk,
+               em_chunk=em_chunk)                         # (I*F,)
     v_if = v.view(n_inits, n_folds)
     metric = v_if.mean(1).max().item()                    # best init's mean fold LL
     best_i = int(v_if.mean(1).argmax())
@@ -989,8 +1018,8 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
                                  scale=scale, em_chunk=em_chunk)
     w, mu, cov, _ = em_fit(X, train_r, w0, mu0, cov0, reg_covar, threshold_fit, max_iter,
                            em_chunk=em_chunk, n_chunk=n_chunk)
-    v = val_ll(X, val_r, w, mu, cov,
-               n_chunk=n_chunk).view(max_components, n_inits, n_folds)
+    v = val_ll(X, val_r, w, mu, cov, n_chunk=n_chunk,
+               em_chunk=em_chunk).view(max_components, n_inits, n_folds)
     metric_k = v.mean(-1).max(-1).values                  # (max_components,)
     if metric_method == 'valid':
         # parsimony rule: smallest k within `threshold_components` of the best metric
@@ -1131,7 +1160,7 @@ def _select_and_fit(X, protocol, fixed_components_number, max_components,
     `estimate_categorical` (per-category), so the two cannot drift apart:
     chunk sizing, the fixed-k shortcut, protocol dispatch and the
     protocol/metric_method compatibility rules live only here.
-    Returns (k_best, (w, mu, cov)).
+    Returns (k_best, (w, mu, cov)) with dead components sliced away.
     """
     N, d = X.shape
     IF = n_inits * n_folds
@@ -1150,27 +1179,35 @@ def _select_and_fit(X, protocol, fixed_components_number, max_components,
                                   threshold_fit, max_iter, seed,
                                   em_chunk=em_chunk_sel, init_type=init_type,
                                   scale=scale, n_chunk=n_chunk)
-        return k_best, params
-    kw = dict(max_components=max_components, n_folds=n_folds,
-              n_inits=n_inits, reg_covar=reg_covar,
-              threshold_fit=threshold_fit, max_iter=max_iter, seed=seed,
-              threshold_components=threshold_components,
-              em_chunk=em_chunk_sel, init_type=init_type, scale=scale,
-              n_chunk=n_chunk)
-    if protocol == 'sequential':
-        if metric_method != 'valid':
-            raise ValueError("metric_method is only supported by the "
-                             "batched protocol")
-        sel = select_sequential
-        kw['patience'] = patience
     else:
-        if metric_method not in ('valid', 'aic', 'bic'):
-            raise ValueError(f"metric_method must be one of 'valid', 'aic', "
-                             f"'bic'; found '{metric_method}'")
-        sel = select_batched
-        kw['metric_method'] = metric_method
-    k_best, params, _ = sel(X, **kw)
-    return k_best, params
+        kw = dict(max_components=max_components, n_folds=n_folds,
+                  n_inits=n_inits, reg_covar=reg_covar,
+                  threshold_fit=threshold_fit, max_iter=max_iter, seed=seed,
+                  threshold_components=threshold_components,
+                  em_chunk=em_chunk_sel, init_type=init_type, scale=scale,
+                  n_chunk=n_chunk)
+        if protocol == 'sequential':
+            if metric_method != 'valid':
+                raise ValueError("metric_method is only supported by the "
+                                 "batched protocol")
+            sel = select_sequential
+            kw['patience'] = patience
+        else:
+            if metric_method not in ('valid', 'aic', 'bic'):
+                raise ValueError(f"metric_method must be one of 'valid', "
+                                 f"'aic', 'bic'; found '{metric_method}'")
+            sel = select_batched
+            kw['metric_method'] = metric_method
+        k_best, params, _ = sel(X, **kw)
+    # the batched protocol pads parameters to K=max_components, and any
+    # protocol can leave dead components in the best CV fit; a zero-weight
+    # component can never resurrect under EM, so drop them here (the same
+    # masking FittedGMM applies) instead of paying for them through the
+    # bootstrap, refit and MC stages — and letting them shrink the
+    # auto-sized chunks by the padding factor.
+    w1, mu1, cov1 = params
+    alive = w1 > 0
+    return k_best, (w1[alive], mu1[alive], cov1[alive])
 
 
 def _bootstrap_counts(N, B, dtype, device, generator):
@@ -1333,7 +1370,8 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         limited fp64 throughput; float64 is the reference precision.
     em_chunk : int or 'auto', default='auto'
         Number of EM replicates (CV fits or bootstrap realisations) processed
-        per batch. Larger values are faster on GPU at higher peak memory
+        per batch; the initialisation and validation-LL stages batch the
+        same way. Larger values are faster on GPU at higher peak memory
         (results are chunk-invariant). 'auto' keeps 8 on CPU; on CUDA it
         sizes each stage's batch to fill half of the free device memory from
         the measured peak-memory model (replicates x N x K x (4d+4) x
