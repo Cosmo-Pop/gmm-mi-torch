@@ -289,6 +289,12 @@ def _chol(cov):
     broken = ~torch.isfinite(cov).all(dim=(-2, -1))       # (R,K)
     safe = torch.where((dead | broken)[..., None, None], eye.expand_as(cov),
                        cov)
+    if bool(dead.any()):
+        # internally produced dead components are already exact identity
+        # (the M-steps and inits finalise them so), so this absolute test
+        # fires only on externally supplied matrices — say so
+        warnings.warn(f"{int(dead.sum())} all-zero covariance(s) replaced "
+                      f"by identity", RuntimeWarning, stacklevel=2)
     if bool(broken.any()):
         warnings.warn(f"{int(broken.sum())} non-finite covariance(s) "
                       f"reset to identity", RuntimeWarning, stacklevel=2)
@@ -1386,18 +1392,24 @@ class FittedGMM:
 
     Mirrors GMM-MI's fitted-model access for plotting and inspection, with
     sklearn-style attributes: `weights_` (K,), `means_` (K, d) and
-    `covariances_` (K, d, d) as numpy arrays on the CPU (dead padding
-    components dropped), plus `n_components`. Obtained via
-    `estimate(..., return_fit=True)`.
+    `covariances_` (K, d, d) as float64 numpy arrays on the CPU (dead
+    padding components dropped), plus `n_components`. Obtained via
+    `estimate(..., return_fit=True)`, which passes a Cholesky factor
+    computed (and, when needed, repaired) in the fit's standardised units,
+    where reg_covar and the repair thresholds are meaningful. Direct
+    construction without `chol` factorises whatever units the caller
+    supplies.
     """
 
-    def __init__(self, w, mu, cov):
-        # factorise once: if the back-transformed covariance needs repair,
-        # covariances_, sample and score_samples all describe the same
-        # (repaired) mixture, and the repair warning fires here, not on use
-        chol, cov = _chol(cov.unsqueeze(0))
-        self._w, self._mu, self._cov = w, mu, cov[0]
-        self._chol = chol[0]
+    def __init__(self, w, mu, cov, chol=None):
+        if chol is None:
+            # factorise once: covariances_, sample and score_samples then
+            # all describe the same (repaired) mixture, and any repair
+            # warning fires here, not on use
+            chol_b, cov_b = _chol(cov.unsqueeze(0))
+            chol, cov = chol_b[0], cov_b[0]
+        self._w, self._mu, self._cov = w, mu, cov
+        self._chol = chol
         self.weights_ = w.cpu().numpy()
         self.means_ = mu.cpu().numpy()
         self.covariances_ = self._cov.cpu().numpy()
@@ -1711,11 +1723,20 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
                                   cov1.unsqueeze(0), reg_covar, threshold_fit,
                                   max_iter, em_chunk=em_chunk_boot, n_chunk=n_chunk)
         alive = wf[0] > 0
-        std_w = col_std.to(dtype=dtype, device=device)
-        mean_w = col_mean.to(dtype=dtype, device=device)
-        fit = FittedGMM(wf[0][alive],
-                        muf[0][alive] * std_w + mean_w,
-                        covf[0][alive] * (std_w[:, None] * std_w[None, :]))
+        # factorise/repair in STANDARDISED units, where reg_covar, the
+        # absolute dead test and the repair bump scale are meaningful, then
+        # back-transform both the covariance and its factor at float64:
+        # D L is lower-triangular and (D L)(D L)^T = D cov D exactly, so
+        # cov == chol chol^T survives the change of units, and a float32
+        # working dtype can no longer overflow (or zero out) the
+        # original-units covariance of a healthy fit
+        chol_s, cov_s = _chol(covf[0][alive].unsqueeze(0))
+        D = col_std.to(device=device)                 # float64 scales
+        mean64 = col_mean.to(device=device)
+        fit = FittedGMM(wf[0][alive].double(),
+                        muf[0][alive].double() * D + mean64,
+                        cov_s[0].double() * (D[:, None] * D[None, :]),
+                        chol=chol_s[0].double() * D[:, None])
     g = torch.Generator(device=X.device).manual_seed(seed + 10_000)
     if n_bootstrap >= 1:
         s = _bootstrap_counts(N, B, X.dtype, X.device, g)

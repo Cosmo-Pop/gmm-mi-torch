@@ -1443,6 +1443,57 @@ def test_integer_input_and_dtype_validation():
                  max_components=2)
 
 
+def _scaled_pair(scale, rho=0.8, N=600, seed=0):
+    rng = np.random.default_rng(seed)
+    cov = np.array([[1.0, rho], [rho, 1.0]])
+    return rng.multivariate_normal([0, 0], cov, N) * scale
+
+
+def test_return_fit_tiny_scale_units():
+    # review finding: FittedGMM factorised the ORIGINAL-units covariance, so
+    # columns with std ~1e-21 (strain-scale data) tripped the absolute
+    # dead test and silently returned identity covariances. The repair now
+    # happens in standardised units and the back-transform runs at float64.
+    X = _scaled_pair(1e-21)
+    _, _, fit = estimate(X, 'MI', n_bootstrap=0, fixed_components_number=1,
+                         return_fit=True)
+    assert np.allclose(fit.covariances_[0], np.cov(X.T), rtol=0.2)
+    s = fit.score_samples(X[:50])
+    assert np.isfinite(s).all() and s.std() > 0
+    S = fit.sample(10_000, seed=1)
+    assert abs(float(np.log10(S.std(0)).mean()) + 21.0) < 0.5
+
+
+def test_return_fit_mixed_scale_repair():
+    # with reg_covar below float32 resolution and a near-collinear pair at
+    # scales (1e-4, 1), a repair at FittedGMM construction used to add
+    # 1e-6 x the LARGEST original-unit variance to every diagonal entry,
+    # inflating the small column's variance ~100x; repaired in standardised
+    # units, the small column keeps its true ~1e-8 variance
+    rng = np.random.default_rng(1)
+    x = rng.normal(0, 1, 2000)
+    y = x + 1e-5 * rng.normal(size=2000)
+    X = np.column_stack([x * 1e-4, y])
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        _, _, fit = estimate(X, 'MI', n_bootstrap=0,
+                             fixed_components_number=1, return_fit=True,
+                             dtype=torch.float32, reg_covar=1e-9)
+    assert fit.covariances_[0][0, 0] < 5e-8
+
+
+def test_return_fit_huge_scale_fp32():
+    # float32 data at |x| ~ 1e20: the old working-dtype back-transform
+    # overflowed to inf and the fit came back as identity covariances under
+    # a generic non-finite warning; the float64 back-transform keeps the
+    # true ~1e40 covariances
+    X = _scaled_pair(1e20, rho=0.9)
+    _, _, fit = estimate(X, 'MI', n_bootstrap=0, fixed_components_number=1,
+                         return_fit=True, dtype=torch.float32)
+    assert np.isfinite(fit.covariances_).all()
+    assert fit.covariances_[0][0, 0] > 1e38
+
+
 def test_gaussianise_ties_average_rank_regression():
     # review finding: positional (double-argsort) tie-breaking mapped a tied
     # block to a monotone probit ramp in row order, fabricating MI whenever
