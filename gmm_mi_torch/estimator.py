@@ -33,8 +33,12 @@ import torch
 # EM kernel implementation. 'gemm' evaluates the Gaussian log-densities
 # and the M-step moments as matrix products against per-sample quadratic
 # features (see the kernel section below); 'legacy' selects the previous
-# broadcast kernels. Both give the same results.
+# broadcast kernels. Both give the same results. A typo must fail here,
+# not silently select the legacy kernels.
 _EM_KERNEL = os.environ.get('GMM_MI_TORCH_EM_KERNEL', 'gemm')
+if _EM_KERNEL not in ('gemm', 'legacy'):
+    raise ValueError(f"GMM_MI_TORCH_EM_KERNEL must be 'gemm' or 'legacy'; "
+                     f"found '{_EM_KERNEL}'")
 
 
 def _full_precision(fn):
@@ -783,6 +787,8 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None):
     Returns
     -------
     torch.Tensor of shape (n_replicates,)
+        -inf for a replicate whose weights are all zero (an empty validation
+        fold scores worse than any real fit, instead of a spurious 0).
     """
     R, N = s_val.shape
     if _EM_KERNEL == 'gemm':
@@ -794,23 +800,43 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None):
             lj += const.unsqueeze(1)
             acc = acc + (s_val[:, i:i+(n_chunk or N)]
                          * torch.logsumexp(lj, -1)).sum(1)
-        return acc / s_val.sum(1).clamp_min(1e-30)
-    chol, _ = _chol(cov)
-    if n_chunk is None:
-        ll_n = gmm_score(X.expand(R, N, X.shape[-1]), w, mu, chol)
-        return (s_val * ll_n).sum(1) / s_val.sum(1).clamp_min(1e-30)
-    acc = torch.zeros(R, dtype=X.dtype, device=X.device)
-    for i in range(0, N, n_chunk):
-        Xc = X[i:i+n_chunk]
-        nc = Xc.shape[0]
-        ll_n = gmm_score(Xc.expand(R, nc, X.shape[-1]), w, mu, chol)
-        acc = acc + (s_val[:, i:i+n_chunk] * ll_n).sum(1)
-    return acc / s_val.sum(1).clamp_min(1e-30)
+    else:
+        chol, _ = _chol(cov)
+        if n_chunk is None:
+            ll_n = gmm_score(X.expand(R, N, X.shape[-1]), w, mu, chol)
+            acc = (s_val * ll_n).sum(1)
+        else:
+            acc = torch.zeros(R, dtype=X.dtype, device=X.device)
+            for i in range(0, N, n_chunk):
+                Xc = X[i:i+n_chunk]
+                nc = Xc.shape[0]
+                ll_n = gmm_score(Xc.expand(R, nc, X.shape[-1]), w, mu, chol)
+                acc = acc + (s_val[:, i:i+n_chunk] * ll_n).sum(1)
+    tot = s_val.sum(1)
+    return torch.where(tot > 0, acc / tot.clamp_min(1e-30),
+                       torch.full_like(acc, -torch.inf))
 
 
 # ----------------------------------------------------------------------
 # component selection: the two protocols
 # ----------------------------------------------------------------------
+
+# CV fold assignment uses the caller's seed plus this fixed offset, keeping
+# the fold stream decoupled from the init streams (seed + K) and the
+# bootstrap stream (seed + 10_000).
+_CV_MASK_SEED_OFFSET = 30_000
+
+
+def _validate_folds(N, n_folds, what='X'):
+    """Reject CV settings that produce empty or degenerate folds up front:
+    they otherwise surface as 0/0 NaN metrics and far-away index errors."""
+    if int(n_folds) < 2:
+        raise ValueError(f"n_folds must be >= 2 (each fit needs a held-out "
+                         f"validation fold); found {n_folds}")
+    if int(N) < int(n_folds):
+        raise ValueError(f"n_folds={n_folds} exceeds the {N} samples "
+                         f"in {what}")
+
 
 def _cv_masks(N, n_folds, n_inits, dtype, seed=42):
     """0/1 train masks and val masks, shape (n_inits*n_folds, N)."""
@@ -831,7 +857,8 @@ def _cv_fit_for_k(X, K, n_folds, n_inits, reg_covar, threshold_fit, max_iter, se
                   n_chunk=None):
     """CV fits for a single k, batched over inits x folds."""
     g = torch.Generator(device=X.device).manual_seed(seed + K)
-    train, val = _cv_masks(X.shape[0], n_folds, n_inits, X.dtype)
+    train, val = _cv_masks(X.shape[0], n_folds, n_inits, X.dtype,
+                           seed=seed + _CV_MASK_SEED_OFFSET)
     train, val = train.to(X.device), val.to(X.device)
     R = train.shape[0]
     w0, mu0, cov0 = _init_params(X, K, R, reg_covar, generator=g,
@@ -856,9 +883,12 @@ def select_sequential(X, max_components=20, n_folds=2, n_inits=3,
 
     Components are added one at a time; the search stops when the validation
     metric fails to improve by `threshold_components` for `patience`
-    consecutive values of k. Cheaper than the batched protocol when it stops
-    early, but the stopping decision is made under initialisation noise: one
-    poor fit at a plateau can gate off better models at higher k.
+    consecutive values of k (the counter resets whenever k improves), and
+    the best-scoring k seen so far is selected — also when the search
+    reaches `max_components` without stopping. Cheaper than the batched
+    protocol when it stops early, but the stopping decision is made under
+    initialisation noise: one poor fit at a plateau can gate off better
+    models at higher k.
 
     Parameters
     ----------
@@ -870,7 +900,8 @@ def select_sequential(X, max_components=20, n_folds=2, n_inits=3,
         Minimum metric improvement that counts as progress.
     patience : int, default=1
         Number of consecutive non-improving k values tolerated before
-        stopping; the selected k is the last improving one.
+        stopping; the counter resets on every improvement, and the selected
+        k is the best-scoring one.
     n_folds, n_inits, reg_covar, threshold_fit, max_iter, seed, em_chunk,
     init_type, scale, n_chunk
         As in `estimate`.
@@ -884,7 +915,7 @@ def select_sequential(X, max_components=20, n_folds=2, n_inits=3,
     history : dict
         Per-k (metric, params) from the search.
     """
-    best_metric, pat, history = -torch.inf, 0, {}
+    best_metric, best_k, pat, history = -torch.inf, None, 0, {}
     for K in range(1, max_components + 1):
         metric, params = _cv_fit_for_k(X, K, n_folds, n_inits, reg_covar, threshold_fit,
                                        max_iter, seed, em_chunk=em_chunk,
@@ -892,13 +923,16 @@ def select_sequential(X, max_components=20, n_folds=2, n_inits=3,
                                        n_chunk=n_chunk)
         history[K] = (metric, params)
         if metric - best_metric > threshold_components:
-            best_metric = metric
+            best_metric, best_k, pat = metric, K, 0
         else:
             pat += 1
             if pat >= patience:
-                k_best = K - patience
-                return k_best, history[k_best][1], history
-    return max_components, history[max_components][1], history
+                break
+    if best_k is None:
+        raise RuntimeError(
+            "sequential selection found no finite validation metric at any "
+            "k; NaN metrics usually mean degenerate CV folds or data")
+    return best_k, history[best_k][1], history
 
 
 def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_components=1e-5,
@@ -942,7 +976,8 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
         parameters are returned separately).
     """
     N, d = X.shape
-    train, val = _cv_masks(N, n_folds, n_inits, X.dtype)
+    train, val = _cv_masks(N, n_folds, n_inits, X.dtype,
+                           seed=seed + _CV_MASK_SEED_OFFSET)
     train, val = train.to(X.device), val.to(X.device)
     IF = train.shape[0]
     R = max_components * IF
@@ -1132,7 +1167,7 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
              device='cpu', dtype=torch.float64, em_chunk='auto', mc_chunk='auto',
              preprocess='none', init_type='random_responsibilities',
              scale=None, fixed_components_number=None, metric_method='valid',
-             threshold_components=1e-5, n_chunk=None):
+             threshold_components=1e-5, patience=1, n_chunk=None):
     """Estimate an information-theoretic quantity with bootstrap errorbars.
 
     One joint GMM is fitted to all columns of `X` (component count chosen by
@@ -1264,6 +1299,9 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         Parsimony threshold for the batched protocol's 'valid' metric (and
         the improvement threshold for the sequential protocol): metric gains
         smaller than this do not justify a larger k.
+    patience : int, default=1
+        Sequential protocol only: consecutive non-improving k values
+        tolerated before the search stops (as in `select_sequential`).
     n_chunk : int, optional
         If set, each EM iteration and validation-LL evaluation streams over
         the sample dimension in chunks of this size, accumulating sufficient
@@ -1301,6 +1339,26 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     unstandardised data.
     """
     X = torch.as_tensor(X, dtype=dtype, device=device)
+    if quantity not in _INTEGRANDS:
+        raise ValueError(f"quantity must be one of "
+                         f"{sorted(_INTEGRANDS)}; found '{quantity}'")
+    if protocol not in ('batched', 'sequential'):
+        raise ValueError(f"protocol must be 'batched' or 'sequential'; "
+                         f"found '{protocol}'")
+    if X.dim() != 2:
+        raise ValueError(f"X must be 2-D (n_samples, n_variables); "
+                         f"found shape {tuple(X.shape)}")
+    if quantity in ('MI', 'KL_forward', 'KL_reverse') and X.shape[1] != 2:
+        raise ValueError(f"quantity='{quantity}' needs exactly 2 columns; "
+                         f"found {X.shape[1]}")
+    if quantity in ('cMI', 'TC') and X.shape[1] < (3 if quantity == 'cMI' else 2):
+        raise ValueError(f"quantity='{quantity}' needs at least "
+                         f"{3 if quantity == 'cMI' else 2} columns; "
+                         f"found {X.shape[1]}")
+    _validate_folds(X.shape[0], n_folds)
+    if n_chunk is not None and int(n_chunk) < 1:
+        raise ValueError(f"n_chunk must be a positive int or None; "
+                         f"found {n_chunk}")
     if preprocess == 'gaussianise':
         if quantity in ('KL_forward', 'KL_reverse'):
             raise ValueError(
@@ -1332,10 +1390,6 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         col_std = X.std(0)
     col_std = torch.where(col_std > 0, col_std, torch.ones_like(col_std))
     X = (X - col_mean) / col_std
-    if quantity in ('MI', 'KL_forward', 'KL_reverse'):
-        assert X.shape[1] == 2
-    if quantity == 'cMI':
-        assert X.shape[1] >= 3
     N, d = X.shape
     IF = n_inits * n_folds
     if fixed_components_number is not None:
@@ -1363,6 +1417,7 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
             if metric_method != 'valid':
                 raise ValueError("metric_method is only supported by the "
                                  "batched protocol")
+            kw['patience'] = patience
         else:
             kw['metric_method'] = metric_method
         k_best, (w1, mu1, cov1), _ = sel(X, **kw)
@@ -1476,16 +1531,35 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     k : list of int
         Selected component count per category; only if `return_k` is True.
     """
-    X = torch.as_tensor(X, dtype=dtype, device=device).reshape(-1, 1)
+    X = torch.as_tensor(X, dtype=dtype, device=device)
+    if X.dim() > 2 or (X.dim() == 2 and X.shape[1] != 1):
+        raise ValueError(f"X must be 1-D or a single column; found shape "
+                         f"{tuple(X.shape)}")
+    X = X.reshape(-1, 1)
+    Y = torch.as_tensor(Y, device=device)
+    if Y.dim() > 2 or (Y.dim() == 2 and Y.shape[1] != 1):
+        raise ValueError(f"Y must be 1-D; found shape {tuple(Y.shape)}")
+    Y = Y.reshape(-1)
+    if Y.shape[0] != X.shape[0]:
+        raise ValueError(f"X and Y must have the same length; found "
+                         f"{X.shape[0]} and {Y.shape[0]}")
+    if protocol not in ('batched', 'sequential'):
+        raise ValueError(f"protocol must be 'batched' or 'sequential'; "
+                         f"found '{protocol}'")
+    if n_chunk is not None and int(n_chunk) < 1:
+        raise ValueError(f"n_chunk must be a positive int or None; "
+                         f"found {n_chunk}")
     # shared affine standardisation of the continuous variable: MI with a
     # categorical variable is invariant, and reg_covar becomes scale-free
     x_std = X.std()
     X = (X - X.mean()) / torch.where(x_std > 0, x_std, torch.ones_like(x_std))
-    Y = torch.as_tensor(Y, device=device).reshape(-1)
-    cats = torch.unique(Y)
+    cats, counts = torch.unique(Y, return_counts=True)
     C = cats.shape[0]
+    ci_min = int(counts.argmin())
+    _validate_folds(int(counts[ci_min]), n_folds,
+                    what=f"the smallest category (Y == {cats[ci_min].item()})")
     if category_weights == 'empirical':
-        pi = torch.stack([(Y == c).sum() for c in cats]).to(dtype) / Y.shape[0]
+        pi = counts.to(dtype) / Y.shape[0]
     elif category_weights == 'uniform':
         pi = torch.full((C,), 1.0 / C, dtype=dtype, device=X.device)
     else:
