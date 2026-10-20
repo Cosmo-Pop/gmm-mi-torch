@@ -867,7 +867,9 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
         warnings.warn(
             f"{n_rerouted} of {R} EM replicate(s) carried a component "
             f"collapsed beyond the GEMM kernels' precision at this dtype "
-            f"and finished on the (slower, centred) legacy kernels",
+            f"and finished on the (slower, centred) legacy kernels — "
+            f"expected for surplus components during selection at "
+            f"float32, not a data problem",
             RuntimeWarning, stacklevel=3)
     if len(outs) == 1:
         return outs[0][:4]
@@ -948,29 +950,30 @@ _REROUTE_TOL_NATS = 1e-3
 
 
 def _reroute_danger(w, mu, cov):
-    """Per-replicate danger statistic max_k (|mu_k|^2 + 1) / min_j diag
-    cov_k, over alive components, at float64; the estimated log-density
-    residue is u x this."""
+    """Per-component danger statistic (R,K): (|mu_k|^2 + 1) / min_j diag
+    cov_k, zeroed for dead components, at float64; the estimated
+    log-density residue is u x this."""
     dmin = torch.diagonal(cov, dim1=-2, dim2=-1).double().amin(-1)   # (R,K)
     dgr = (mu.double().pow(2).sum(-1) + 1.0) \
         / dmin.clamp_min(torch.finfo(torch.float64).tiny)
-    dgr = torch.where(w > 0, dgr, torch.zeros_like(dgr))
-    return dgr.amax(-1)                                              # (R,)
+    return torch.where(w > 0, dgr, torch.zeros_like(dgr))            # (R,K)
 
 
 def _reroute_trips(w, mu, cov, repaired=None):
-    """(R,) bool: replicates whose GEMM residue would exceed
-    _REROUTE_TOL_NATS at this dtype's unit roundoff."""
+    """(R,) bool: replicates with a component whose GEMM residue would
+    exceed _REROUTE_TOL_NATS at this dtype's unit roundoff."""
     u = torch.finfo(cov.dtype).eps / 2.0        # unit roundoff, not eps
     thr = _REROUTE_TOL_NATS / u
-    danger = _reroute_danger(w, mu, cov)
-    trips = danger > thr
+    dgr = _reroute_danger(w, mu, cov)                                # (R,K)
+    trips = dgr > thr
     if repaired is not None:
         # escalation is corroborating evidence of the cancellation at work,
         # but alone it also fires for rho->1 components where legacy fp32
-        # is the worse kernel, so it only LOWERS the threshold tenfold
-        trips = trips | (repaired.any(-1) & (danger > thr / 10.0))
-    return trips
+        # is the worse kernel, so it only LOWERS the threshold tenfold —
+        # and only for the ESCALATED component itself, so a repaired
+        # blind-spot component cannot conscript an unrelated one's danger
+        trips = trips | (repaired & (dgr > thr / 10.0))
+    return trips.any(-1)
 
 
 def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500,
@@ -1002,8 +1005,8 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
     # budget the replicate chunk was sized with
     leg = torch.zeros(R, dtype=torch.bool, device=dev)
     n_rerouted = 0
-    nl = max(1, (3 * N) // (4 * d + 4)) if n_chunk is None \
-        else min(n_chunk, max(1, (3 * N) // (4 * d + 4)))
+    nl = max(1, (3 * (N if n_chunk is None else min(N, n_chunk)))
+             // (4 * d + 4))
     for _ in range(max_iter):
         Ra = ai.shape[0]
         if gemm:
@@ -1511,7 +1514,8 @@ def _rank_gaussianise(X, tie_rank='average', generator=None):
             # a STABLE sort, the order within each tied block is exactly
             # the permutation's — i.e. uniformly random — while untied
             # values keep their exact ranks
-            perm = torch.randperm(N, generator=generator).to(xj.device)
+            perm = torch.randperm(N, generator=generator,
+                                  device='cpu').to(xj.device)
             order = torch.argsort(xj[perm], dim=0, stable=True)
             rp = torch.argsort(order, dim=0, stable=True)
             ranks = torch.empty(N, dtype=torch.float64, device=xj.device)
