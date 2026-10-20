@@ -838,6 +838,121 @@ def test_entry_argument_validation():
         estimate_categorical(X, Y, max_components=2)
     with pytest.raises(ValueError, match='same length'):
         estimate_categorical(X[:100, 0], Y, max_components=2)
+    # counts and floors that used to fail deep inside EM with opaque torch
+    # errors (or silently return garbage: max_iter=0 returned the random
+    # init, n_bootstrap=-1 was treated as 0, reg_covar<=0 fitted collapsed
+    # components) must raise at entry under the argument's own name
+    with pytest.raises(ValueError, match='max_iter'):
+        estimate(X, 'MI', max_iter=0, max_components=2)
+    with pytest.raises(ValueError, match='reg_covar'):
+        estimate(X, 'MI', reg_covar=0.0, max_components=2)
+    with pytest.raises(ValueError, match='reg_covar'):
+        estimate(X, 'MI', reg_covar=-1e-6, max_components=2)
+    with pytest.raises(ValueError, match='mc_samples'):
+        estimate(X, 'MI', mc_samples=0, max_components=2)
+    with pytest.raises(TypeError, match='mc_samples'):
+        estimate(X, 'MI', mc_samples=1e5, max_components=2)
+    with pytest.raises(ValueError, match='max_components'):
+        estimate(X, 'MI', max_components=0)
+    with pytest.raises(ValueError, match='n_inits'):
+        estimate(X, 'MI', n_inits=0, max_components=2)
+    with pytest.raises(ValueError, match='fixed_components_number'):
+        estimate(X, 'MI', fixed_components_number=0)
+    with pytest.raises(ValueError, match='fixed_components_number'):
+        estimate(X, 'MI', fixed_components_number=-1)
+    with pytest.raises(ValueError, match='threshold_components'):
+        estimate(X, 'MI', threshold_components=-1.0, max_components=2)
+    with pytest.raises(ValueError, match='n_bootstrap'):
+        estimate(X, 'MI', n_bootstrap=-1, max_components=2)
+    with pytest.raises(TypeError, match='n_bootstrap'):
+        estimate(X, 'MI', n_bootstrap=3.0, max_components=2)
+    with pytest.raises(TypeError, match='n_folds'):
+        estimate(X, 'MI', n_folds=2.5, max_components=2)
+    with pytest.raises(ValueError, match='max_iter'):
+        estimate_categorical(X[:, 0], Y, max_iter=0, max_components=2)
+    with pytest.raises(TypeError, match='mc_samples'):
+        estimate_categorical(X[:, 0], Y, mc_samples=1e4, max_components=2)
+    with pytest.raises(ValueError, match='reg_covar'):
+        estimate_categorical(X[:, 0], Y, reg_covar=0.0, max_components=2)
+
+
+def test_metric_method_validated_with_fixed_k():
+    # the fixed-k shortcut used to skip the protocol/metric_method
+    # compatibility rules entirely, so typos ran silently
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(200, 2))
+    Y = rng.integers(0, 2, 200)
+    with pytest.raises(ValueError, match='metric_method'):
+        estimate(X, 'MI', fixed_components_number=2, metric_method='bogus')
+    with pytest.raises(ValueError, match='metric_method'):
+        estimate(X, 'MI', protocol='sequential', fixed_components_number=2,
+                 metric_method='aic')
+    with pytest.raises(ValueError, match='metric_method'):
+        estimate_categorical(X[:, 0], Y, fixed_components_number=2,
+                             metric_method='bogus')
+
+
+def test_numpy_integer_seed():
+    # np.int64/np.int32 seeds (what rng.integers yields in seed sweeps)
+    # used to crash in _cv_masks with 'TypeError: an integer is required';
+    # they must behave exactly like the equal Python int, and a float seed
+    # must be rejected under the argument's name
+    rng = np.random.default_rng(0)
+    X = rng.multivariate_normal([0, 0], [[1, .6], [.6, 1]], 300)
+    kw = dict(max_components=2, n_bootstrap=2, mc_samples=1000)
+    m0, s0 = estimate(X, 'MI', seed=3, **kw)
+    m1, s1 = estimate(X, 'MI', seed=np.int64(3), **kw)
+    assert m0 == m1 and s0 == s1
+    Y = rng.integers(0, 2, 300)
+    m2, _ = estimate_categorical(X[:, 0], Y, seed=np.int32(3), **kw)
+    assert np.isfinite(m2)
+    with pytest.raises(TypeError, match='seed'):
+        estimate(X, 'MI', seed=3.0, **kw)
+
+
+def test_nonfinite_input_rejected():
+    # review finding: NaN/inf input was never rejected — gaussianise ranked
+    # NaN rows as the largest values (fabricating MI for independent data)
+    # and the 'none' path burned max_iter everywhere before a far-away
+    # IndexError. Both entry points must refuse it up front.
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(400, 2))
+    for bad in (np.nan, np.inf, -np.inf):
+        Xb = X.copy()
+        Xb[7, 1] = bad
+        with pytest.raises(ValueError, match='non-finite'):
+            estimate(Xb, 'MI', max_components=2)
+        with pytest.raises(ValueError, match='non-finite'):
+            estimate(Xb, 'MI', preprocess='gaussianise', max_components=2)
+    Y = rng.integers(0, 2, 400)
+    Xc = X[:, 0].copy()
+    Xc[3] = np.nan
+    with pytest.raises(ValueError, match='non-finite'):
+        estimate_categorical(Xc, Y, max_components=2)
+    Yf = Y.astype(float)
+    Yf[3] = np.nan
+    with pytest.raises(ValueError, match='non-finite'):
+        estimate_categorical(X[:, 0], Yf, max_components=2)
+
+
+def test_select_public_guards():
+    # the public selection functions skipped _validate_folds, silently
+    # returning k=1 with every metric -inf for infeasible folds; and
+    # all-non-finite metrics hit the parsimony mask's nonzero()[0] as an
+    # opaque IndexError instead of the sequential path's clear RuntimeError
+    E = gmm_mi_torch.estimator
+    torch.manual_seed(0)
+    X20 = torch.randn(20, 2, dtype=torch.float64)
+    with pytest.raises(ValueError, match='n_folds'):
+        E.select_batched(X20, max_components=3, n_folds=25)
+    with pytest.raises(ValueError, match='n_folds'):
+        E.select_sequential(X20, max_components=3, n_folds=25)
+    Xn = torch.randn(300, 2, dtype=torch.float64)
+    Xn[5, 0] = float('nan')
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        with pytest.raises(RuntimeError, match='no finite validation metric'):
+            E.select_batched(Xn, max_components=2, max_iter=20)
 
 
 def test_val_ll_empty_fold_minus_inf():
