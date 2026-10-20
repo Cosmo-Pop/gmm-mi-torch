@@ -1,5 +1,77 @@
 # Changelog
 
+## 0.4.0 (2026-10-20)
+
+The design pass for the remaining 2026-10-20 review findings, built under
+report-before-code: each change below was proposed in
+scoping/design-report-v0.4.0-2026-10-20.md, ruled on by an independent
+reviewer (scoping/design-review-v0.4.0-2026-10-20.md, all amendments
+adopted), and landed with the regression tests the ruling asked for.
+Intentional behaviour changes: gaussianise ties are randomised by default,
+the Monte-Carlo streams are reseeded per replicate, float32 runs on
+large-offset or spike-bearing data now return the float64 answer (they
+were wrong before), and AIC/BIC values shift by up to 2*N*threshold_fit
+(same selections in all tests).
+
+- Float32 is now safe on collapsed components: the GEMM kernels' uncentred
+  moments leave a rounding residue ~ u*P*|x|^2 that swamped a
+  reg_covar-floored spike away from the origin (zero-inflated MI biased up
+  to +60% at float32 under nothing but repair warnings; float64 kernel
+  parity broken below reg_covar ~1e-13). em_fit/val_ll now detect such
+  replicates on the parameters entering every E-step and finish them on
+  the centred legacy kernels, per replicate and chunk-invariantly, with
+  one aggregated RuntimeWarning. Measured on the GB10 at float32 defaults:
+  clean data trips nothing (+3% wall for the detector); 30%-zero-inflated
+  N=20,000 pays +6% wall and returns 0.966+-0.005 where the undetected
+  kernels gave 1.007+-0.064. The detector is deliberately blind to
+  near-collinear components with O(1) variances, where the float32 GEMM
+  kernels are accurate and the legacy kernels are the worse choice; that
+  class is pinned by a must-not-reroute test and documented in the kernel
+  section.
+- gaussianise breaks ties with seeded random ranks by default
+  (tie_rank='random'; 'average' remains available): the v0.3.0 average
+  ranks mapped a tied block to one probit atom and fabricated ~0.24 nats
+  between INDEPENDENT 50%-zero-inflated columns. Random tie-ranks leave
+  the MI estimand exactly unchanged (the original values are recoverable
+  from the tie-broken ones) and restore ~0 there. Measured caveat, stated
+  in the tie warning: on DEPENDENT atoms (a shared zero mask, truth 0.949
+  nats) the randomised transform is biased low (~0.74) while
+  preprocess='none' lands at ~0.94 — prefer 'none' for heavily tied data.
+  The tie warning also now ignores two-sample blocks (float32-native data
+  acquires harmless birthday pairs at large N).
+- The entry pipeline (finiteness check, rank transform, standardisation)
+  runs at float64 BEFORE the cast to the working dtype: float64 data with
+  offset/sigma >~ 1e6 (MJDs, timestamps) used to be quantised at float32
+  before the centring could protect it — MI silently destroyed at offset
+  1e8, a hard abort at timestamp scale. float32 now tracks float64 at
+  every offset. Integer/half inputs are promoted; fp16/bf16 working dtypes
+  are rejected at entry.
+- return_fit: the covariance is factorised (and repaired) in the fit's
+  standardised units and back-transformed together with its Cholesky
+  factor at float64. Strain-scale (1e-21) data no longer comes back with
+  identity covariances, mixed column scales no longer inflate a repaired
+  small column ~100x, and 1e20-scale float32 fits no longer overflow to
+  identity. FittedGMM attributes are float64 numpy.
+- Reproducibility: each bootstrap replicate draws its MC samples from its
+  own seeded stream, so results are independent of mc_chunk and of
+  out-of-memory retries by construction (and the GB10 measures the
+  per-replicate draws slightly faster than the batched one). Fixed-seed
+  results are bitwise reproducible on CPU including with 'auto' chunks;
+  on CUDA, em_chunk changes reduction order (documented). |seed| <= 2**62
+  and n_bootstrap <= 2**20 are enforced so the stream offsets stay valid.
+- The precision pin also suspends ambient torch.autocast (a bf16 region
+  used to change both the estimate and the selected k); EM warns once per
+  call when replicates exhaust max_iter unconverged; AIC/BIC score the
+  refit parameters exactly (em_fit's log-likelihood lags its returned
+  parameters by one M-step — now documented); val_ll accumulates at
+  float64 across sample chunks like the EM kernels;
+  torch.set_default_device('cuda') no longer breaks the CV masks.
+- plotting.find_contours: the 1-sigma ellipse constant becomes chi2(2 dof)
+  at 0.6827 (2.2958); the inherited 0.77 was the inverted quantile, whose
+  ellipse encloses 32% of the mass (upstream GMM-MI has the same constant;
+  default contour_levels=[2] unaffected). The reg_covar docstring states
+  the KL pooled-variance exception.
+
 ## 0.3.1 (2026-10-20)
 
 Mechanical fix release addressing the no-design-decision findings of the
