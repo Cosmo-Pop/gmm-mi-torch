@@ -866,6 +866,60 @@ def test_patience_exposed_by_estimate():
     assert np.isfinite(m)
 
 
+def test_categorical_selection_pipeline_shared():
+    # the categorical selection pipeline is now the same code as estimate's:
+    # sequential + metric_method raises (it used to be silently dropped and
+    # ran 'valid' selection), and threshold_components / patience are
+    # exposed instead of hardcoded
+    rng = np.random.default_rng(0)
+    N = 600
+    Y = rng.integers(0, 2, N)
+    X = rng.normal(2.0 * Y, 1.0)
+    with pytest.raises(ValueError, match='metric_method'):
+        estimate_categorical(X, Y, protocol='sequential',
+                             metric_method='bic', max_components=2)
+    with pytest.raises(ValueError, match='metric_method'):
+        estimate_categorical(X, Y, metric_method='aicc', max_components=2)
+    m, _ = estimate_categorical(X, Y, protocol='sequential',
+                                max_components=2, threshold_components=1e-4,
+                                patience=2, n_bootstrap=2, mc_samples=2000)
+    assert np.isfinite(m)
+
+
+def test_single_bootstrap_std_is_none():
+    # n_bootstrap=1 used to return std = NaN (sample std of one element);
+    # one replicate has no sample deviation, so std is None as for 0
+    rng = np.random.default_rng(0)
+    cov = np.array([[1.0, 0.6], [0.6, 1.0]])
+    X = rng.multivariate_normal([0, 0], cov, 1000)
+    m, s = estimate(X, 'MI', max_components=2, n_bootstrap=1,
+                    mc_samples=2000)
+    assert np.isfinite(m) and s is None
+    Y = rng.integers(0, 2, 1000)
+    Xc = rng.normal(2.0 * Y, 1.0)
+    m, s = estimate_categorical(Xc, Y, max_components=2, n_bootstrap=1,
+                                mc_samples=2000)
+    assert np.isfinite(m) and s is None
+
+
+def test_categorical_bootstrap_randint_fallback(monkeypatch):
+    # the categorical bootstrap used to lack the >2^24 multinomial fallback
+    # estimate has (it now lives in the shared _bootstrap_counts); as in
+    # test_bootstrap_randint_fallback, the two paths must agree within the
+    # combined bootstrap error
+    rng = np.random.default_rng(8)
+    N = 4000
+    Y = rng.integers(0, 2, N)
+    X = rng.normal(2.0 * Y, 1.0)
+    common = dict(max_components=3, n_bootstrap=20, mc_samples=20_000, seed=1)
+    m_mn, s_mn = estimate_categorical(X, Y, **common)
+    monkeypatch.setattr(gmm_mi_torch.estimator,
+                        '_MULTINOMIAL_MAX_CATEGORIES', 8)
+    m_ri, s_ri = estimate_categorical(X, Y, **common)
+    combined = (s_mn ** 2 + s_ri ** 2) ** 0.5
+    assert abs(m_mn - m_ri) <= SIGMAS * combined
+
+
 def test_gaussianise_ties_average_rank_regression():
     # review finding: positional (double-argsort) tie-breaking mapped a tied
     # block to a monotone probit ramp in row order, fabricating MI whenever
