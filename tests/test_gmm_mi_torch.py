@@ -746,6 +746,126 @@ def test_legacy_nchunk_mstep_covariance_floor():
     assert cov2[0, 0, 0, 0].item() >= np.float32(1e-6) * (1 - 1e-6)
 
 
+def test_sequential_patience_reset_exhaustion_and_nan(monkeypatch):
+    # review finding: the patience counter never reset on improvement and
+    # the selected k assumed the misses were trailing; exhaustion returned
+    # max_components regardless of scores; an all-NaN metric crashed with
+    # KeyError(0). All three paths, with a scripted metric sequence.
+    E = gmm_mi_torch.estimator
+    X = torch.zeros(10, 2)
+
+    def scripted(metrics):
+        def stub(X, K, *args, **kwargs):
+            return metrics[K - 1], (f'w{K}', f'mu{K}', f'cov{K}')
+        return stub
+
+    # improve@1, flat@2, improve@3, flat@4+: patience=2 must survive the
+    # single miss at k=2 and select k=3 (the old counter returned k=2)
+    monkeypatch.setattr(E, '_cv_fit_for_k',
+                        scripted([1.0, 1.0, 2.0, 2.0, 2.0]))
+    k, params, _ = E.select_sequential(X, max_components=5, patience=2)
+    assert k == 3 and params[0] == 'w3'
+    # exhaustion without an early stop: the best-scoring k wins, not
+    # max_components
+    monkeypatch.setattr(E, '_cv_fit_for_k', scripted([1.0, 2.0, 1.5]))
+    k, params, _ = E.select_sequential(X, max_components=3, patience=5)
+    assert k == 2 and params[0] == 'w2'
+    # all-NaN metrics: a clear error instead of history[0]
+    monkeypatch.setattr(E, '_cv_fit_for_k', scripted([float('nan')] * 3))
+    with pytest.raises(RuntimeError, match='metric'):
+        E.select_sequential(X, max_components=3, patience=1)
+
+
+def test_seed_controls_cv_folds(monkeypatch):
+    # review finding: the seed was never forwarded to _cv_masks (hardcoded
+    # 42) although the docstring promises seed controls the CV splits
+    E = gmm_mi_torch.estimator
+    t0, v0 = E._cv_masks(100, 2, 1, torch.float64, seed=0)
+    t1, v1 = E._cv_masks(100, 2, 1, torch.float64, seed=1)
+    assert not torch.equal(v0, v1)
+    seen = []
+    orig = E._cv_masks
+
+    def spy(N, n_folds, n_inits, dtype, seed=42):
+        seen.append(seed)
+        return orig(N, n_folds, n_inits, dtype, seed=seed)
+
+    monkeypatch.setattr(E, '_cv_masks', spy)
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(300, 2))
+    for s in (7, 8):
+        estimate(X, 'MI', max_components=2, n_bootstrap=2, seed=s,
+                 mc_samples=1000)
+    assert len(seen) == 2 and seen[0] != seen[1]
+    assert all(s != 42 for s in seen)
+
+
+def test_fold_feasibility_validation():
+    # degenerate CV settings must fail fast with a clear ValueError instead
+    # of a NaN cascade into far-away Index/KeyErrors
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(50, 2))
+    with pytest.raises(ValueError, match='n_folds'):
+        estimate(X, 'MI', n_folds=1, max_components=2)
+    with pytest.raises(ValueError, match='n_folds'):
+        estimate(X[:3], 'MI', n_folds=5, max_components=2)
+    Y = np.array([0] * 48 + [1] * 2)
+    with pytest.raises(ValueError, match='category'):
+        estimate_categorical(X[:, 0], Y, n_folds=3, max_components=2)
+
+
+def test_entry_argument_validation():
+    # typos and malformed inputs raise at entry, before minutes of compute
+    # (and not via bare asserts, which vanish under python -O)
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(200, 2))
+    Y = rng.integers(0, 2, 200)
+    with pytest.raises(ValueError, match='protocol'):
+        estimate(X, 'MI', protocol='Sequential', max_components=2)
+    with pytest.raises(ValueError, match='quantity'):
+        estimate(X, 'mi', max_components=2)
+    with pytest.raises(ValueError, match='columns'):
+        estimate(np.hstack([X, X[:, :1]]), 'MI', max_components=2)
+    with pytest.raises(ValueError, match='columns'):
+        estimate(X, 'cMI', max_components=2)
+    with pytest.raises(ValueError, match='2-D'):
+        estimate(X[:, 0], 'MI', max_components=2)
+    with pytest.raises(ValueError, match='n_chunk'):
+        estimate(X, 'MI', n_chunk=0, max_components=2)
+    with pytest.raises(ValueError, match='protocol'):
+        estimate_categorical(X[:, 0], Y, protocol='batch', max_components=2)
+    with pytest.raises(ValueError, match='single column'):
+        estimate_categorical(X, Y, max_components=2)
+    with pytest.raises(ValueError, match='same length'):
+        estimate_categorical(X[:100, 0], Y, max_components=2)
+
+
+def test_val_ll_empty_fold_minus_inf():
+    # an all-zero validation weight row used to score exactly 0.0 (clamped
+    # denominator), beating any real negative log-likelihood in the fold
+    # argmax; it must lose instead
+    E = gmm_mi_torch.estimator
+    torch.manual_seed(0)
+    X = torch.randn(50, 2, dtype=torch.float64)
+    g = torch.Generator().manual_seed(0)
+    w, mu, cov = E._init_params(X, 2, 2, 1e-6, generator=g)
+    s = torch.ones(2, 50, dtype=torch.float64)
+    s[1] = 0.0
+    v = E.val_ll(X, s, w, mu, cov)
+    assert torch.isfinite(v[0])
+    assert v[1].item() == -float('inf')
+
+
+def test_patience_exposed_by_estimate():
+    # patience used not to be plumbed through estimate() at all
+    rng = np.random.default_rng(0)
+    cov = np.array([[1.0, 0.6], [0.6, 1.0]])
+    X = rng.multivariate_normal([0, 0], cov, 2000)
+    m, s = estimate(X, 'MI', protocol='sequential', max_components=3,
+                    patience=2, n_bootstrap=2, mc_samples=1000)
+    assert np.isfinite(m)
+
+
 def test_gaussianise_ties_average_rank_regression():
     # review finding: positional (double-argsort) tie-breaking mapped a tied
     # block to a monotone probit ramp in row order, fabricating MI whenever
