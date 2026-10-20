@@ -155,7 +155,9 @@ def test_aic_bic_select_sensible_k():
     for metric_method in ('aic', 'bic'):
         _, _, k = estimate(X, 'MI', protocol='batched', max_components=6,
                            metric_method=metric_method, return_k=True)
-        assert 3 <= k <= 4, f"{metric_method} selected k={k}"
+        # pinned exact value (all four matrix legs agree); the v0.4.0
+        # final-state rescoring of the criterion must not move the argmin
+        assert k == 3, f"{metric_method} selected k={k}"
 
 
 def test_fixed_k_matches_batched():
@@ -1589,13 +1591,24 @@ def test_cv_masks_survive_default_device():
         pytest.skip('needs a CUDA device to change the default to')
     rng = np.random.default_rng(0)
     X = rng.multivariate_normal([0, 0], [[1, .6], [.6, 1]], 500)
+    Xt = X.copy()
+    Xt[:100, 0] = 0.0          # a tied block, so the random tie-break runs
     try:
         torch.set_default_device('cuda')
         m, s = estimate(X, 'MI', max_components=2, n_bootstrap=2,
                         mc_samples=1000, device='cuda', dtype=torch.float32)
+        # diff-review defect 1: the default tie_rank='random' path used to
+        # raise under a CUDA default device (CPU generator vs default-device
+        # randperm — the same class as the _cv_masks fix)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            m2, s2 = estimate(Xt, 'MI', preprocess='gaussianise',
+                              max_components=2, n_bootstrap=2,
+                              mc_samples=1000, device='cuda',
+                              dtype=torch.float32)
     finally:
         torch.set_default_device(None)
-    assert np.isfinite(m)
+    assert np.isfinite(m) and np.isfinite(m2)
 
 
 def test_plotting_one_sigma_contour_constant():
@@ -1681,6 +1694,43 @@ def test_reroute_leaves_safe_classes_alone():
         warnings.simplefilter('ignore', RuntimeWarning)
         m64, s64 = estimate(Xc, 'MI', dtype=torch.float64, **kw)
     assert abs(m32 - m64) <= 3 * (s32 ** 2 + s64 ** 2) ** 0.5 + 0.05
+    # line-collapsed subsets (y = x exactly on 20% of rows), at the origin
+    # and displaced: the other blind-spot shape the ruling asked to pin
+    rng = np.random.default_rng(2)
+    base = rng.multivariate_normal([0, 0], [[1, .5], [.5, 1]], 4000)
+    mask = rng.random(4000) < 0.2
+    base[mask, 1] = base[mask, 0]
+    for off in (0.0, 3.0):
+        Xl = base + off
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter('always')
+            l32, t32 = estimate(Xl, 'MI', dtype=torch.float32, **kw)
+        assert not any('legacy kernels' in str(r.message) for r in rec), off
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            l64, t64 = estimate(Xl, 'MI', dtype=torch.float64, **kw)
+        assert abs(l32 - l64) <= 3 * (t32 ** 2 + t64 ** 2) ** 0.5 + 0.05, off
+
+
+def test_reroute_never_fires_at_fp64(monkeypatch):
+    # the fp64-leg guarantee from the ruling: on multimodal data at a sane
+    # reg_covar, the detector must never trip at float64
+    E = gmm_mi_torch.estimator
+    trips = []
+    orig = E._reroute_trips
+
+    def spy(w, mu, cov, repaired=None):
+        out = orig(w, mu, cov, repaired=repaired)
+        trips.append(int(out.sum()))
+        return out
+
+    monkeypatch.setattr(E, '_reroute_trips', spy)
+    X = _three_component_data(N=6000)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        estimate(X, 'MI', protocol='batched', max_components=6,
+                 n_bootstrap=5, mc_samples=5000, dtype=torch.float64)
+    assert sum(trips) == 0
 
 
 def test_reroute_fp64_tiny_regcovar():

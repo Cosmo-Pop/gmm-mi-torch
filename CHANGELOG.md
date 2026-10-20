@@ -20,14 +20,21 @@ were wrong before), and AIC/BIC values shift by up to 2*N*threshold_fit
   parity broken below reg_covar ~1e-13). em_fit/val_ll now detect such
   replicates on the parameters entering every E-step and finish them on
   the centred legacy kernels, per replicate and chunk-invariantly, with
-  one aggregated RuntimeWarning. Measured on the GB10 at float32 defaults:
-  clean data trips nothing (+3% wall for the detector); 30%-zero-inflated
-  N=20,000 pays +6% wall and returns 0.966+-0.005 where the undetected
-  kernels gave 1.007+-0.064. The detector is deliberately blind to
-  near-collinear components with O(1) variances, where the float32 GEMM
-  kernels are accurate and the legacy kernels are the worse choice; that
-  class is pinned by a must-not-reroute test and documented in the kernel
-  section.
+  one aggregated RuntimeWarning. Measured on the GB10 at float32 defaults
+  (N=20,000, independent reviewer's measurements): ordinary multimodal
+  data reroutes a few per cent of the over-specified CV replicates (3 of
+  120; 14 of 120 on CPU at N=6,000) at ~+10% wall-clock with MI unchanged
+  (0.9065+-0.0051 vs float64 0.9052+-0.0052), so the reroute warning is
+  routine at float32 during selection — it says so, and is not a data
+  problem; 30%-zero-inflated data reroutes nearly every replicate and
+  costs ~2.7x wall-clock (3.4 s vs 1.25 s — still ~3.4x faster than
+  float64's 11.8 s), returning 0.9693+-0.0056 where the undetected
+  kernels gave 0.9757+-0.0064 (float64: 0.9698+-0.0052); on worse seeds
+  the undetected float32 bias reached +60%. The detector is deliberately
+  blind to near-collinear components with O(1) variances, where the
+  float32 GEMM kernels are accurate and the legacy kernels are the worse
+  choice; that class is pinned by must-not-reroute tests and documented
+  in the kernel section.
 - gaussianise breaks ties with seeded random ranks by default
   (tie_rank='random'; 'average' remains available): the v0.3.0 average
   ranks mapped a tied block to one probit atom and fabricated ~0.24 nats
