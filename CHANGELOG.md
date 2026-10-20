@@ -1,5 +1,96 @@
 # Changelog
 
+## 0.3.0 (2026-10-20)
+
+Fix release addressing the 2026-10-16 adversarial review. Three intentional
+behaviour changes mean results for a given seed shift relative to v0.2.2
+(all well within the validated errorbars on continuous, well-conditioned
+data): gaussianise now average-ranks ties, CV folds now follow the seed,
+and dead padding components are dropped before the bootstrap (which moves
+estimates at Monte-Carlo noise level).
+
+### Estimator correctness
+
+- `preprocess='gaussianise'` breaks ties by average rank (the scipy
+  `rankdata` convention) instead of positionally: a tied block used to be
+  mapped to a monotone probit ramp in row order, fabricating MI whenever
+  row order correlates with another variable (a sorted column next to a
+  constant column returned 1.06 nats; the truth, and the new result, is 0).
+  A RuntimeWarning now names columns with more than 1% tied values. Ranks
+  and quantiles are computed at float64, where float32 integer ranks round
+  above 2^24 samples. `return_fit` with gaussianise warns that the model
+  lives in rank-probit space (the rank transform has no parametric
+  inverse).
+- `cov == chol @ chol^T` is now an invariant: `_chol` returns the repaired
+  covariance and every caller writes it back. The Monte-Carlo stage used to
+  sample the joint under the repaired factor while scoring marginals
+  refactorised from the raw covariance — two different mixtures whenever a
+  replicate needed repair. `FittedGMM` factorises once at construction, so
+  `covariances_`, `sample` and `score_samples` agree; the repair warnings
+  now report correct counts and the cumulative bump (the exhaustion message
+  claimed "1e4 x mean variance"; the ceiling is ~1.11e3 x the largest
+  absolute diagonal entry), and the non-finite-reset warning is no longer
+  swallowed when escalation also runs.
+- The legacy chunked M-step gets the v0.2.1 reg_covar diagonal clamp and
+  float64 cross-chunk accumulators, matching the GEMM path: float32
+  rounding of the shifted moments could push a collapsed component's
+  variance below the floor, or negative.
+- Sequential selection: the patience counter resets on improvement and the
+  best-scoring k is returned — with patience=2 and improvements at k=1 and
+  k=3, the old counter arithmetic returned k=2, discarding the better
+  model; exhaustion returned max_components regardless of scores; an
+  all-NaN metric crashed with KeyError. `patience` is now a parameter of
+  `estimate` and `estimate_categorical`.
+- The seed now controls the CV folds, as the docstring always claimed
+  (they were hardcoded to seed 42); forwarded with a fixed offset so the
+  fold stream stays decoupled from the init and bootstrap streams.
+- An empty validation fold scores -inf instead of a spurious 0.0 that beat
+  every real fit in the fold argmax; degenerate CV settings (n_folds < 2,
+  n_folds > N, a category smaller than n_folds) are rejected up front with
+  a clear ValueError, as are typo'd quantity/protocol/metric_method
+  values, wrong column counts (previously bare asserts that vanish under
+  python -O), bad n_chunk, a multi-column X passed to
+  `estimate_categorical` (it was silently flattened), and a typo'd
+  GMM_MI_TORCH_EM_KERNEL (it silently selected the legacy kernels).
+- `estimate` and `estimate_categorical` share one selection->bootstrap
+  pipeline (they had drifted): the categorical path no longer silently
+  drops metric_method under protocol='sequential' (it raises, as estimate
+  does), exposes `threshold_components` and `patience` instead of
+  hardcoding them, and gains the N > 2^24 bootstrap fallback.
+- `n_bootstrap=1` returns std=None instead of NaN (one replicate has no
+  sample deviation).
+
+### Memory and precision
+
+- Dead padding components are sliced away after selection: the batched
+  protocol pads to K=max_components, and the dead components used to ride
+  through the bootstrap, refit and MC stages (~6.7x wasted work at
+  k_best=3, max_components=20) while shrinking the auto-sized replicate
+  batches by the same factor.
+- `val_ll` scores replicates in `em_chunk` batches under the same
+  halve-and-retry CUDA out-of-memory guard as `em_fit` (it used to
+  evaluate all replicates in one unguarded allocation that could OOM an
+  estimate whose EM stage had already fitted), and `_init_params` runs its
+  replicate chunks under the same guard.
+- `em_fit` and `val_ll` pin float32 matmuls to full precision at entry, so
+  direct kernel calls no longer run under ambient TF32; the pin is
+  process-global (not thread-local), now documented.
+
+### Packaging, examples, docs
+
+- New `plot` extra (`pip install ".[plot]"`): `gmm_mi_torch.plotting`
+  imports numpy, matplotlib and scipy, none of which the base install
+  guarantees.
+- `examples/mi_grid_multigpu.py` (and the README copy): workers index into
+  the inherited CUDA_VISIBLE_DEVICES mask instead of writing absolute GPU
+  indices that escape a scheduler's allocation (e.g. Slurm), and the
+  script exits cleanly on a machine with no visible GPU.
+- Doc fixes: the em_chunk docstring documents the GEMM byte model (not
+  just the legacy one); "Piras et al. 2022" -> 2023; README shell quoting
+  for zsh; validation/README.md and gb10_report.md corrections; the three
+  stale validation bench scripts import the package instead of the
+  pre-package flat module they were silently timing.
+
 ## 0.2.2 (2026-10-16)
 
 Documentation release; no code changes.

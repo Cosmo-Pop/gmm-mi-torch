@@ -28,10 +28,10 @@ conda activate gmm-mi-torch
 ```bash
 git clone git@github.com:Cosmo-Pop/gmm-mi-torch.git
 cd gmm-mi-torch
-pip install .          # or: pip install -e .[test]
+pip install .          # or: pip install -e ".[test]"
 ```
 
-The only runtime dependency is `torch` (numpy inputs are accepted; tests additionally need `numpy` and `pytest`).
+The only runtime dependency is `torch` (numpy inputs are accepted; tests additionally need `numpy` and `pytest`). The plotting helpers in `gmm_mi_torch.plotting` need `numpy`, `matplotlib` and `scipy`, installed via the `plot` extra: `pip install ".[plot]"`.
 
 ## Quickstart
 
@@ -87,15 +87,16 @@ from concurrent.futures import ProcessPoolExecutor
 
 import torch
 
-N_GPUS = max(torch.cuda.device_count(), 1)   # GPUs visible to this job
 
-
-def init_worker(counter, n_gpus):
-    # runs in each child before any CUDA use: pin this worker to one GPU
+def init_worker(counter, visible):
+    # runs in each child before any CUDA use: pin this worker to one GPU.
+    # Index INTO the inherited CUDA_VISIBLE_DEVICES mask — writing absolute
+    # indices would escape a scheduler's allocation (e.g. under Slurm with
+    # CUDA_VISIBLE_DEVICES=2,3, workers must pin to 2 and 3, not 0 and 1).
     with counter.get_lock():
         idx = counter.value
         counter.value += 1
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(idx % n_gpus)
+    os.environ["CUDA_VISIBLE_DEVICES"] = visible[idx % len(visible)]
 
 
 def one_pair(task):
@@ -106,31 +107,36 @@ def one_pair(task):
 
 
 if __name__ == "__main__":
+    n_gpus = torch.cuda.device_count()       # GPUs visible to this job
+    if n_gpus == 0:
+        raise SystemExit("no CUDA device is visible")
+    mask = os.environ.get("CUDA_VISIBLE_DEVICES")
+    visible = mask.split(",") if mask else [str(i) for i in range(n_gpus)]
     X = load_my_data()                     # (n_samples, n_variables) array
     pairs = [(i, j) for i in range(X.shape[1]) for j in range(i + 1, X.shape[1])]
     tasks = [((i, j), X[:, [i, j]]) for i, j in pairs]
     ctx = mp.get_context("spawn")   # fork is unsafe once CUDA is involved
     counter = ctx.Value("i", 0)
-    with ProcessPoolExecutor(max_workers=N_GPUS, mp_context=ctx,
+    with ProcessPoolExecutor(max_workers=n_gpus, mp_context=ctx,
                              initializer=init_worker,
-                             initargs=(counter, N_GPUS)) as pool:
+                             initargs=(counter, visible)) as pool:
         for i, j, mi, sigma in pool.map(one_pair, tasks):
             print(i, j, mi, sigma)
 ```
 
-This is also available as a runnable file: [`examples/mi_grid_multigpu.py`](examples/mi_grid_multigpu.py). It must be run as a script (`python examples/mi_grid_multigpu.py`): the `spawn` start method re-imports the file in each worker, so pasting the code into a notebook or an interactive Python/IPython session fails with `AttributeError: Can't get attribute ... on <module '__main__'>` followed by `BrokenProcessPool`. The `spawn` start method and the environment variable set in the initializer matter — CUDA contexts do not survive `fork`, and a worker must be pinned to its GPU before the first CUDA call. On one GPU this pool degenerates to a single worker and buys nothing over a plain loop; leave `max_workers` at the GPU count, never higher (a worker pinned to a GPU that does not exist crashes the pool).
+This is also available as a runnable file: [`examples/mi_grid_multigpu.py`](examples/mi_grid_multigpu.py). It must be run as a script (`python examples/mi_grid_multigpu.py`): the `spawn` start method re-imports the file in each worker, so pasting the code into a notebook or an interactive Python/IPython session fails with `AttributeError: Can't get attribute ... on <module '__main__'>` followed by `BrokenProcessPool`. The `spawn` start method and the environment variable set in the initializer matter — CUDA contexts do not survive `fork`, and a worker must be pinned to its GPU before the first CUDA call. On one GPU this pool degenerates to a single worker and buys nothing over a plain loop; leave `max_workers` at the GPU count, never higher (an `estimate()` call already fills its GPU, so extra workers would only contend for the same devices).
 
 Sample-dimension chunking (`n_chunk`) extends the reachable scale to N=10⁸, d=8 (total correlation in 23 min / 77.5 GiB at fp32 on 128 GB unified memory). One hardware caveat: on GPUs with rate-limited fp64 throughput (e.g. GB10), CUDA fp64 is slower than CPU fp64 — use fp32 on such devices (validated: the full test suite passes at fp32). On data-centre GPUs with full-rate fp64 (A100/H100/GH200 class), float64 costs only ~1.4x float32 end-to-end and avoids all reduced-precision caveats — prefer it there, especially for near-zero MI or spike-like marginals.
 
 ## Tests
 
 ```bash
-pip install -e .[test]
+pip install -e ".[test]"
 pytest                                                    # CPU, float64
 GMM_MI_DEVICE=cuda GMM_MI_DTYPE=float32 GMM_MI_EM_CHUNK=1000 pytest   # GPU, float32
 ```
 
-The suite (38 tests) checks analytic Gaussian targets, Monte-Carlo/quadrature targets for multimodal and non-Gaussian cases, chunking parity, categorical MI, and error paths; `tests/conftest.py` routes the whole suite to a device/dtype via the `GMM_MI_*` environment variables. One additional statistical test — bootstrap-errorbar coverage calibration over 40 independent datasets — is slow and therefore gated behind `GMM_MI_OFFLINE=1`.
+The suite (58 tests) checks analytic Gaussian targets, Monte-Carlo/quadrature targets for multimodal and non-Gaussian cases, chunking parity, categorical MI, and error paths; `tests/conftest.py` routes the whole suite to a device/dtype via the `GMM_MI_*` environment variables (tests that call internals directly always run on CPU at float64, whatever the variables say). One additional statistical test — bootstrap-errorbar coverage calibration over 40 independent datasets — is slow and therefore gated behind `GMM_MI_OFFLINE=1`.
 
 For most readers, [docs/validation_summary.pdf](docs/validation_summary.pdf) is the right entry point to the validation results. The [validation/](validation/) directory additionally contains the full working report from the port's GB10 acceptance run ([validation/README.md](validation/README.md) explains its contents and provenance), kept in the repository for team review while it is private.
 

@@ -18,8 +18,6 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import torch
 
-N_GPUS = max(torch.cuda.device_count(), 1)   # GPUs visible to this job
-
 
 def load_data():
     # stand-in for your own (n_samples, n_variables) array
@@ -28,12 +26,15 @@ def load_data():
         [0, 0, 0], [[1, 0.6, 0.2], [0.6, 1, 0.4], [0.2, 0.4, 1]], 10_000)
 
 
-def init_worker(counter, n_gpus):
-    # runs in each child before any CUDA use: pin this worker to one GPU
+def init_worker(counter, visible):
+    # runs in each child before any CUDA use: pin this worker to one GPU.
+    # Index INTO the inherited CUDA_VISIBLE_DEVICES mask — writing absolute
+    # indices would escape a scheduler's allocation (e.g. under Slurm with
+    # CUDA_VISIBLE_DEVICES=2,3, workers must pin to 2 and 3, not 0 and 1).
     with counter.get_lock():
         idx = counter.value
         counter.value += 1
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(idx % n_gpus)
+    os.environ["CUDA_VISIBLE_DEVICES"] = visible[idx % len(visible)]
 
 
 def one_pair(task):
@@ -44,14 +45,20 @@ def one_pair(task):
 
 
 if __name__ == "__main__":
+    n_gpus = torch.cuda.device_count()       # GPUs visible to this job
+    if n_gpus == 0:
+        raise SystemExit("no CUDA device is visible; use a plain loop with "
+                         "estimate(..., device='cpu') instead")
+    mask = os.environ.get("CUDA_VISIBLE_DEVICES")
+    visible = mask.split(",") if mask else [str(i) for i in range(n_gpus)]
     X = load_data()
     pairs = [(i, j) for i in range(X.shape[1])
              for j in range(i + 1, X.shape[1])]
     tasks = [((i, j), X[:, [i, j]]) for i, j in pairs]
     ctx = mp.get_context("spawn")   # fork is unsafe once CUDA is involved
     counter = ctx.Value("i", 0)
-    with ProcessPoolExecutor(max_workers=N_GPUS, mp_context=ctx,
+    with ProcessPoolExecutor(max_workers=n_gpus, mp_context=ctx,
                              initializer=init_worker,
-                             initargs=(counter, N_GPUS)) as pool:
+                             initargs=(counter, visible)) as pool:
         for i, j, mi, sigma in pool.map(one_pair, tasks):
             print(f"MI(x{i}, x{j}) = {mi:.4f} +- {sigma:.4f}")

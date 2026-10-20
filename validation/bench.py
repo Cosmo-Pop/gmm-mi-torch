@@ -1,18 +1,19 @@
-"""Benchmark torch_gmm_mi: selection vs bootstrap wall-clock, CPU vs GPU, fp64 vs fp32.
+"""Benchmark gmm_mi_torch: selection vs bootstrap wall-clock, CPU vs GPU, fp64 vs fp32.
 
 Workload: 3-component bivariate mixture, N=20000, max_k=8, n_bootstrap=50
 (mirrors estimate()'s internals so the two phases can be timed separately).
 """
 
+import os
 import sys
 import time
 
 import numpy as np
 import torch
 
-sys.path.insert(0, "/home/hvp20/GMM-MI torch port")
-from torch_gmm_mi import (select_batched, em_fit, _chol, gmm_sample,
-                          _INTEGRANDS)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from gmm_mi_torch.estimator import (select_batched, em_fit, _chol,
+                                    gmm_sample, _INTEGRANDS)
 
 
 def make_data(N=20000, seed=0):
@@ -67,7 +68,7 @@ def run_once(Xnp, device, dtype, max_k=8, n_bootstrap=50, mc_samples=100_000,
     cov0 = cov1.unsqueeze(0).expand(B, K, d, d).contiguous()
     w, mu, cov, _ = em_fit(X, s, w0, mu0, cov0, reg, tol, max_iter,
                            em_chunk=em_chunk)
-    chol = _chol(cov)
+    chol, cov = _chol(cov)
     vals = []
     for i in range(0, B, mc_chunk):
         sl = slice(i, i + mc_chunk)
