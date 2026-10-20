@@ -480,15 +480,18 @@ def test_em_chunk_parity_fp64():
 
 
 def test_mc_chunk_auto_within_mc_noise():
-    # same fits, possibly different MC sample stream (on CUDA 'auto' differs
-    # from 8): agreement at the Monte-Carlo noise level, well inside the
-    # bootstrap errorbar
+    # same fits, different MC sample stream per chunking: agreement at the
+    # Monte-Carlo noise level, well inside the bootstrap errorbar. The
+    # fixed chunking is 3 so it differs from 'auto' on EVERY leg (CPU
+    # 'auto'=8, CUDA 'auto'=20 here): the v0.3.0 version compared
+    # mc_chunk=8 against CPU 'auto'=8, which is bitwise the same run and
+    # could never fail on the documented default pytest invocation.
     rng = np.random.default_rng(0)
     cov = np.array([[1.0, 0.6], [0.6, 1.0]])
     X = rng.multivariate_normal([0, 0], cov, 10000)
     common = dict(protocol='batched', max_components=3, n_bootstrap=20,
                   em_chunk=8)
-    m0, s0 = estimate(X, 'MI', mc_chunk=8, **common)
+    m0, s0 = estimate(X, 'MI', mc_chunk=3, **common)
     m1, s1 = estimate(X, 'MI', mc_chunk='auto', **common)
     assert abs(m0 - m1) < 5e-3
     assert abs(s0 - s1) < 5e-3
@@ -1248,6 +1251,47 @@ def test_full_precision_tf32_gemm_result_cuda(monkeypatch):
             assert gemm_err() > 1e-2
         finally:
             torch.backends.cuda.matmul.fp32_precision = saved
+
+
+def test_dataframe_input_accepted():
+    # the docstrings promise 'array-like' but torch.as_tensor cannot
+    # inspect a pandas DataFrame ("could not determine the shape of object
+    # type 'DataFrame'"); the entry points unwrap __array__ containers, so
+    # a DataFrame must give bitwise the numpy result
+    pd = pytest.importorskip('pandas')
+    rng = np.random.default_rng(0)
+    X = rng.multivariate_normal([0, 0], [[1, .6], [.6, 1]], 1000)
+    kw = dict(max_components=2, n_bootstrap=2, mc_samples=2000)
+    m_np, s_np = estimate(X, 'MI', **kw)
+    m_df, s_df = estimate(pd.DataFrame(X, columns=['a', 'b']), 'MI', **kw)
+    assert m_df == m_np and s_df == s_np
+    Y = rng.integers(0, 2, 1000)
+    x0 = X[:, 0].copy()      # same memory layout for both calls: a strided
+    # column and a Series copy reduce in different orders at the ulp level
+    m_c, _ = estimate_categorical(pd.Series(x0), pd.Series(Y), **kw)
+    m_n, _ = estimate_categorical(x0, Y, **kw)
+    assert m_c == m_n
+
+
+def test_string_labels_estimate_categorical():
+    # string/object labels (morphological class, survey field) used to die
+    # inside torch.as_tensor with a raw TypeError; they are factorised via
+    # numpy's unique. Labels whose sorted order matches the integer codes
+    # must give bitwise the integer-label result, and the degenerate-fold
+    # error must name the offending label, not a numeric code.
+    rng = np.random.default_rng(0)
+    X = rng.multivariate_normal([0, 0], [[1, .6], [.6, 1]], 900)
+    Y = rng.integers(0, 3, 900)
+    names = np.array(['a0', 'b1', 'c2'])     # sorted order == code order
+    kw = dict(max_components=2, n_bootstrap=2, mc_samples=2000)
+    m_int, s_int = estimate_categorical(X[:, 0], Y, **kw)
+    m_str, s_str = estimate_categorical(X[:, 0], names[Y], **kw)
+    assert m_str == m_int and s_str == s_int
+    m_lst, _ = estimate_categorical(X[:, 0], list(names[Y]), **kw)
+    assert m_lst == m_int
+    Ysmall = np.array(['rare'] + ['common'] * 399)
+    with pytest.raises(ValueError, match='rare'):
+        estimate_categorical(X[:400, 0], Ysmall, max_components=2)
 
 
 def test_return_k_reports_live_components(monkeypatch):
