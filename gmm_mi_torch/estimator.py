@@ -34,8 +34,11 @@ import torch
 # EM kernel implementation. 'gemm' evaluates the Gaussian log-densities
 # and the M-step moments as matrix products against per-sample quadratic
 # features (see the kernel section below); 'legacy' selects the previous
-# broadcast kernels. Both give the same results. A typo must fail here,
-# not silently select the legacy kernels.
+# broadcast kernels. The two agree at reduction-order precision wherever
+# the GEMM cancellation residue is below the reg_covar floor (reg_covar >=
+# ~1e-13 at float64; at float32, standardised data with the reroute
+# guarding collapsed components — see the kernel section). A typo must
+# fail here, not silently select the legacy kernels.
 _EM_KERNEL = os.environ.get('GMM_MI_TORCH_EM_KERNEL', 'gemm')
 if _EM_KERNEL not in ('gemm', 'legacy'):
     raise ValueError(f"GMM_MI_TORCH_EM_KERNEL must be 'gemm' or 'legacy'; "
@@ -308,7 +311,7 @@ def _run_chunked(n, chunk, fn):
 # batched Gaussian machinery
 # ----------------------------------------------------------------------
 
-def _chol(cov):
+def _chol(cov, return_repaired=False):
     """Cholesky of (R,K,d,d) covariances; returns (chol, cov).
 
     The returned covariance is the matrix that was actually factorised, and
@@ -322,6 +325,10 @@ def _chol(cov):
     diagonal entry until the factorisation succeeds (with a RuntimeWarning
     reporting the cumulative bump): the per-component analogue of GMM-MI's
     refit-at-larger-reg_covar fallback, without abandoning the whole fit.
+
+    With return_repaired=True, a third element is returned: the (R,K) bool
+    mask of components that needed escalation or a non-finite reset — the
+    kernel-reroute detector uses it as corroborating evidence.
     """
     d = cov.shape[-1]
     eye = torch.eye(d, dtype=cov.dtype, device=cov.device)
@@ -340,7 +347,7 @@ def _chol(cov):
                       f"reset to identity", RuntimeWarning, stacklevel=2)
     L, info = torch.linalg.cholesky_ex(safe)
     if not bool(info.any()):
-        return L, safe
+        return (L, safe, broken) if return_repaired else (L, safe)
     # positive by construction: a corrupted component can have a negative or
     # near-zero mean diagonal, which must not flip the bump's sign
     scale = torch.diagonal(safe, dim1=-2, dim2=-1).abs().amax(-1)
@@ -360,7 +367,8 @@ def _chol(cov):
                 f"extra diagonal regularisation (up to {total:g} x the "
                 f"component's largest absolute diagonal entry)",
                 RuntimeWarning, stacklevel=2)
-            return L, safe
+            return ((L, safe, repaired | broken) if return_repaired
+                    else (L, safe))
         bump *= 10.0
     raise RuntimeError(
         f"covariance factorisation failed even after diagonal "
@@ -488,6 +496,18 @@ def marginal_score(X_full, w, mu, cov, idx):
 # accumulated at float64 (see _gauss_coef and _moment_gemm); the data are
 # standardised in estimate(), which bounds the magnitudes entering the
 # cancellation (Chan, Golub & LeVeque 1983).
+#
+# Standardisation bounds |x| but NOT the residue relative to a collapsed
+# component's variance: the uncentred form leaves a rounding residue
+# ~ u * P_k * |x|^2 in the log-density and ~ u * |mu_k|^2 per entry of the
+# M2 - m1 m1^T covariance (u = unit roundoff), so a component at the
+# reg_covar floor away from the origin is beyond these kernels' precision
+# at float32 (and below reg_covar ~1e-13 at float64). Replicates in that
+# regime are detected and finished on the centred legacy kernels (see
+# _reroute_trips, which also documents the detector's deliberate blind
+# spot for rho->1 components). Direct em_fit/val_ll calls on unstandardised
+# float32 data fall in the detected regime too: they run correctly, via
+# the slower legacy path.
 
 
 def _features(X):
@@ -842,6 +862,13 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
             f"within max_iter={max_iter} iterations; their last iterates "
             f"are used (raise max_iter or loosen threshold_fit)",
             RuntimeWarning, stacklevel=3)   # em_fit -> _full_precision -> caller
+    n_rerouted = sum(o[5] for o in outs)
+    if n_rerouted:
+        warnings.warn(
+            f"{n_rerouted} of {R} EM replicate(s) carried a component "
+            f"collapsed beyond the GEMM kernels' precision at this dtype "
+            f"and finished on the (slower, centred) legacy kernels",
+            RuntimeWarning, stacklevel=3)
     if len(outs) == 1:
         return outs[0][:4]
     return tuple(torch.cat([o[j] for o in outs]) for j in range(4))
@@ -900,6 +927,52 @@ def _em_step_nchunked(X, s, w, mu, chol, logw, reg_covar, n_chunk):
     return ll, w_new.to(dt), mu_new.to(dt), cov_new.to(dt)
 
 
+# Kernel reroute: the GEMM kernels evaluate the Gaussian quadratic form and
+# the M-step covariance from uncentred origin moments, whose rounding
+# residue scales as u * P_k * |x|^2 (u = unit roundoff). For a component
+# collapsed to the reg_covar floor away from the origin this swamps both
+# the log-density (O(1)-nat errors at float32) and the covariance
+# (indefinite every iteration), silently biasing MI on spike-bearing,
+# zero-inflated or duplicated-point data — and at float64 it defeats
+# reg_covar <= ~1e-13. The centred legacy kernels are immune, so replicates
+# whose parameters make the residue material are finished on them. The
+# detector uses the min diagonal as the precision proxy: it trips on every
+# executed failure case and never on continuous data, but is DELIBERATELY
+# blind to rho->1 components with O(1) diagonals (it understates their P by
+# diag/lambda_min, measured x500 at rho=0.999): there the GEMM float32
+# kernels stay within 1 sigma of float64 (residual +0.016..0.025 nats at
+# |mu|^2 ~ 8-20 with lambda_min = reg_covar) while legacy float32 is
+# measurably WORSE (repair storms — the v0.2.x beta failure mode), so such
+# replicates must NOT be rerouted; tests pin both sides.
+_REROUTE_TOL_NATS = 1e-3
+
+
+def _reroute_danger(w, mu, cov):
+    """Per-replicate danger statistic max_k (|mu_k|^2 + 1) / min_j diag
+    cov_k, over alive components, at float64; the estimated log-density
+    residue is u x this."""
+    dmin = torch.diagonal(cov, dim1=-2, dim2=-1).double().amin(-1)   # (R,K)
+    dgr = (mu.double().pow(2).sum(-1) + 1.0) \
+        / dmin.clamp_min(torch.finfo(torch.float64).tiny)
+    dgr = torch.where(w > 0, dgr, torch.zeros_like(dgr))
+    return dgr.amax(-1)                                              # (R,)
+
+
+def _reroute_trips(w, mu, cov, repaired=None):
+    """(R,) bool: replicates whose GEMM residue would exceed
+    _REROUTE_TOL_NATS at this dtype's unit roundoff."""
+    u = torch.finfo(cov.dtype).eps / 2.0        # unit roundoff, not eps
+    thr = _REROUTE_TOL_NATS / u
+    danger = _reroute_danger(w, mu, cov)
+    trips = danger > thr
+    if repaired is not None:
+        # escalation is corroborating evidence of the cancellation at work,
+        # but alone it also fires for rho->1 components where legacy fp32
+        # is the worse kernel, so it only LOWERS the threshold tenfold
+        trips = trips | (repaired.any(-1) & (danger > thr / 10.0))
+    return trips
+
+
 def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500,
                  n_chunk=None):
     """Weighted EM, batched over replicates.
@@ -907,13 +980,15 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
     X: (N,d) shared data; s: (R,N) per-replicate sample weights.
     n_chunk: sample-dimension chunk size for the per-iteration E/M
     accumulation (None = original single-pass path, kept verbatim).
-    Returns (w, mu, cov, train_ll, n_unconverged) with train_ll the last
-    E-step's weighted mean per-sample log-likelihood, shape (R,), and
-    n_unconverged the number of replicates that exhausted max_iter
-    (aggregated and warned about once by em_fit).
+    Returns (w, mu, cov, train_ll, n_unconverged, n_rerouted) with train_ll
+    the last E-step's weighted mean per-sample log-likelihood, shape (R,),
+    n_unconverged the replicates that exhausted max_iter and n_rerouted the
+    replicates the kernel-reroute detector moved to the legacy kernels
+    (each aggregated and warned about once by em_fit).
     """
     R, N = s.shape
     dev = X.device
+    d = X.shape[-1]
     # compaction: only still-active replicates stay in the working batch
     ai = torch.arange(R, device=dev)                      # active indices
     w_out, mu_out, cov_out = w.clone(), mu.clone(), cov.clone()
@@ -922,15 +997,58 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
     sa = s
     gemm = _EM_KERNEL == 'gemm'
     F = _features(X) if gemm and n_chunk is None else None
+    # sticky per-replicate reroute mask over the active set; the legacy step
+    # streams its samples so the (4d+4) legacy peak stays inside the 3x GEMM
+    # budget the replicate chunk was sized with
+    leg = torch.zeros(R, dtype=torch.bool, device=dev)
+    n_rerouted = 0
+    nl = max(1, (3 * N) // (4 * d + 4)) if n_chunk is None \
+        else min(n_chunk, max(1, (3 * N) // (4 * d + 4)))
     for _ in range(max_iter):
         Ra = ai.shape[0]
         if gemm:
+            # the trip check runs on the parameters entering EVERY E-step,
+            # including the first (warm starts can already carry a
+            # collapsed component); the factorisation doubles as the
+            # escalation evidence and its repair is written back
+            _, cov, rep = _chol(cov, return_repaired=True)
+            trips = _reroute_trips(w, mu, cov, repaired=rep)
+            new = trips & ~leg
+            if bool(new.any()):
+                n_rerouted += int(new.sum())
+                leg = leg | trips
+        if gemm and not bool(leg.any()):
             if n_chunk is None:
                 resp, ll = _estep_gemm(F, sa, w, mu, cov)
                 w, mu, cov = _mstep_gemm(F, resp, sa, reg_covar, X.shape[-1])
             else:
                 ll, w, mu, cov = _em_step_gemm_nchunked(X, sa, w, mu, cov,
                                                         reg_covar, n_chunk)
+        elif gemm:
+            gi = (~leg).nonzero(as_tuple=True)[0]
+            li = leg.nonzero(as_tuple=True)[0]
+            ll = torch.empty(Ra, dtype=X.dtype, device=dev)
+            w_n, mu_n, cov_n = (torch.empty_like(w), torch.empty_like(mu),
+                                torch.empty_like(cov))
+            if gi.numel():
+                if n_chunk is None:
+                    resp, llg = _estep_gemm(F, sa[gi], w[gi], mu[gi], cov[gi])
+                    wg, mug, covg = _mstep_gemm(F, resp, sa[gi], reg_covar, d)
+                else:
+                    llg, wg, mug, covg = _em_step_gemm_nchunked(
+                        X, sa[gi], w[gi], mu[gi], cov[gi], reg_covar, n_chunk)
+                ll[gi] = llg
+                w_n[gi], mu_n[gi], cov_n[gi] = wg, mug, covg
+            if li.numel():
+                chol_l, cov_l = _chol(cov[li])
+                logw_l = torch.where(
+                    w[li] > 0, torch.log(w[li].clamp_min(1e-300)),
+                    torch.full_like(w[li], -torch.inf))
+                lll, wl, mul, covl = _em_step_nchunked(
+                    X, sa[li], w[li], mu[li], chol_l, logw_l, reg_covar, nl)
+                ll[li] = lll
+                w_n[li], mu_n[li], cov_n[li] = wl, mul, covl
+            w, mu, cov = w_n, mu_n, cov_n
         elif n_chunk is None:
             chol, cov = _chol(cov)
             logw = torch.where(w > 0, torch.log(w.clamp_min(1e-300)),
@@ -955,13 +1073,14 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
             keep = ~done
             ai, sa, prev = ai[keep], sa[keep], ll[keep]
             w, mu, cov = w[keep], mu[keep], cov[keep]
+            leg = leg[keep]
             if ai.shape[0] == 0:
-                return w_out, mu_out, cov_out, ll_out, 0
+                return w_out, mu_out, cov_out, ll_out, 0, n_rerouted
         else:
             prev = ll
     # unconverged stragglers: write back current state
     w_out[ai], mu_out[ai], cov_out[ai], ll_out[ai] = w, mu, cov, prev
-    return w_out, mu_out, cov_out, ll_out, int(ai.shape[0])
+    return w_out, mu_out, cov_out, ll_out, int(ai.shape[0]), n_rerouted
 
 
 @_full_precision
@@ -993,39 +1112,71 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None, em_chunk=None):
     outs = _run_chunked(R, R if em_chunk is None else em_chunk,
                         lambda sl: _val_ll_core(X, s_val[sl], w[sl], mu[sl],
                                                 cov[sl], n_chunk))
-    return outs[0] if len(outs) == 1 else torch.cat(outs)
+    n_rerouted = sum(o[1] for o in outs)
+    if n_rerouted:
+        warnings.warn(
+            f"{n_rerouted} of {R} replicate(s) carried a component "
+            f"collapsed beyond the GEMM kernels' precision at this dtype "
+            f"and were scored with the (slower, centred) legacy kernels",
+            RuntimeWarning, stacklevel=3)   # val_ll -> _full_precision -> caller
+    vals = [o[0] for o in outs]
+    return vals[0] if len(vals) == 1 else torch.cat(vals)
+
+
+def _legacy_score_sum(X, s_val, w, mu, chol, n_chunk):
+    """Weighted log-likelihood sums via the centred kernels, float64 acc."""
+    R, N = s_val.shape
+    if n_chunk is None:
+        ll_n = gmm_score(X.expand(R, N, X.shape[-1]), w, mu, chol)
+        return (s_val * ll_n).sum(1).double()
+    acc = torch.zeros(R, dtype=torch.float64, device=X.device)
+    for i in range(0, N, n_chunk):
+        Xc = X[i:i+n_chunk]
+        nc = Xc.shape[0]
+        ll_n = gmm_score(Xc.expand(R, nc, X.shape[-1]), w, mu, chol)
+        acc = acc + (s_val[:, i:i+n_chunk] * ll_n).sum(1).double()
+    return acc
 
 
 def _val_ll_core(X, s_val, w, mu, cov, n_chunk=None):
-    """`val_ll` for one replicate batch.  The cross-chunk accumulator runs
-    at float64, as in the EM kernels: at float32 the drift of a working-
-    dtype sum grows as sqrt(#chunks) x ulp and reaches a visible fraction
-    of threshold_components at large N — and this metric decides k."""
+    """`val_ll` for one replicate batch; returns (values, n_rerouted).
+
+    The cross-chunk accumulator runs at float64, as in the EM kernels: at
+    float32 the drift of a working-dtype sum grows as sqrt(#chunks) x ulp
+    and reaches a visible fraction of threshold_components at large N — and
+    this metric decides k. Replicates the reroute detector trips are scored
+    with the centred legacy kernels, as in em_fit."""
     R, N = s_val.shape
+    n_rerouted = 0
     if _EM_KERNEL == 'gemm':
-        coef, const = _gauss_coef(w, mu, cov)
+        chol_all, cov, rep = _chol(cov, return_repaired=True)
+        trips = _reroute_trips(w, mu, cov, repaired=rep)
+        n_rerouted = int(trips.sum())
         acc = torch.zeros(R, dtype=torch.float64, device=X.device)
-        for i in range(0, N, n_chunk or N):
-            Fc = _features(X[i:i+(n_chunk or N)])
-            lj = torch.matmul(Fc.unsqueeze(0), coef.transpose(1, 2))
-            lj += const.unsqueeze(1)
-            acc = acc + (s_val[:, i:i+(n_chunk or N)]
-                         * torch.logsumexp(lj, -1)).sum(1).double()
+        gi = (~trips).nonzero(as_tuple=True)[0]
+        li = trips.nonzero(as_tuple=True)[0]
+        if gi.numel():
+            coef, const = _gauss_coef(w[gi], mu[gi], cov[gi])
+            sg = s_val[gi]
+            accg = torch.zeros(gi.numel(), dtype=torch.float64,
+                               device=X.device)
+            for i in range(0, N, n_chunk or N):
+                Fc = _features(X[i:i+(n_chunk or N)])
+                lj = torch.matmul(Fc.unsqueeze(0), coef.transpose(1, 2))
+                lj += const.unsqueeze(1)
+                accg = accg + (sg[:, i:i+(n_chunk or N)]
+                               * torch.logsumexp(lj, -1)).sum(1).double()
+            acc[gi] = accg
+        if li.numel():
+            acc[li] = _legacy_score_sum(X, s_val[li], w[li], mu[li],
+                                        chol_all[li], n_chunk)
     else:
         chol, _ = _chol(cov)
-        if n_chunk is None:
-            ll_n = gmm_score(X.expand(R, N, X.shape[-1]), w, mu, chol)
-            acc = (s_val * ll_n).sum(1).double()
-        else:
-            acc = torch.zeros(R, dtype=torch.float64, device=X.device)
-            for i in range(0, N, n_chunk):
-                Xc = X[i:i+n_chunk]
-                nc = Xc.shape[0]
-                ll_n = gmm_score(Xc.expand(R, nc, X.shape[-1]), w, mu, chol)
-                acc = acc + (s_val[:, i:i+n_chunk] * ll_n).sum(1).double()
+        acc = _legacy_score_sum(X, s_val, w, mu, chol, n_chunk)
     tot = s_val.sum(1).double()
-    return torch.where(tot > 0, acc / tot.clamp_min(1e-30),
+    vals = torch.where(tot > 0, acc / tot.clamp_min(1e-30),
                        torch.full_like(acc, -torch.inf)).to(X.dtype)
+    return vals, n_rerouted
 
 
 # ----------------------------------------------------------------------

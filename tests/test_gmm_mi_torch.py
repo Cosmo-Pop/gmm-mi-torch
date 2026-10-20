@@ -1609,6 +1609,115 @@ def test_plotting_one_sigma_contour_constant():
     assert abs(r3 - np.sqrt(chi2.ppf(0.995, 2))) < 1e-2
 
 
+def _zero_inflated_pair(seed, N=6000, frac=0.3, rho=0.8):
+    rng = np.random.default_rng(seed)
+    z = rng.random(N) < frac
+    g = rng.multivariate_normal([8, 8], [[1, rho], [rho, 1]], N)
+    return np.where(z[:, None], 0.0, g)
+
+
+def test_reroute_zero_inflated_fp32():
+    # review finding 1: the GEMM kernels' uncentred origin moments leave a
+    # rounding residue ~ u*P*|x|^2 that swamps a reg_covar-floored spike at
+    # float32 — MI biased up to +60% (1.54 vs 0.96 at seed 2) with only
+    # generic repair warnings. The detector must reroute such replicates to
+    # the centred kernels: float32 now tracks float64, and the reroute
+    # announces itself.
+    E = gmm_mi_torch.estimator
+    kw = dict(n_bootstrap=10, fixed_components_number=2, mc_samples=20_000)
+    for seed in (0, 2):
+        X = _zero_inflated_pair(seed)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            m64, s64 = estimate(X, 'MI', dtype=torch.float64, seed=seed, **kw)
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter('always')
+            m32, s32 = estimate(X, 'MI', dtype=torch.float32, seed=seed, **kw)
+        assert abs(m32 - m64) <= 3 * (s32 ** 2 + s64 ** 2) ** 0.5 + 0.01, seed
+        if E._EM_KERNEL == 'gemm':
+            assert any('legacy kernels' in str(r.message) for r in rec), seed
+
+
+def test_reroute_matches_legacy_fp32(monkeypatch):
+    # on the tripped class, float32 GEMM (with the reroute) and float32
+    # legacy must agree within the combined bootstrap error — the review's
+    # "missing (d)" parity statement for the rerouted regime
+    E = gmm_mi_torch.estimator
+    X = _zero_inflated_pair(2)
+    kw = dict(n_bootstrap=10, fixed_components_number=2, seed=2,
+              mc_samples=20_000, dtype=torch.float32)
+    out = {}
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        for kernel in ('gemm', 'legacy'):
+            monkeypatch.setattr(E, '_EM_KERNEL', kernel)
+            out[kernel] = estimate(X, 'MI', **kw)
+    (mg, sg), (ml, sl) = out['gemm'], out['legacy']
+    assert abs(mg - ml) <= 3 * (sg ** 2 + sl ** 2) ** 0.5 + 0.01
+
+
+def test_reroute_leaves_safe_classes_alone():
+    # the detector's two pinned negative cases: plain continuous data (must
+    # stay entirely on the fast path) and near-collinear standardised data —
+    # the detector's DELIBERATE blind spot, where float32 GEMM is accurate
+    # and the legacy float32 kernel is the demonstrably worse target. A
+    # future 'improvement' of the statistic must not silently reroute them.
+    rng = np.random.default_rng(0)
+    Xg = rng.multivariate_normal([0, 0], [[1, .6], [.6, 1]], 4000)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter('always')
+        estimate(Xg, 'MI', dtype=torch.float32, max_components=3,
+                 n_bootstrap=5, mc_samples=5000)
+    assert not any('legacy kernels' in str(r.message) for r in rec)
+    rng = np.random.default_rng(1)
+    x = rng.normal(0, 1, 5000)
+    Xc = np.column_stack([x, x + rng.normal(0, 1e-3, 5000)])
+    kw = dict(fixed_components_number=2, n_bootstrap=8, mc_samples=10_000)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter('always')
+        m32, s32 = estimate(Xc, 'MI', dtype=torch.float32, **kw)
+    assert not any('legacy kernels' in str(r.message) for r in rec)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        m64, s64 = estimate(Xc, 'MI', dtype=torch.float64, **kw)
+    assert abs(m32 - m64) <= 3 * (s32 ** 2 + s64 ** 2) ** 0.5 + 0.05
+
+
+def test_reroute_fp64_tiny_regcovar():
+    # at float64 the same residue defeats reg_covar <= ~1e-13: duplicated
+    # points at reg_covar=1e-15 used to break kernel parity (GEMM ~1.0 vs
+    # the analytic 0.7324). The reroute hands those replicates to the
+    # centred kernels at float64 too.
+    rng = np.random.default_rng(0)
+    base = rng.multivariate_normal([0, 0], [[1, .5], [.5, 1]], 400)
+    dup = np.repeat(
+        rng.multivariate_normal([4, 4], [[.01, 0], [0, .01]], 1), 200, axis=0)
+    X = np.vstack([base, dup])
+    analytic = 0.7324          # H(1/3,2/3) + (2/3) * (-0.5 ln 0.75)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        m, s = estimate(X, 'MI', n_bootstrap=5, fixed_components_number=2,
+                        reg_covar=1e-15, dtype=torch.float64,
+                        mc_samples=20_000)
+    assert abs(m - analytic) <= 3 * max(s, 0.03) + 0.05
+
+
+def test_categorical_zero_inflated_fp32():
+    # the same danger class reaches estimate_categorical through its 1-D
+    # per-category fits (a zero spike at a nonzero standardised position);
+    # the shared pipeline must give float32 the float64 answer
+    rng = np.random.default_rng(5)
+    N = 6000
+    Y = rng.integers(0, 2, N)
+    X = np.where(rng.random(N) < 0.4, 0.0, rng.normal(2.0 * Y, 1.0))
+    kw = dict(max_components=3, n_bootstrap=8, mc_samples=10_000, seed=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        m32, s32 = estimate_categorical(X, Y, dtype=torch.float32, **kw)
+        m64, s64 = estimate_categorical(X, Y, dtype=torch.float64, **kw)
+    assert abs(m32 - m64) <= 3 * (s32 ** 2 + s64 ** 2) ** 0.5 + 0.02
+
+
 def test_gaussianise_random_ties_zero_inflated():
     # the v0.3.0 average-rank convention mapped a zero atom to a probit
     # point with a hole around it, fabricating ~0.24 nats between
