@@ -1119,13 +1119,23 @@ def test_full_precision_pinned_at_kernel_boundary(monkeypatch):
     # direct em_fit/val_ll calls must run under full-precision float32
     # matmuls even when the ambient setting is TF32, and restore the
     # ambient setting afterwards (estimate was already pinned; the kernels
-    # used to run under whatever the process had set)
+    # used to run under whatever the process had set). On torch >= 2.9 the
+    # pin lives in the per-backend fp32_precision settings (the legacy
+    # getter reports the ambient legacy value even while pinned), so the
+    # probe reads whichever settings the pin actually drives.
     E = gmm_mi_torch.estimator
     seen = []
     orig = E._em_fit_core
 
+    def pinned_state():
+        if E._FP32_KNOBS is not None:
+            return tuple(k.fp32_precision for k in E._FP32_KNOBS)
+        return torch.get_float32_matmul_precision()
+
+    target = ('ieee',) * 3 if E._FP32_KNOBS is not None else 'highest'
+
     def probe(*args, **kwargs):
-        seen.append(torch.get_float32_matmul_precision())
+        seen.append(pinned_state())
         return orig(*args, **kwargs)
 
     monkeypatch.setattr(E, '_em_fit_core', probe)
@@ -1138,13 +1148,188 @@ def test_full_precision_pinned_at_kernel_boundary(monkeypatch):
     try:
         torch.set_float32_matmul_precision('medium')
         E.em_fit(X, s, w, mu, cov)
-        assert seen and all(p == 'highest' for p in seen)
+        assert seen and all(p == target for p in seen)
         assert torch.get_float32_matmul_precision() == 'medium'
         v = E.val_ll(X, s, w, mu, cov)
         assert torch.isfinite(v).all()
         assert torch.get_float32_matmul_precision() == 'medium'
     finally:
         torch.set_float32_matmul_precision(prev)
+
+
+def test_entry_points_survive_new_fp32_api():
+    # review finding: once torch >= 2.9's fp32_precision API had been used
+    # anywhere in the process, _full_precision's legacy getter raised
+    # RuntimeError ('mix of the legacy and new APIs') at EVERY public entry
+    # point, even on CPU. The pin must work through the new API and restore
+    # the caller's settings exactly (the legacy-setter restore also used to
+    # rewrite the mkldnn backend a CUDA-only caller never touched).
+    E = gmm_mi_torch.estimator
+    if E._FP32_KNOBS is None:
+        pytest.skip('torch < 2.9: no fp32_precision API')
+    rng = np.random.default_rng(0)
+    X = rng.multivariate_normal([0, 0], [[1, .6], [.6, 1]], 300)
+    Y = rng.integers(0, 2, 300)
+    saved = torch.backends.cuda.matmul.fp32_precision
+    mkldnn_before = torch.backends.mkldnn.matmul.fp32_precision
+    try:
+        torch.backends.cuda.matmul.fp32_precision = 'tf32'
+        # the ambient state that used to crash estimate() on CPU:
+        with pytest.raises(RuntimeError):
+            torch.get_float32_matmul_precision()
+        m, _ = estimate(X, 'MI', max_components=2, n_bootstrap=2,
+                        mc_samples=1000)
+        assert np.isfinite(m)
+        m2, _ = estimate_categorical(X[:, 0], Y, max_components=2,
+                                     n_bootstrap=2, mc_samples=1000)
+        assert np.isfinite(m2)
+        # the caller's own settings survive: cuda.matmul still tf32,
+        # mkldnn untouched
+        assert torch.backends.cuda.matmul.fp32_precision == 'tf32'
+        assert torch.backends.mkldnn.matmul.fp32_precision == mkldnn_before
+    finally:
+        torch.backends.cuda.matmul.fp32_precision = saved
+
+
+def test_full_precision_tf32_gemm_result_cuda(monkeypatch):
+    # asserts a TF32-sensitive GEMM RESULT inside em_fit rather than a
+    # precision flag string (which cannot see whether CUDA GEMMs actually
+    # run at full precision), under both the legacy API and (when torch has
+    # it) the per-backend fp32_precision API. The probe matrix of
+    # 1 + 2**-12 entries rounds to exactly 1 under TF32's 10-bit mantissa,
+    # so reduced precision shows up as an O(0.1) error against the fp64
+    # reference.
+    if not torch.cuda.is_available():
+        pytest.skip('needs CUDA: TF32 is a CUDA tensor-core mode')
+    E = gmm_mi_torch.estimator
+    a = torch.full((256, 256), 1.0 + 2 ** -12, device='cuda')
+    ref = (a.double() @ a.double()).float()
+
+    def gemm_err():
+        return (a @ a - ref).abs().max().item()
+
+    seen = []
+    orig = E._em_fit_core
+
+    def probe(*args, **kwargs):
+        seen.append(gemm_err())
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(E, '_em_fit_core', probe)
+    torch.manual_seed(0)
+    X = torch.randn(400, 2, dtype=torch.float32, device='cuda')
+    g = torch.Generator(device='cuda').manual_seed(0)
+    w, mu, cov = E._init_params(X, 2, 2, 1e-6, generator=g)
+    s = torch.ones(2, 400, dtype=torch.float32, device='cuda')
+
+    # (a) legacy API: 'high' = TF32 matmuls
+    prev = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision('high')
+        ambient = gemm_err()
+        if ambient <= 1e-2:
+            pytest.skip('device does not run TF32 matmuls; probe is blind')
+        seen.clear()
+        E.em_fit(X, s, w, mu, cov)
+        assert seen and max(seen) < 1e-3     # full precision inside the pin
+        assert gemm_err() > 1e-2             # degraded ambient mode restored
+    finally:
+        torch.set_float32_matmul_precision(prev)
+
+    # (b) per-backend API (torch >= 2.9)
+    if E._FP32_KNOBS is not None:
+        saved = torch.backends.cuda.matmul.fp32_precision
+        try:
+            torch.backends.cuda.matmul.fp32_precision = 'tf32'
+            assert gemm_err() > 1e-2
+            seen.clear()
+            E.em_fit(X, s, w, mu, cov)
+            assert seen and max(seen) < 1e-3
+            assert gemm_err() > 1e-2
+        finally:
+            torch.backends.cuda.matmul.fp32_precision = saved
+
+
+def test_return_k_reports_live_components(monkeypatch):
+    # review finding: v0.3.0's alive-slice dropped components that died
+    # during the CV fit without adjusting the reported k, so return_k said
+    # e.g. 6 while the model actually bootstrapped, MC-integrated and
+    # returned had 5, with no warning. k must report the live count, and a
+    # requested fixed_components_number that lost components must warn.
+    E = gmm_mi_torch.estimator
+    orig = E._cv_fit_for_k
+
+    def kill_one(*args, **kwargs):
+        metric, (w, mu, cov) = orig(*args, **kwargs)
+        w = w.clone()
+        w[0] = 0.0                      # one dead component, as EM leaves it
+        w = w / w.sum()
+        return metric, (w, mu, cov)
+
+    monkeypatch.setattr(E, '_cv_fit_for_k', kill_one)
+    rng = np.random.default_rng(0)
+    X = rng.multivariate_normal([0, 0], [[1, .6], [.6, 1]], 400)
+    with pytest.warns(RuntimeWarning, match='died during the CV fit'):
+        m, s, k, fit = estimate(X, 'MI', fixed_components_number=3,
+                                n_bootstrap=2, mc_samples=2000,
+                                return_k=True, return_fit=True)
+    assert k == 2
+    assert fit.n_components <= 2
+    assert np.isfinite(m)
+
+
+def test_warning_stacklevels_attribute_to_caller():
+    # the gaussianise tie warning and the return_fit warning carried a
+    # stacklevel computed without the entry decorator's frame, so both
+    # reported estimator.py's wrapper line as their origin; Python's
+    # once-per-location filter then collapsed distinct call sites and a
+    # module-keyed warnings filter could not match the caller. They must
+    # attribute to the caller's own frame.
+    E = gmm_mi_torch.estimator
+    rng = np.random.default_rng(0)
+    Xq = np.column_stack([rng.integers(0, 3, 400).astype(float),
+                          rng.normal(size=400)])
+    with warnings.catch_warnings(record=True) as wl:
+        warnings.simplefilter('always')
+        E.estimate(Xq, 'MI', preprocess='gaussianise', return_fit=True,
+                   fixed_components_number=1, n_bootstrap=0, mc_samples=1000)
+    mine = [w for w in wl if w.category is RuntimeWarning
+            and ('tied values' in str(w.message)
+                 or 'return_fit' in str(w.message))]
+    assert len(mine) >= 2               # the tie and the return_fit warning
+    for w in mine:
+        assert os.path.basename(w.filename) == os.path.basename(__file__), \
+            f"warning attributed to {w.filename}:{w.lineno}"
+
+
+def test_requires_grad_input_detached(monkeypatch):
+    # review finding: an input tensor with requires_grad=True built and
+    # retained the full EM autograd graph (peak memory several times the
+    # no-grad run, growing with iteration count) and return_fit=True then
+    # crashed in FittedGMM on .numpy(). The entry points now run under
+    # torch.no_grad() and detach the input; the caller's tensor is untouched.
+    E = gmm_mi_torch.estimator
+    rng = np.random.default_rng(0)
+    Xg = torch.as_tensor(
+        rng.multivariate_normal([0, 0], [[1, .6], [.6, 1]], 500)
+    ).requires_grad_(True)
+    grad_seen = []
+    orig = E._em_fit_core
+
+    def probe(*args, **kwargs):
+        grad_seen.append(torch.is_grad_enabled())
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(E, '_em_fit_core', probe)
+    m, s, fit = estimate(Xg, 'MI', max_components=2, n_bootstrap=2,
+                         mc_samples=2000, return_fit=True)
+    assert np.isfinite(m) and np.isfinite(fit.weights_).all()
+    assert grad_seen and not any(grad_seen)
+    assert Xg.requires_grad and Xg.grad is None
+    Y = rng.integers(0, 2, 500)
+    m2, _ = estimate_categorical(Xg[:, 0], Y, max_components=2,
+                                 n_bootstrap=2, mc_samples=2000)
+    assert np.isfinite(m2)
 
 
 def test_gaussianise_ties_average_rank_regression():
