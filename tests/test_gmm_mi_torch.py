@@ -1609,6 +1609,76 @@ def test_plotting_one_sigma_contour_constant():
     assert abs(r3 - np.sqrt(chi2.ppf(0.995, 2))) < 1e-2
 
 
+def test_gaussianise_random_ties_zero_inflated():
+    # the v0.3.0 average-rank convention mapped a zero atom to a probit
+    # point with a hole around it, fabricating ~0.24 nats between
+    # INDEPENDENT 50%-zero-inflated columns; seeded random tie-ranks (the
+    # new default) restore ~0, deterministically under the seed, while the
+    # 'average' option reproduces the atom artefact
+    rng = np.random.default_rng(0)
+    N = 4000
+    a = rng.normal(size=N)
+    a[rng.random(N) < 0.5] = 0.0
+    b = rng.normal(size=N)
+    b[rng.random(N) < 0.5] = 0.0
+    X = np.column_stack([a, b])
+    kw = dict(max_components=5, n_bootstrap=5, mc_samples=20_000,
+              return_k=True)
+    with pytest.warns(RuntimeWarning, match='tied values'):
+        m_r, s_r, k_r = estimate(X, 'MI', preprocess='gaussianise', **kw)
+    assert abs(m_r) < 0.02 and k_r <= 2
+    with pytest.warns(RuntimeWarning, match='tied values'):
+        rerun = estimate(X, 'MI', preprocess='gaussianise', **kw)
+    assert rerun == (m_r, s_r, k_r)
+    with pytest.warns(RuntimeWarning, match='tied values'):
+        m_a, _, _ = estimate(X, 'MI', preprocess='gaussianise',
+                             tie_rank='average', **kw)
+    assert m_a > 0.05
+    with pytest.raises(ValueError, match='tie_rank'):
+        estimate(X, 'MI', tie_rank='jitter', max_components=2)
+
+
+def test_gaussianise_dependent_atoms_guidance():
+    # when the zeros are SHARED between the columns, the randomised
+    # transform is biased low while preprocess='none' stays near the truth
+    # H(1/2) + 0.5 * I_gauss — the measured basis of the tie warning's
+    # recommendation to prefer 'none' on heavily tied data
+    rng = np.random.default_rng(3)
+    N = 4000
+    z = rng.random(N) < 0.5
+    g = rng.multivariate_normal([0, 0], [[1, .8], [.8, 1]], N)
+    X = np.where(z[:, None], 0.0, g)
+    truth = np.log(2) + 0.5 * (-0.5 * np.log(1 - 0.8 ** 2))
+    kw = dict(max_components=5, n_bootstrap=5, mc_samples=20_000)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        m_none, _ = estimate(X, 'MI', **kw)
+        m_rand, _ = estimate(X, 'MI', preprocess='gaussianise', **kw)
+    assert abs(m_none - truth) < abs(m_rand - truth)
+    assert m_rand < truth - 0.05
+
+
+def test_gaussianise_random_rank_properties():
+    # within a tied block the random ranks are exactly the block's rank
+    # range (in the seeded permutation's order, which needs the STABLE
+    # argsort); untied data is bitwise identical to the average convention
+    from scipy.stats import norm
+    E = gmm_mi_torch.estimator
+    x = torch.tensor([[3.0], [1.0], [2.0], [1.0], [3.0], [3.0], [0.5],
+                      [1.0]], dtype=torch.float64)
+    out = E._rank_gaussianise(x, tie_rank='random',
+                              generator=torch.Generator().manual_seed(7))
+    ranks = np.rint(norm.cdf(out[:, 0].numpy()) * (len(x) + 1)).astype(int)
+    assert sorted(ranks[[1, 3, 7]].tolist()) == [2, 3, 4]   # the 1.0 block
+    assert sorted(ranks[[0, 4, 5]].tolist()) == [6, 7, 8]   # the 3.0 block
+    assert ranks[6] == 1 and ranks[2] == 5                  # untied exact
+    g = torch.Generator().manual_seed(1)
+    y = torch.randn(500, 1, dtype=torch.float64, generator=g)
+    a = E._rank_gaussianise(y, tie_rank='random',
+                            generator=torch.Generator().manual_seed(0))
+    assert torch.equal(a, E._rank_gaussianise(y))
+
+
 def test_gaussianise_ties_average_rank_regression():
     # review finding: positional (double-argsort) tie-breaking mapped a tied
     # block to a monotone probit ramp in row order, fabricating MI whenever

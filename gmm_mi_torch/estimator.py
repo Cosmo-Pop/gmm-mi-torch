@@ -155,6 +155,11 @@ _MULTINOMIAL_MAX_CATEGORIES = 1 << 24
 _MC_SEED_OFFSET = 50_000
 _MC_CAT_STRIDE = 1 << 20
 
+# gaussianise's random tie-breaking draws its permutations from
+# seed + _TIE_SEED_OFFSET (one CPU generator, advanced per column so the
+# per-column permutations are independent).
+_TIE_SEED_OFFSET = 40_000
+
 # Auto-sizing of the replicate chunks (em_chunk / mc_chunk = 'auto').  Peak
 # memory of one EM iteration is replicates x N_eff x K x itemsize x (4d+3),
 # and of one MC chunk replicates x mc_samples x K x itemsize x (3d+1); both
@@ -1310,38 +1315,82 @@ _INTEGRANDS = {'MI': _integrand_MI, 'cMI': _integrand_cMI, 'TC': _integrand_TC,
 _GAUSSIANISE_TIE_WARN_FRACTION = 0.01
 
 
-def _rank_gaussianise(X):
+def _rank_gaussianise(X, tie_rank='average', generator=None):
     """Per-variable rank-probit transform: X -> Phi^{-1}(rank / (N+1)).
 
     MI, cMI and TC are invariant under per-variable diffeomorphisms, so no
-    correction term is needed.  Tied values share their average rank (the
-    scipy `rankdata` convention), so a tied block maps to a single probit
-    atom instead of a monotone ramp in row order — a positional tiebreak
-    fabricates MI whenever row order correlates with another variable
-    (sorted catalogues, concatenated bins, zero-inflated data).
+    correction term is needed.  Ranks and quantiles are computed at float64
+    (float32 integer ranks round above 2^24 samples).
+
+    tie_rank:
+        'random'  : tied values get a seeded random ordering within their
+                    block — `estimate`'s default. Equivalent to breaking
+                    ties with independent sub-resolution jitter, under
+                    which the MI estimand is EXACTLY unchanged (the
+                    original values are recoverable from the tie-broken
+                    ones, so data processing gives equality both ways) and
+                    the transformed marginal is exactly uniform. The
+                    permutation is drawn independently per column: one
+                    shared permutation would correlate the tie-breaks of
+                    blocks shared across columns (joint zeros) and
+                    fabricate MI inside the atom.
+        'average' : tied values share their average rank (the scipy
+                    `rankdata` convention) — this function's default, for
+                    deterministic direct use. The tied block maps to a
+                    single probit atom.
+    Neither convention makes a GMM fit of heavily tied data reliable; the
+    warning below recommends preprocess='none' there.
     """
     N = X.shape[0]
-    # ranks and quantiles at float64: float32 integer ranks round above
-    # 2^24 samples, corrupting the quantiles exactly in the large-N regime
     cols, tie_frac = [], []
     for j in range(X.shape[1]):
-        vals, inv, cnt = torch.unique(X[:, j], return_inverse=True,
-                                      return_counts=True)
-        # average rank of a tied block: (#smaller values) + (count+1)/2
-        csum = torch.cumsum(cnt, 0)
-        avg_rank = (csum - cnt).double() + (cnt.double() + 1.0) / 2.0
-        cols.append(avg_rank[inv])
+        xj = X[:, j]
+        if tie_rank == 'average':
+            vals, inv, cnt = torch.unique(xj, return_inverse=True,
+                                          return_counts=True)
+        elif tie_rank == 'random':
+            vals, cnt = torch.unique(xj, return_counts=True)
+        else:
+            raise ValueError(f"tie_rank must be 'random' or 'average'; "
+                             f"found '{tie_rank}'")
         big = cnt[cnt >= 3]
         tie_frac.append(float((big - 1).sum()) / N)
+        if tie_rank == 'random':
+            # positional ranks after a seeded random row permutation: with
+            # a STABLE sort, the order within each tied block is exactly
+            # the permutation's — i.e. uniformly random — while untied
+            # values keep their exact ranks
+            perm = torch.randperm(N, generator=generator).to(xj.device)
+            order = torch.argsort(xj[perm], dim=0, stable=True)
+            rp = torch.argsort(order, dim=0, stable=True)
+            ranks = torch.empty(N, dtype=torch.float64, device=xj.device)
+            ranks[perm] = rp.double() + 1.0
+            cols.append(ranks)
+        else:
+            # average rank of a tied block: (#smaller values) + (count+1)/2
+            csum = torch.cumsum(cnt, 0)
+            avg_rank = (csum - cnt).double() + (cnt.double() + 1.0) / 2.0
+            cols.append(avg_rank[inv])
     tied = [j for j, f in enumerate(tie_frac)
             if f > _GAUSSIANISE_TIE_WARN_FRACTION]
     if tied:
+        fracs = ', '.join(f'{tie_frac[j]:.2f}' for j in tied)
+        if tie_rank == 'random':
+            detail = ("ties were broken by seeded random ranks, which "
+                      "leaves the MI estimand exactly unchanged but biases "
+                      "the GMM estimate LOW when the tied values are "
+                      "shared between columns (e.g. joint zero-inflation), "
+                      "and the bootstrap errorbar excludes the rank "
+                      "transform's own sampling variability")
+        else:
+            detail = ("tied blocks share their average rank and map to a "
+                      "single probit atom, which can fabricate MI between "
+                      "independent heavily tied columns")
         warnings.warn(
-            f"gaussianise: column(s) {tied} have tied values (tie fraction "
-            f"{', '.join(f'{tie_frac[j]:.2f}' for j in tied)}); tied blocks "
-            f"map to one probit atom, so the transformed marginal is not "
-            f"Gaussian and the GMM fit may be degraded on heavily "
-            f"quantised data", RuntimeWarning, stacklevel=4)
+            f"gaussianise: column(s) {tied} have heavily tied values (tie "
+            f"fraction {fracs}); {detail}. For heavily tied or "
+            f"zero-inflated data, preprocess='none' is the more reliable "
+            f"choice.", RuntimeWarning, stacklevel=4)
         # 4: _rank_gaussianise -> estimate -> _entry_precision -> caller
     p = torch.stack(cols, 1) / (N + 1.0)
     # ndtri/erfinv are JIT (nvrtc) kernels on CUDA and nvrtc rejects the
@@ -1501,7 +1550,8 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
              reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, seed=0, return_k=False,
              return_fit=False,
              device='cpu', dtype=torch.float64, em_chunk='auto', mc_chunk='auto',
-             preprocess='none', init_type='random_responsibilities',
+             preprocess='none', tie_rank='random',
+             init_type='random_responsibilities',
              scale=None, fixed_components_number=None, metric_method='valid',
              threshold_components=1e-5, patience=1, n_chunk=None):
     """Estimate an information-theoretic quantity with bootstrap errorbars.
@@ -1618,12 +1668,22 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         diffeomorphisms, so this changes only the difficulty of the density
         estimation: heavy tails and monotone nonlinearities that would
         require many components (or defeat the fit entirely) are removed.
-        Tied values share their average rank, so quantised data maps tied
-        blocks to probit atoms (a RuntimeWarning is raised above a 1% tie
-        fraction: atoms are not Gaussian, and the invariance argument needs
-        a continuous variable in the first place). Rejected (ValueError) for
-        the KL quantities, which are not invariant under marginal
-        transforms.
+        Tied values are ranked per `tie_rank`; a RuntimeWarning fires when
+        more than 1% of a column's samples sit in tied blocks of three or
+        more, because no tie convention makes the GMM fit of heavily tied
+        data reliable — prefer preprocess='none' there. Rejected
+        (ValueError) for the KL quantities, which are not invariant under
+        marginal transforms.
+    tie_rank : {'random', 'average'}, default='random'
+        How gaussianise ranks tied values. 'random' breaks each column's
+        ties with a seeded random ordering (drawn independently per column
+        from seed + 40_000): the MI estimand is exactly unchanged — the
+        original values are recoverable from the tie-broken ones — and the
+        transformed marginals are exactly Gaussian, but the GMM estimate is
+        biased low when ties are shared between columns (joint
+        zero-inflation). 'average' is the deterministic scipy rankdata
+        convention; a tied block becomes a single probit atom, which can
+        fabricate MI between independent heavily tied columns.
     init_type : {'random_responsibilities', 'minmax', 'kmeans', 'randomized_kmeans'}, default='random_responsibilities'
         GMM initialisation scheme (torch ports of GMM-MI's initialisations).
         'random_responsibilities' is cheap and adequate for easy fits; the
@@ -1736,6 +1796,9 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     if n_chunk is not None and int(n_chunk) < 1:
         raise ValueError(f"n_chunk must be a positive int or None; "
                          f"found {n_chunk}")
+    if tie_rank not in ('random', 'average'):
+        raise ValueError(f"tie_rank must be 'random' or 'average'; "
+                         f"found '{tie_rank}'")
     if preprocess == 'gaussianise':
         if quantity in ('KL_forward', 'KL_reverse'):
             raise ValueError(
@@ -1750,7 +1813,9 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
                 "parametric inverse. Its sample/score_samples/contours "
                 "live in gaussianised space.", RuntimeWarning,
                 stacklevel=3)   # estimate -> _entry_precision -> caller
-        X = _rank_gaussianise(X)
+        X = _rank_gaussianise(
+            X, tie_rank=tie_rank,
+            generator=torch.Generator().manual_seed(seed + _TIE_SEED_OFFSET))
     elif preprocess != 'none':
         raise ValueError(f"preprocess must be 'none' or 'gaussianise'; "
                          f"found '{preprocess}'")
