@@ -25,6 +25,7 @@ Design notes
 
 import functools
 import math
+import operator
 import os
 import warnings
 
@@ -110,6 +111,52 @@ def _resolve_chunk(value, n_items, bytes_per_item, device):
     if value < 1:
         raise ValueError(f"chunk must be a positive int or 'auto'; found {value}")
     return value
+
+
+def _index_arg(value, name, minimum=None):
+    """Coerce an integer argument at entry: operator.index accepts numpy
+    integers (the natural output of numpy RNGs in seed sweeps) and rejects
+    floats, so a malformed count fails here under the argument's own name
+    instead of deep inside EM with an opaque torch error after the compute
+    has already been spent."""
+    try:
+        value = operator.index(value)
+    except TypeError:
+        raise TypeError(f"{name} must be an integer; found {value!r} of "
+                        f"type {type(value).__name__}") from None
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}; found {value}")
+    return value
+
+
+def _validate_entry_args(seed, n_bootstrap, mc_samples, max_components,
+                         n_folds, n_inits, max_iter,
+                         fixed_components_number, reg_covar,
+                         threshold_components):
+    """Entry validation shared by estimate and estimate_categorical, so the
+    two cannot drift apart. Returns the integer arguments coerced to plain
+    Python ints (torch.Generator.manual_seed and torch factory sizes reject
+    numpy integers and floats)."""
+    seed = _index_arg(seed, 'seed')
+    n_bootstrap = _index_arg(n_bootstrap, 'n_bootstrap', 0)
+    mc_samples = _index_arg(mc_samples, 'mc_samples', 1)
+    max_components = _index_arg(max_components, 'max_components', 1)
+    n_folds = _index_arg(n_folds, 'n_folds')   # >= 2 checked by _validate_folds
+    n_inits = _index_arg(n_inits, 'n_inits', 1)
+    max_iter = _index_arg(max_iter, 'max_iter', 1)
+    if fixed_components_number is not None:
+        fixed_components_number = _index_arg(
+            fixed_components_number, 'fixed_components_number', 1)
+    if not reg_covar > 0:
+        raise ValueError(f"reg_covar must be > 0 (the covariance floor; 0 "
+                         f"lets collapsed components through to garbage "
+                         f"fits or factorisation failures); "
+                         f"found {reg_covar}")
+    if not threshold_components >= 0:
+        raise ValueError(f"threshold_components must be >= 0; found "
+                         f"{threshold_components}")
+    return (seed, n_bootstrap, mc_samples, max_components, n_folds, n_inits,
+            max_iter, fixed_components_number)
 
 
 def _em_bytes_per_replicate(N, K, d, dtype, n_chunk=None):
@@ -944,6 +991,7 @@ def select_sequential(X, max_components=20, n_folds=2, n_inits=3,
     history : dict
         Per-k (metric, params) from the search.
     """
+    _validate_folds(X.shape[0], n_folds)
     best_metric, best_k, pat, history = -torch.inf, None, 0, {}
     for K in range(1, max_components + 1):
         metric, params = _cv_fit_for_k(X, K, n_folds, n_inits, reg_covar, threshold_fit,
@@ -1005,6 +1053,7 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
         parameters are returned separately).
     """
     N, d = X.shape
+    _validate_folds(N, n_folds)
     train, val = _cv_masks(N, n_folds, n_inits, X.dtype,
                            seed=seed + _CV_MASK_SEED_OFFSET)
     train, val = train.to(X.device), val.to(X.device)
@@ -1021,6 +1070,12 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
     v = val_ll(X, val_r, w, mu, cov, n_chunk=n_chunk,
                em_chunk=em_chunk).view(max_components, n_inits, n_folds)
     metric_k = v.mean(-1).max(-1).values                  # (max_components,)
+    if not torch.isfinite(metric_k).any():
+        # mirror select_sequential: all-NaN/-inf metrics must not reach the
+        # parsimony mask's nonzero()[0] (an opaque, far-away IndexError)
+        raise RuntimeError(
+            "batched selection found no finite validation metric at any "
+            "k; NaN metrics usually mean degenerate CV folds or data")
     if metric_method == 'valid':
         # parsimony rule: smallest k within `threshold_components` of the best metric
         k_best = int((metric_k >= metric_k.max() - threshold_components)
@@ -1164,6 +1219,15 @@ def _select_and_fit(X, protocol, fixed_components_number, max_components,
     """
     N, d = X.shape
     IF = n_inits * n_folds
+    # compatibility rules before the fixed-k shortcut: a typo'd
+    # metric_method must raise even when selection itself is skipped
+    if protocol == 'sequential':
+        if metric_method != 'valid':
+            raise ValueError("metric_method is only supported by the "
+                             "batched protocol")
+    elif metric_method not in ('valid', 'aic', 'bic'):
+        raise ValueError(f"metric_method must be one of 'valid', "
+                         f"'aic', 'bic'; found '{metric_method}'")
     if fixed_components_number is not None:
         k_sel, r_sel = int(fixed_components_number), IF
     elif protocol == 'sequential':
@@ -1187,15 +1251,9 @@ def _select_and_fit(X, protocol, fixed_components_number, max_components,
                   em_chunk=em_chunk_sel, init_type=init_type, scale=scale,
                   n_chunk=n_chunk)
         if protocol == 'sequential':
-            if metric_method != 'valid':
-                raise ValueError("metric_method is only supported by the "
-                                 "batched protocol")
             sel = select_sequential
             kw['patience'] = patience
         else:
-            if metric_method not in ('valid', 'aic', 'bic'):
-                raise ValueError(f"metric_method must be one of 'valid', "
-                                 f"'aic', 'bic'; found '{metric_method}'")
             sel = select_batched
             kw['metric_method'] = metric_method
         k_best, params, _ = sel(X, **kw)
@@ -1465,6 +1523,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     if protocol not in ('batched', 'sequential'):
         raise ValueError(f"protocol must be 'batched' or 'sequential'; "
                          f"found '{protocol}'")
+    (seed, n_bootstrap, mc_samples, max_components, n_folds, n_inits,
+     max_iter, fixed_components_number) = _validate_entry_args(
+        seed, n_bootstrap, mc_samples, max_components, n_folds, n_inits,
+        max_iter, fixed_components_number, reg_covar, threshold_components)
     if X.dim() != 2:
         raise ValueError(f"X must be 2-D (n_samples, n_variables); "
                          f"found shape {tuple(X.shape)}")
@@ -1475,6 +1537,12 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         raise ValueError(f"quantity='{quantity}' needs at least "
                          f"{3 if quantity == 'cMI' else 2} columns; "
                          f"found {X.shape[1]}")
+    if not torch.isfinite(X).all():
+        raise ValueError(
+            "X contains non-finite values (NaN or inf in the working "
+            "dtype); gaussianise would silently rank them as extreme "
+            "values and the standardisation path propagates them into "
+            "every replicate — remove or impute them first")
     _validate_folds(X.shape[0], n_folds)
     if n_chunk is not None and int(n_chunk) < 1:
         raise ValueError(f"n_chunk must be a positive int or None; "
@@ -1621,16 +1689,30 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         raise ValueError(f"X must be 1-D or a single column; found shape "
                          f"{tuple(X.shape)}")
     X = X.reshape(-1, 1)
+    if not torch.isfinite(X).all():
+        raise ValueError(
+            "X contains non-finite values (NaN or inf in the working "
+            "dtype); the standardisation propagates them into every "
+            "replicate — remove or impute them first")
     Y = torch.as_tensor(Y, device=device)
     if Y.dim() > 2 or (Y.dim() == 2 and Y.shape[1] != 1):
         raise ValueError(f"Y must be 1-D; found shape {tuple(Y.shape)}")
     Y = Y.reshape(-1)
+    if Y.is_floating_point() and not torch.isfinite(Y).all():
+        raise ValueError(
+            "Y contains non-finite labels (NaN or inf); torch.unique would "
+            "make every NaN its own category — remove those samples or "
+            "encode missingness as an explicit category")
     if Y.shape[0] != X.shape[0]:
         raise ValueError(f"X and Y must have the same length; found "
                          f"{X.shape[0]} and {Y.shape[0]}")
     if protocol not in ('batched', 'sequential'):
         raise ValueError(f"protocol must be 'batched' or 'sequential'; "
                          f"found '{protocol}'")
+    (seed, n_bootstrap, mc_samples, max_components, n_folds, n_inits,
+     max_iter, fixed_components_number) = _validate_entry_args(
+        seed, n_bootstrap, mc_samples, max_components, n_folds, n_inits,
+        max_iter, fixed_components_number, reg_covar, threshold_components)
     if n_chunk is not None and int(n_chunk) < 1:
         raise ValueError(f"n_chunk must be a positive int or None; "
                          f"found {n_chunk}")
