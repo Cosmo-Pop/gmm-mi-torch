@@ -1121,6 +1121,85 @@ def _rank_gaussianise(X):
     return torch.special.ndtri(p.cpu()).to(dtype=X.dtype, device=X.device)
 
 
+def _select_and_fit(X, protocol, fixed_components_number, max_components,
+                    n_folds, n_inits, reg_covar, threshold_fit, max_iter,
+                    seed, em_chunk, init_type, scale, metric_method,
+                    threshold_components, patience, n_chunk):
+    """Component selection and best CV fit for one dataset.
+
+    The single home of the selection pipeline shared by `estimate` and
+    `estimate_categorical` (per-category), so the two cannot drift apart:
+    chunk sizing, the fixed-k shortcut, protocol dispatch and the
+    protocol/metric_method compatibility rules live only here.
+    Returns (k_best, (w, mu, cov)).
+    """
+    N, d = X.shape
+    IF = n_inits * n_folds
+    if fixed_components_number is not None:
+        k_sel, r_sel = int(fixed_components_number), IF
+    elif protocol == 'sequential':
+        k_sel, r_sel = max_components, IF
+    else:
+        k_sel, r_sel = max_components, max_components * IF
+    em_chunk_sel = _resolve_chunk(
+        em_chunk, r_sel, _em_bytes_per_replicate(N, k_sel, d, X.dtype, n_chunk),
+        X.device)
+    if fixed_components_number is not None:
+        k_best = int(fixed_components_number)
+        _, params = _cv_fit_for_k(X, k_best, n_folds, n_inits, reg_covar,
+                                  threshold_fit, max_iter, seed,
+                                  em_chunk=em_chunk_sel, init_type=init_type,
+                                  scale=scale, n_chunk=n_chunk)
+        return k_best, params
+    kw = dict(max_components=max_components, n_folds=n_folds,
+              n_inits=n_inits, reg_covar=reg_covar,
+              threshold_fit=threshold_fit, max_iter=max_iter, seed=seed,
+              threshold_components=threshold_components,
+              em_chunk=em_chunk_sel, init_type=init_type, scale=scale,
+              n_chunk=n_chunk)
+    if protocol == 'sequential':
+        if metric_method != 'valid':
+            raise ValueError("metric_method is only supported by the "
+                             "batched protocol")
+        sel = select_sequential
+        kw['patience'] = patience
+    else:
+        if metric_method not in ('valid', 'aic', 'bic'):
+            raise ValueError(f"metric_method must be one of 'valid', 'aic', "
+                             f"'bic'; found '{metric_method}'")
+        sel = select_batched
+        kw['metric_method'] = metric_method
+    k_best, params, _ = sel(X, **kw)
+    return k_best, params
+
+
+def _bootstrap_counts(N, B, dtype, device, generator):
+    """Uniform multinomial bootstrap resample counts, shape (B, N).
+
+    Identical in distribution to index resampling. torch.multinomial caps
+    its category count at 2^24; above that the counts are accumulated from
+    randint draws instead (identically distributed for uniform
+    probabilities; this size used to raise, so no existing result changed
+    when the fallback was added). This helper is the fallback's only home.
+    """
+    if N <= _MULTINOMIAL_MAX_CATEGORIES:
+        idx = torch.multinomial(
+            torch.full((B, N), 1.0 / N, dtype=dtype, device=device),
+            N, replacement=True, generator=generator)
+    else:
+        idx = torch.randint(0, N, (B, N), device=device, generator=generator)
+    return torch.zeros(B, N, dtype=dtype, device=device).scatter_add_(
+        1, idx, torch.ones(B, N, dtype=dtype, device=device))
+
+
+def _warm_start(w1, mu1, cov1, B):
+    """Expand one CV-selected parameter set to B bootstrap replicates."""
+    K, d = mu1.shape
+    return (w1.unsqueeze(0).expand(B, K).contiguous(),
+            mu1.unsqueeze(0).expand(B, K, d).contiguous(),
+            cov1.unsqueeze(0).expand(B, K, d, d).contiguous())
+
+
 class FittedGMM:
     """The GMM selected by `estimate`, refitted on the full data.
 
@@ -1202,8 +1281,9 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         Number of bootstrap realisations used for the errorbar. Higher values
         give a smoother MI distribution and more reliable errorbars, while
         being slower; on GPU all realisations are fitted as one batch.
-        Set to 0 to skip the bootstrap (single fit on the full data; the
-        returned standard deviation is then None).
+        Set to 0 to skip the bootstrap (single fit on the full data); the
+        returned standard deviation is None whenever n_bootstrap < 2, since
+        one replicate has no sample deviation.
     mc_samples : int, default=100_000
         Number of Monte Carlo samples used to integrate the estimator for
         each bootstrap replicate. Higher values reduce the MC contribution to
@@ -1317,7 +1397,8 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         Mean of the estimated quantity over the bootstrap distribution
         (or the single-fit value when n_bootstrap=0), in nats.
     std : float or None
-        Bootstrap standard deviation (None when n_bootstrap=0).
+        Bootstrap standard deviation (None when n_bootstrap < 2:
+        one replicate has no sample deviation).
     k : int
         Selected number of components; only if `return_k` is True.
     fit : FittedGMM
@@ -1391,36 +1472,11 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     col_std = torch.where(col_std > 0, col_std, torch.ones_like(col_std))
     X = (X - col_mean) / col_std
     N, d = X.shape
-    IF = n_inits * n_folds
-    if fixed_components_number is not None:
-        k_sel, r_sel = int(fixed_components_number), IF
-    elif protocol == 'sequential':
-        k_sel, r_sel = max_components, IF
-    else:
-        k_sel, r_sel = max_components, max_components * IF
-    em_chunk_sel = _resolve_chunk(
-        em_chunk, r_sel, _em_bytes_per_replicate(N, k_sel, d, dtype, n_chunk), device)
-    if fixed_components_number is not None:
-        k_best = int(fixed_components_number)
-        _, (w1, mu1, cov1) = _cv_fit_for_k(X, k_best, n_folds, n_inits, reg_covar,
-                                           threshold_fit, max_iter, seed, em_chunk=em_chunk_sel,
-                                           init_type=init_type, scale=scale,
-                                           n_chunk=n_chunk)
-    else:
-        sel = select_sequential if protocol == 'sequential' else select_batched
-        kw = dict(max_components=max_components, n_folds=n_folds, n_inits=n_inits, reg_covar=reg_covar,
-                  threshold_fit=threshold_fit, max_iter=max_iter, seed=seed,
-                  threshold_components=threshold_components,
-                  em_chunk=em_chunk_sel, init_type=init_type, scale=scale,
-                  n_chunk=n_chunk)
-        if protocol == 'sequential':
-            if metric_method != 'valid':
-                raise ValueError("metric_method is only supported by the "
-                                 "batched protocol")
-            kw['patience'] = patience
-        else:
-            kw['metric_method'] = metric_method
-        k_best, (w1, mu1, cov1), _ = sel(X, **kw)
+    k_best, (w1, mu1, cov1) = _select_and_fit(
+        X, protocol, fixed_components_number, max_components, n_folds,
+        n_inits, reg_covar, threshold_fit, max_iter, seed, em_chunk,
+        init_type, scale, metric_method, threshold_components, patience,
+        n_chunk)
 
     B = max(n_bootstrap, 1)
     K = w1.shape[0]
@@ -1439,23 +1495,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
                         covf[0][alive] * (col_std[:, None] * col_std[None, :]))
     g = torch.Generator(device=X.device).manual_seed(seed + 10_000)
     if n_bootstrap >= 1:
-        if N <= _MULTINOMIAL_MAX_CATEGORIES:
-            s = torch.multinomial(
-                torch.full((B, N), 1.0 / N, dtype=X.dtype, device=X.device),
-                N, replacement=True, generator=g)
-        else:
-            # torch.multinomial caps categories at 2^24; for uniform
-            # probabilities the resample counts are identically distributed
-            # as a histogram of N iid uniform indices (previously this size
-            # raised, so no existing result changes)
-            s = torch.randint(0, N, (B, N), device=X.device, generator=g)
-        s = torch.zeros(B, N, dtype=X.dtype, device=X.device).scatter_add_(
-            1, s, torch.ones(B, N, dtype=X.dtype, device=X.device))
+        s = _bootstrap_counts(N, B, X.dtype, X.device, g)
     else:
         s = torch.ones(1, N, dtype=X.dtype, device=X.device)
-    w0 = w1.unsqueeze(0).expand(B, K).contiguous()
-    mu0 = mu1.unsqueeze(0).expand(B, K, d).contiguous()
-    cov0 = cov1.unsqueeze(0).expand(B, K, d, d).contiguous()
+    w0, mu0, cov0 = _warm_start(w1, mu1, cov1, B)
     w, mu, cov, _ = em_fit(X, s, w0, mu0, cov0, reg_covar, threshold_fit, max_iter,
                            em_chunk=em_chunk_boot, n_chunk=n_chunk)
 
@@ -1469,7 +1512,7 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         return _INTEGRANDS[quantity](pts, w[sl], mu[sl], cov[sl], chol[sl]).mean(1)
     vals = torch.cat(_run_chunked(B, mc_chunk, _mc))              # (B,)
     mean = vals.mean().item()
-    std = vals.std(unbiased=True).item() if n_bootstrap >= 1 else None
+    std = vals.std(unbiased=True).item() if n_bootstrap >= 2 else None
     out = (mean, std)
     if return_k:
         out += (k_best,)
@@ -1486,6 +1529,7 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
                          em_chunk='auto', mc_chunk='auto',
                          init_type='random_responsibilities', scale=None,
                          fixed_components_number=None, metric_method='valid',
+                         threshold_components=1e-5, patience=1,
                          category_weights='empirical', n_chunk=None):
     """Estimate MI between a continuous variable and a categorical variable.
 
@@ -1517,17 +1561,19 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         Largest number of components considered per category's 1D fit.
 
     All remaining parameters are shared with `estimate` and have the same
-    meaning there: protocol, n_bootstrap, mc_samples, n_folds, n_inits,
-    reg_covar, threshold_fit, max_iter, seed, return_k, device, dtype,
-    em_chunk, mc_chunk, init_type, scale, fixed_components_number,
-    metric_method, n_chunk.
+    meaning there (applied per category): protocol, n_bootstrap, mc_samples,
+    n_folds, n_inits, reg_covar, threshold_fit, max_iter, seed, return_k,
+    device, dtype, em_chunk, mc_chunk, init_type, scale,
+    fixed_components_number, metric_method, threshold_components, patience,
+    n_chunk.
 
     Returns
     -------
     mean : float
         Bootstrap-mean MI in nats.
     std : float or None
-        Bootstrap standard deviation (None when n_bootstrap=0).
+        Bootstrap standard deviation (None when n_bootstrap < 2:
+        one replicate has no sample deviation).
     k : list of int
         Selected component count per category; only if `return_k` is True.
     """
@@ -1567,52 +1613,25 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     logpi = torch.log(pi)
     B = max(n_bootstrap, 1)
     fits, k_bests = [], []
-    IF = n_inits * n_folds
     for ci in range(C):
         Xc = X[Y == cats[ci]]
         Nc = Xc.shape[0]
         seed_c = seed + 997 * ci
-        if fixed_components_number is not None:
-            k_sel, r_sel = int(fixed_components_number), IF
-        elif protocol == 'sequential':
-            k_sel, r_sel = max_components, IF
-        else:
-            k_sel, r_sel = max_components, max_components * IF
-        em_chunk_c = _resolve_chunk(
-            em_chunk, r_sel, _em_bytes_per_replicate(Nc, k_sel, 1, dtype, n_chunk), device)
-        if fixed_components_number is not None:
-            k_c = int(fixed_components_number)
-            _, (w1, mu1, cov1) = _cv_fit_for_k(
-                Xc, k_c, n_folds, n_inits, reg_covar, threshold_fit, max_iter, seed_c,
-                em_chunk=em_chunk_c, init_type=init_type, scale=scale,
-                n_chunk=n_chunk)
-        else:
-            sel = (select_sequential if protocol == 'sequential'
-                   else select_batched)
-            kw = dict(max_components=max_components, n_folds=n_folds, n_inits=n_inits, reg_covar=reg_covar,
-                      threshold_fit=threshold_fit, max_iter=max_iter, seed=seed_c, threshold_components=1e-5,
-                      em_chunk=em_chunk_c, init_type=init_type, scale=scale,
-                      n_chunk=n_chunk)
-            if protocol != 'sequential':
-                kw['metric_method'] = metric_method
-            k_c, (w1, mu1, cov1), _ = sel(Xc, **kw)
+        k_c, (w1, mu1, cov1) = _select_and_fit(
+            Xc, protocol, fixed_components_number, max_components, n_folds,
+            n_inits, reg_covar, threshold_fit, max_iter, seed_c, em_chunk,
+            init_type, scale, metric_method, threshold_components, patience,
+            n_chunk)
         k_bests.append(k_c)
         g = torch.Generator(device=X.device).manual_seed(seed_c + 10_000)
         if n_bootstrap >= 1:
-            s = torch.multinomial(
-                torch.full((B, Nc), 1.0 / Nc, dtype=X.dtype, device=X.device),
-                Nc, replacement=True, generator=g)
-            s = torch.zeros(B, Nc, dtype=X.dtype, device=X.device) \
-                .scatter_add_(1, s, torch.ones(B, Nc, dtype=X.dtype,
-                                               device=X.device))
+            s = _bootstrap_counts(Nc, B, X.dtype, X.device, g)
         else:
             s = torch.ones(1, Nc, dtype=X.dtype, device=X.device)
         K = w1.shape[0]
         em_chunk_b = _resolve_chunk(
             em_chunk, B, _em_bytes_per_replicate(Nc, K, 1, dtype, n_chunk), device)
-        w0 = w1.unsqueeze(0).expand(B, K).contiguous()
-        mu0 = mu1.unsqueeze(0).expand(B, K, 1).contiguous()
-        cov0 = cov1.unsqueeze(0).expand(B, K, 1, 1).contiguous()
+        w0, mu0, cov0 = _warm_start(w1, mu1, cov1, B)
         w, mu, cov, _ = em_fit(Xc, s, w0, mu0, cov0, reg_covar, threshold_fit, max_iter,
                                em_chunk=em_chunk_b, n_chunk=n_chunk)
         chol, cov = _chol(cov)
@@ -1635,5 +1654,5 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
             return pi[ci] * (scores[ci] - log_pbar).mean(1)
         vals += torch.cat(_run_chunked(B, mc_chunk, _mc))
     mean = vals.mean().item()
-    std = vals.std(unbiased=True).item() if n_bootstrap >= 1 else None
+    std = vals.std(unbiased=True).item() if n_bootstrap >= 2 else None
     return (mean, std, k_bests) if return_k else (mean, std)
