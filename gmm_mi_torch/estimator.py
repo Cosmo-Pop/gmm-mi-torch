@@ -42,27 +42,82 @@ if _EM_KERNEL not in ('gemm', 'legacy'):
                      f"found '{_EM_KERNEL}'")
 
 
+# torch >= 2.9 replaces get/set_float32_matmul_precision with per-backend
+# fp32_precision settings; once user code has set any of those, the legacy
+# getter RAISES ("mix of the legacy and new APIs"), which used to kill every
+# public entry point here even on CPU. The per-backend settings are also what
+# make an exact restore possible: the legacy setter rewrites every backend at
+# once, so restoring through it handed a caller who had only enabled CUDA
+# TF32 a changed mkldnn (CPU) setting.
+try:
+    _FP32_KNOBS = (torch.backends, torch.backends.cuda.matmul,
+                   torch.backends.mkldnn.matmul)
+    for _knob in _FP32_KNOBS:
+        _knob.fp32_precision
+except AttributeError:      # torch < 2.9: legacy API only
+    _FP32_KNOBS = None
+
+
+class _pinned_precision:
+    """Context manager: float32 matmuls at full (ieee) precision inside the
+    block, the caller's exact settings restored on exit. Reentrant."""
+
+    def __enter__(self):
+        if _FP32_KNOBS is not None:
+            self._prev = [knob.fp32_precision for knob in _FP32_KNOBS]
+            for knob in _FP32_KNOBS:
+                knob.fp32_precision = 'ieee'
+        else:
+            self._prev = torch.get_float32_matmul_precision()
+            torch.set_float32_matmul_precision('highest')
+        return self
+
+    def __exit__(self, *exc):
+        if _FP32_KNOBS is not None:
+            for knob, prev in zip(_FP32_KNOBS, self._prev):
+                knob.fp32_precision = prev
+        else:
+            torch.set_float32_matmul_precision(self._prev)
+        return False
+
+
 def _full_precision(fn):
     """Pin float32 matmuls to full precision for the duration of a call:
-    frameworks that set torch's matmul precision to 'high'/'medium' (TF32,
-    10-bit mantissas) would silently degrade the GEMM-formulated EM.
+    frameworks that set torch's matmul precision ('high'/'medium' via the
+    legacy API, TF32/bf16 via the per-backend fp32_precision settings of
+    torch >= 2.9) would silently degrade the GEMM-formulated EM. The pin
+    uses the per-backend settings when torch has them (generic,
+    cuda.matmul, mkldnn.matmul — the legacy getter raises once any of
+    those has been set in the process) and the legacy get/set pair
+    otherwise.
 
     Applied to estimate/estimate_categorical and, so that direct kernel
     calls are covered too, at the cancellation-critical kernel boundaries
-    em_fit and val_ll (the decorator is reentrant: nesting saves and
-    restores the ambient value). torch's matmul precision is PROCESS-GLOBAL,
-    not thread-local: concurrent callers in other threads of the same
-    process will also run these calls' matmuls at 'highest', and the
+    em_fit and val_ll (the pin is reentrant: nesting saves and restores
+    the ambient values). These settings are PROCESS-GLOBAL, not
+    thread-local: concurrent callers in other threads of the same process
+    will also run these calls' matmuls at full precision, and the
     save/restore can race with theirs. Use processes, not threads, for
     parallel estimates (see examples/mi_grid_multigpu.py)."""
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
-        prev = torch.get_float32_matmul_precision()
-        torch.set_float32_matmul_precision('highest')
-        try:
+        with _pinned_precision():
             return fn(*args, **kwargs)
-        finally:
-            torch.set_float32_matmul_precision(prev)
+    return wrapped
+
+
+def _entry_precision(fn):
+    """_full_precision plus torch.no_grad() for the public estimators: they
+    return plain floats, so an input tensor carrying requires_grad (model
+    latents taken without .detach()) would otherwise build and retain the
+    EM autograd graph of every iteration — several times the peak memory —
+    and crash FittedGMM's .numpy() calls under return_fit=True. em_fit and
+    val_ll keep plain _full_precision: differentiating a log-likelihood
+    with respect to the parameters is legitimate."""
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        with _pinned_precision(), torch.no_grad():
+            return fn(*args, **kwargs)
     return wrapped
 
 LOG2PI = math.log(2.0 * math.pi)
@@ -1198,7 +1253,8 @@ def _rank_gaussianise(X):
             f"{', '.join(f'{tie_frac[j]:.2f}' for j in tied)}); tied blocks "
             f"map to one probit atom, so the transformed marginal is not "
             f"Gaussian and the GMM fit may be degraded on heavily "
-            f"quantised data", RuntimeWarning, stacklevel=3)
+            f"quantised data", RuntimeWarning, stacklevel=4)
+        # 4: _rank_gaussianise -> estimate -> _entry_precision -> caller
     p = torch.stack(cols, 1) / (N + 1.0)
     # ndtri/erfinv are JIT (nvrtc) kernels on CUDA and nvrtc rejects the
     # GB10 arch; this is one-off data prep, so run the probit on CPU
@@ -1215,7 +1271,12 @@ def _select_and_fit(X, protocol, fixed_components_number, max_components,
     `estimate_categorical` (per-category), so the two cannot drift apart:
     chunk sizing, the fixed-k shortcut, protocol dispatch and the
     protocol/metric_method compatibility rules live only here.
-    Returns (k_best, (w, mu, cov)) with dead components sliced away.
+    Returns (k, (w, mu, cov)) with dead components sliced away and k the
+    LIVE component count of the returned parameters — the model that is
+    actually bootstrapped, MC-integrated and returned — which can be
+    smaller than the selected/requested k when components died during the
+    CV fit (a RuntimeWarning says so for a requested
+    fixed_components_number).
     """
     N, d = X.shape
     IF = n_inits * n_folds
@@ -1265,7 +1326,14 @@ def _select_and_fit(X, protocol, fixed_components_number, max_components,
     # auto-sized chunks by the padding factor.
     w1, mu1, cov1 = params
     alive = w1 > 0
-    return k_best, (w1[alive], mu1[alive], cov1[alive])
+    k_live = int(alive.sum())
+    if fixed_components_number is not None and k_live != k_best:
+        warnings.warn(
+            f"fixed_components_number={k_best}: {k_best - k_live} "
+            f"component(s) died during the CV fit, so the model that is "
+            f"bootstrapped and returned has {k_live}",
+            RuntimeWarning, stacklevel=4)
+    return k_live, (w1[alive], mu1[alive], cov1[alive])
 
 
 def _bootstrap_counts(N, B, dtype, device, generator):
@@ -1333,7 +1401,7 @@ class FittedGMM:
         return ll[0].cpu().numpy()
 
 
-@_full_precision
+@_entry_precision
 def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
              mc_samples=100_000, max_components=20, n_folds=2, n_inits=3,
              reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, seed=0, return_k=False,
@@ -1516,7 +1584,7 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     standardised units), and the absence of float32 failures on
     unstandardised data.
     """
-    X = torch.as_tensor(X, dtype=dtype, device=device)
+    X = torch.as_tensor(X, dtype=dtype, device=device).detach()
     if quantity not in _INTEGRANDS:
         raise ValueError(f"quantity must be one of "
                          f"{sorted(_INTEGRANDS)}; found '{quantity}'")
@@ -1559,7 +1627,8 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
                 "model is a fit to the rank-probit-transformed data, not "
                 "to the original units — the rank transform has no "
                 "parametric inverse. Its sample/score_samples/contours "
-                "live in gaussianised space.", RuntimeWarning, stacklevel=2)
+                "live in gaussianised space.", RuntimeWarning,
+                stacklevel=3)   # estimate -> _entry_precision -> caller
         X = _rank_gaussianise(X)
     elif preprocess != 'none':
         raise ValueError(f"preprocess must be 'none' or 'gaussianise'; "
@@ -1628,7 +1697,7 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     return out
 
 
-@_full_precision
+@_entry_precision
 def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
                          mc_samples=100_000, max_components=10, n_folds=2, n_inits=3,
                          reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, seed=0,
@@ -1684,7 +1753,7 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     k : list of int
         Selected component count per category; only if `return_k` is True.
     """
-    X = torch.as_tensor(X, dtype=dtype, device=device)
+    X = torch.as_tensor(X, dtype=dtype, device=device).detach()
     if X.dim() > 2 or (X.dim() == 2 and X.shape[1] != 1):
         raise ValueError(f"X must be 1-D or a single column; found shape "
                          f"{tuple(X.shape)}")
@@ -1694,7 +1763,7 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
             "X contains non-finite values (NaN or inf in the working "
             "dtype); the standardisation propagates them into every "
             "replicate — remove or impute them first")
-    Y = torch.as_tensor(Y, device=device)
+    Y = torch.as_tensor(Y, device=device).detach()
     if Y.dim() > 2 or (Y.dim() == 2 and Y.shape[1] != 1):
         raise ValueError(f"Y must be 1-D; found shape {tuple(Y.shape)}")
     Y = Y.reshape(-1)
