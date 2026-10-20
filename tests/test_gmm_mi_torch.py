@@ -1376,6 +1376,73 @@ def test_requires_grad_input_detached(monkeypatch):
     assert np.isfinite(m2)
 
 
+def test_fp32_large_offset_cast_ordering():
+    # review finding: the cast to the working dtype preceded the internal
+    # standardisation, so float64 data with offset/sigma >~ 1e6 was quantised
+    # at float32 before the centring could protect it (MI -18% at 1e7,
+    # destroyed at 1e8, RuntimeError at timestamp scale). Standardising at
+    # float64 first, float32 must now track float64 at every offset.
+    rho = 0.9
+    cov = np.array([[1.0, rho], [rho, 1.0]])
+    rng = np.random.default_rng(0)
+    Z = rng.multivariate_normal([0, 0], cov, 2000)
+    common = dict(fixed_components_number=1, n_bootstrap=5, mc_samples=20_000)
+    for offset in (0.0, 1e6, 1e7, 1e8, 1.7e9):
+        X = Z + offset
+        m64, _ = estimate(X, 'MI', dtype=torch.float64, **common)
+        m32, _ = estimate(X, 'MI', dtype=torch.float32, **common)
+        assert abs(m32 - m64) < 0.02, (offset, m32, m64)
+
+
+def test_entry_pipeline_runs_at_float64(monkeypatch):
+    # the rank transform must see float64 data even when dtype=float32:
+    # pre-cast input made the tie warning fire spuriously on continuous
+    # float32 data at large N and quantised the quantiles
+    E = gmm_mi_torch.estimator
+    seen = []
+    orig = E._rank_gaussianise
+
+    def spy(X, *args, **kwargs):
+        seen.append(X.dtype)
+        return orig(X, *args, **kwargs)
+
+    monkeypatch.setattr(E, '_rank_gaussianise', spy)
+    rng = np.random.default_rng(0)
+    X = rng.multivariate_normal([0, 0], [[1, .6], [.6, 1]], 500)
+    estimate(X, 'MI', preprocess='gaussianise', dtype=torch.float32,
+             max_components=2, n_bootstrap=2, mc_samples=1000)
+    assert seen == [torch.float64]
+
+
+def test_tie_warning_ignores_micro_blocks():
+    # float32-NATIVE continuous data acquires birthday-pair ties at large N
+    # (~2% of samples at N=3e6); pairs are harmless and must not warn, while
+    # genuinely quantised data (few-level column) still must
+    E = gmm_mi_torch.estimator
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(3_000_000, 1, dtype=torch.float64, generator=g)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', RuntimeWarning)
+        E._rank_gaussianise(x.to(torch.float32))   # pairs only: silent
+    q = torch.randint(0, 5, (10_000, 1), generator=g).double()
+    with pytest.warns(RuntimeWarning, match='tied values'):
+        E._rank_gaussianise(q)
+
+
+def test_integer_input_and_dtype_validation():
+    # integer input is promoted to float64 at entry (as_tensor would hand
+    # the standardisation an int64 tensor, whose .std() raises); fp16/bf16
+    # working dtypes are rejected up front (cholesky unsupported deep inside)
+    rng = np.random.default_rng(0)
+    Xi = rng.integers(0, 1000, size=(400, 2))
+    m, s = estimate(Xi, 'MI', max_components=2, n_bootstrap=2,
+                    mc_samples=1000)
+    assert np.isfinite(m)
+    with pytest.raises(ValueError, match='dtype'):
+        estimate(Xi.astype(float), 'MI', dtype=torch.float16,
+                 max_components=2)
+
+
 def test_gaussianise_ties_average_rank_regression():
     # review finding: positional (double-argsort) tie-breaking mapped a tied
     # block to a monotone probit ramp in row order, fabricating MI whenever

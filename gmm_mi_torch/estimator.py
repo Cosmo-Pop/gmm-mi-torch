@@ -1231,10 +1231,12 @@ _INTEGRANDS = {'MI': _integrand_MI, 'cMI': _integrand_cMI, 'TC': _integrand_TC,
                'KL_reverse': _integrand_KL_reverse}
 
 
-# Tie fraction (1 - n_unique/N per column) above which gaussianise warns:
-# genuinely continuous data has essentially no ties, so a noticeable
-# fraction means quantised or zero-inflated input, where the rank-probit
-# transform cannot make the marginal Gaussian.
+# Tie fraction (excess samples in tied blocks of size >= 3, per column)
+# above which gaussianise warns. Blocks of two are ignored: genuinely
+# continuous data acquires birthday-pair collisions once quantised (a
+# float32-native standard-normal column crosses 1% of paired samples around
+# N ~ 2e6), and a two-sample block is harmless jitter, while real
+# quantisation or zero inflation shows up as large blocks.
 _GAUSSIANISE_TIE_WARN_FRACTION = 0.01
 
 
@@ -1259,7 +1261,8 @@ def _rank_gaussianise(X):
         csum = torch.cumsum(cnt, 0)
         avg_rank = (csum - cnt).double() + (cnt.double() + 1.0) / 2.0
         cols.append(avg_rank[inv])
-        tie_frac.append(1.0 - vals.shape[0] / N)
+        big = cnt[cnt >= 3]
+        tie_frac.append(float((big - 1).sum()) / N)
     tied = [j for j, f in enumerate(tie_frac)
             if f > _GAUSSIANISE_TIE_WARN_FRACTION]
     if tied:
@@ -1598,8 +1601,27 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     `scale` argument of the minmax/randomized k-means initialisers (now in
     standardised units), and the absence of float32 failures on
     unstandardised data.
+
+    The standardisation (and the rank transform) run at float64 BEFORE the
+    cast to the working dtype, so float32 runs are safe on data with large
+    offsets (MJDs, timestamps): the cast sees already-centred values. This
+    costs a one-off float64 copy of X at entry. Input that is itself float32
+    cannot be un-quantised; pass float64 (or raw) data where offsets are
+    large relative to the spread.
     """
-    X = torch.as_tensor(_as_array(X), dtype=dtype, device=device).detach()
+    X = torch.as_tensor(_as_array(X)).detach()
+    if dtype not in (torch.float32, torch.float64):
+        raise ValueError(f"dtype must be torch.float32 or torch.float64; "
+                         f"found {dtype}")
+    # The entry pipeline (finiteness check, rank transform, affine
+    # standardisation) runs at float64 BEFORE the cast to the working dtype:
+    # casting first quantises large-offset columns (MJDs, Julian dates,
+    # timestamps) at float32 resolution before the centring that would have
+    # made them representable, silently destroying the estimate. Integer and
+    # half-precision inputs are promoted the same way; already-float32 input
+    # cannot be un-quantised, so the upcast there is best effort. The one-off
+    # float64 copy of X at entry is the price.
+    X = X.to(torch.float64)
     if quantity not in _INTEGRANDS:
         raise ValueError(f"quantity must be one of "
                          f"{sorted(_INTEGRANDS)}; found '{quantity}'")
@@ -1622,10 +1644,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
                          f"found {X.shape[1]}")
     if not torch.isfinite(X).all():
         raise ValueError(
-            "X contains non-finite values (NaN or inf in the working "
-            "dtype); gaussianise would silently rank them as extreme "
-            "values and the standardisation path propagates them into "
-            "every replicate — remove or impute them first")
+            "X contains non-finite values (NaN or inf); gaussianise would "
+            "silently rank them as extreme values and the standardisation "
+            "path propagates them into every replicate — remove or impute "
+            "them first")
     _validate_folds(X.shape[0], n_folds)
     if n_chunk is not None and int(n_chunk) < 1:
         raise ValueError(f"n_chunk must be a positive int or None; "
@@ -1662,6 +1684,14 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         col_std = X.std(0)
     col_std = torch.where(col_std > 0, col_std, torch.ones_like(col_std))
     X = (X - col_mean) / col_std
+    # the float64 col_mean/col_std are kept for the return_fit back-transform;
+    # the fit itself runs at the working dtype on the target device
+    X = X.to(dtype=dtype, device=device)
+    if not torch.isfinite(X).all():
+        raise ValueError(
+            f"X is not representable at {dtype} after standardisation "
+            f"(a column's scale lies beyond the working dtype's range); "
+            f"use dtype=torch.float64")
     N, d = X.shape
     k_best, (w1, mu1, cov1) = _select_and_fit(
         X, protocol, fixed_components_number, max_components, n_folds,
@@ -1681,9 +1711,11 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
                                   cov1.unsqueeze(0), reg_covar, threshold_fit,
                                   max_iter, em_chunk=em_chunk_boot, n_chunk=n_chunk)
         alive = wf[0] > 0
+        std_w = col_std.to(dtype=dtype, device=device)
+        mean_w = col_mean.to(dtype=dtype, device=device)
         fit = FittedGMM(wf[0][alive],
-                        muf[0][alive] * col_std + col_mean,
-                        covf[0][alive] * (col_std[:, None] * col_std[None, :]))
+                        muf[0][alive] * std_w + mean_w,
+                        covf[0][alive] * (std_w[:, None] * std_w[None, :]))
     g = torch.Generator(device=X.device).manual_seed(seed + 10_000)
     if n_bootstrap >= 1:
         s = _bootstrap_counts(N, B, X.dtype, X.device, g)
@@ -1772,16 +1804,22 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     k : list of int
         Selected component count per category; only if `return_k` is True.
     """
-    X = torch.as_tensor(_as_array(X), dtype=dtype, device=device).detach()
+    X = torch.as_tensor(_as_array(X)).detach()
+    if dtype not in (torch.float32, torch.float64):
+        raise ValueError(f"dtype must be torch.float32 or torch.float64; "
+                         f"found {dtype}")
+    # as in estimate: the entry pipeline runs at float64 and the cast to the
+    # working dtype happens after the standardisation (see the comment there)
+    X = X.to(torch.float64)
     if X.dim() > 2 or (X.dim() == 2 and X.shape[1] != 1):
         raise ValueError(f"X must be 1-D or a single column; found shape "
                          f"{tuple(X.shape)}")
     X = X.reshape(-1, 1)
     if not torch.isfinite(X).all():
         raise ValueError(
-            "X contains non-finite values (NaN or inf in the working "
-            "dtype); the standardisation propagates them into every "
-            "replicate — remove or impute them first")
+            "X contains non-finite values (NaN or inf); the "
+            "standardisation propagates them into every replicate — "
+            "remove or impute them first")
     cat_labels = None
     try:
         Y = torch.as_tensor(_as_array(Y), device=device).detach()
@@ -1825,6 +1863,12 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     # categorical variable is invariant, and reg_covar becomes scale-free
     x_std = X.std()
     X = (X - X.mean()) / torch.where(x_std > 0, x_std, torch.ones_like(x_std))
+    X = X.to(dtype=dtype, device=device)
+    if not torch.isfinite(X).all():
+        raise ValueError(
+            f"X is not representable at {dtype} after standardisation "
+            f"(its scale lies beyond the working dtype's range); "
+            f"use dtype=torch.float64")
     cats, counts = torch.unique(Y, return_counts=True)
     C = cats.shape[0]
     ci_min = int(counts.argmin())
