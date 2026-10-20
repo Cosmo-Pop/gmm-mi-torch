@@ -30,7 +30,7 @@ for d in (2,3,5):
     g=torch.Generator(device=dev).manual_seed(0)
     X=torch.randn(2000,d,device=dev)
     w,mu,cov=E._init_params(X,K,b,1e-6,generator=g,em_chunk=b)
-    chol=E._chol(cov)
+    chol, cov=E._chol(cov)
     torch.cuda.synchronize(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(); base=torch.cuda.memory_allocated()
     pts=E.gmm_sample(w,mu,chol,S,generator=g)
     q='MI' if d==2 else ('TC')

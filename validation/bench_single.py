@@ -23,7 +23,7 @@ for em_chunk in (8,300):
     K=w1.shape[0]
     w,mu,cov,_=em_fit(Xt,s,w1.expand(B,K).contiguous(),mu1.expand(B,K,2).contiguous(),cov1.expand(B,K,2,2).contiguous(),em_chunk=em_chunk)
     torch.cuda.synchronize(); t2=time.time()
-    chol=_chol(cov); vals=[]
+    chol, cov=_chol(cov); vals=[]
     for i in range(0,B,8):
         sl=slice(i,i+8); pts=gmm_sample(w[sl],mu[sl],chol[sl],100_000,generator=g)
         vals.append(_INTEGRANDS['MI'](pts,w[sl],mu[sl],cov[sl],chol[sl]).mean(1))

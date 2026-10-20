@@ -10,8 +10,11 @@ At the time these were produced the module was a flat file named
 the test suite was `test_torch_gmm_mi.py` (now `tests/test_gmm_mi_torch.py`,
 identical up to the import rename). File names inside the artifacts reflect
 the old layout. The bench scripts have since been repointed at the package
-(`gmm_mi_torch.estimator`), so they run against the current code; the
-numbers recorded in the reports remain those of the versions stated there.
+(`gmm_mi_torch.estimator`) and updated for v0.3.0's `_chol` signature change
+(it returns `(chol, cov)` since then; between v0.3.0 and v0.3.1 all of them
+except `bench.py` crashed on the old single-tensor contract), so they run
+against the current code; the numbers recorded in the reports remain those
+of the versions stated there.
 
 - `gb10_report.md` — the full report, Parts 1–6: fp32/CUDA validation of the
   original port, benchmark and scale tables, the extensions

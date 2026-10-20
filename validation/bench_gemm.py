@@ -14,7 +14,7 @@ def T(f,n=5):
     torch.cuda.synchronize(); return (time.perf_counter()-t)/n*1e3, out
 
 # ---- current pieces
-chol=E._chol(cov); logw=torch.log(w.clamp_min(1e-300)); Xr=Xt.expand(Ra,N,d)
+chol, cov=E._chol(cov); logw=torch.log(w.clamp_min(1e-300)); Xr=Xt.expand(Ra,N,d)
 t_lg,lj=T(lambda: logw.unsqueeze(1)+E.log_gauss(Xr,mu,chol))
 def resp_f():
     ll_n=torch.logsumexp(lj,-1); return torch.exp(lj-ll_n.unsqueeze(-1)), ll_n

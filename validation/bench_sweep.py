@@ -83,7 +83,7 @@ def saturation(Xt, dtype, batches, K=20):
                 return E._mstep_gemm(F, resp, s, 1e-6, d)
         else:
             def step():
-                chol = E._chol(cov)
+                chol = E._chol(cov)[0]
                 logw = torch.log(w.clamp_min(1e-300))
                 Xr = Xt.expand(Ra, N, d)
                 lj = logw.unsqueeze(1) + E.log_gauss(Xr, mu, chol)

@@ -8,7 +8,7 @@ g = torch.Generator().manual_seed(0)
 w, mu, cov = E._init_params(X, 4, 6, 1e-6, generator=g)
 s = torch.rand(6, 2000, dtype=torch.float64) + 0.5
 # legacy step
-chol = E._chol(cov); logw = torch.log(w.clamp_min(1e-300))
+chol, cov = E._chol(cov); logw = torch.log(w.clamp_min(1e-300))
 Xr = X.expand(6, 2000, 3)
 lj = logw.unsqueeze(1) + E.log_gauss(Xr, mu, chol)
 ll_n = torch.logsumexp(lj, -1); resp_l = torch.exp(lj - ll_n.unsqueeze(-1))

@@ -17,7 +17,7 @@ def traced(X,s,w,mu,cov,reg_covar=1e-6,threshold_fit=1e-5,max_iter=500,n_chunk=N
     sa=s; it_trace=[]
     for it in range(max_iter):
         Ra=ai.shape[0]; torch.cuda.synchronize(); t=time.perf_counter()
-        chol=E._chol(cov)
+        chol, cov=E._chol(cov)
         logw=torch.where(w>0,torch.log(w.clamp_min(1e-300)),torch.full_like(w,-torch.inf))
         Xr=X.expand(Ra,N,X.shape[-1])
         logjoint=logw.unsqueeze(1)+E.log_gauss(Xr,mu,chol)
@@ -63,7 +63,7 @@ for Ra in (1,4,8,32,128,300,1200):
     w,mu,cov=E._init_params(Xt,20,Ra,1e-6,generator=g,em_chunk=Ra)
     s=torch.ones(Ra,N,device='cuda')
     def step():
-        chol=E._chol(cov); logw=torch.log(w.clamp_min(1e-300))
+        chol=E._chol(cov)[0]; logw=torch.log(w.clamp_min(1e-300))
         Xr=Xt.expand(Ra,N,2)
         lj=logw.unsqueeze(1)+E.log_gauss(Xr,mu,chol)
         ll_n=torch.logsumexp(lj,-1); resp=torch.exp(lj-ll_n.unsqueeze(-1))
