@@ -1551,6 +1551,64 @@ def test_seed_and_bootstrap_bounds():
         estimate(X, 'MI', n_bootstrap=(1 << 20) + 1, max_components=2)
 
 
+def test_autocast_suspended_inside_pin():
+    # an ambient torch.autocast region used to run the cancellation-critical
+    # float32 GEMMs at bf16 (shifting both the estimate and the selected k);
+    # the precision pin now suspends autocast, so inside == outside bitwise
+    rng = np.random.default_rng(0)
+    X = rng.multivariate_normal([0, 0], [[1, .6], [.6, 1]], 2000)
+    common = dict(max_components=3, n_bootstrap=4, mc_samples=5000,
+                  dtype=torch.float32, device='cpu', return_k=True)
+    ref = estimate(X, 'MI', **common)
+    with torch.autocast('cpu', dtype=torch.bfloat16):
+        out = estimate(X, 'MI', **common)
+    assert out == ref
+
+
+def test_max_iter_exhaustion_warns():
+    # EM used to exhaust max_iter silently (the sklearn-based reference
+    # emits a ConvergenceWarning); em_fit now warns once per call with the
+    # straggler count, and a converged fit stays silent
+    E = gmm_mi_torch.estimator
+    torch.manual_seed(0)
+    X = torch.randn(400, 2, dtype=torch.float64)
+    g = torch.Generator().manual_seed(0)
+    w0, mu0, cov0 = E._init_params(X, 3, 4, 1e-6, generator=g)
+    s = torch.ones(4, 400, dtype=torch.float64)
+    with pytest.warns(RuntimeWarning, match='did not converge'):
+        E.em_fit(X, s, w0, mu0, cov0, max_iter=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', RuntimeWarning)
+        E.em_fit(X, s, w0, mu0, cov0, max_iter=500)
+
+
+def test_cv_masks_survive_default_device():
+    # torch.set_default_device('cuda') used to break _cv_masks (CPU
+    # generator vs default-device factories); the factories are pinned
+    if not torch.cuda.is_available():
+        pytest.skip('needs a CUDA device to change the default to')
+    rng = np.random.default_rng(0)
+    X = rng.multivariate_normal([0, 0], [[1, .6], [.6, 1]], 500)
+    try:
+        torch.set_default_device('cuda')
+        m, s = estimate(X, 'MI', max_components=2, n_bootstrap=2,
+                        mc_samples=1000, device='cuda', dtype=torch.float32)
+    finally:
+        torch.set_default_device(None)
+    assert np.isfinite(m)
+
+
+def test_plotting_one_sigma_contour_constant():
+    # the 1-sigma ellipse constant was chi2_2.ppf(0.32) = 0.77 (an inverted
+    # quantile enclosing 32% of the mass); it must be the 68.27% quantile
+    from gmm_mi_torch import plotting
+    from scipy.stats import chi2
+    r1, r2, r3 = plotting.find_contours([1, 2, 3])
+    assert abs(r1 - np.sqrt(chi2.ppf(0.6827, 2))) < 1e-3
+    assert abs(r2 - np.sqrt(chi2.ppf(0.95, 2))) < 1e-3
+    assert abs(r3 - np.sqrt(chi2.ppf(0.995, 2))) < 1e-2
+
+
 def test_gaussianise_ties_average_rank_regression():
     # review finding: positional (double-argsort) tie-breaking mapped a tied
     # block to a monotone probit ramp in row order, fabricating MI whenever

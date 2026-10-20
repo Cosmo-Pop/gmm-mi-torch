@@ -60,7 +60,10 @@ except AttributeError:      # torch < 2.9: legacy API only
 
 class _pinned_precision:
     """Context manager: float32 matmuls at full (ieee) precision inside the
-    block, the caller's exact settings restored on exit. Reentrant."""
+    block, with any ambient torch.autocast region suspended (an enclosing
+    mixed-precision context would otherwise run the cancellation-critical
+    GEMMs at bf16/fp16, shifting both the estimate and the selected k).
+    The caller's exact settings are restored on exit. Reentrant."""
 
     def __enter__(self):
         if _FP32_KNOBS is not None:
@@ -70,9 +73,23 @@ class _pinned_precision:
         else:
             self._prev = torch.get_float32_matmul_precision()
             torch.set_float32_matmul_precision('highest')
+        # suspend autocast only for device types where it is active:
+        # entering autocast('cuda', ...) on a CPU-only build warns
+        self._autocast = []
+        for dev_type in ('cuda', 'cpu'):
+            try:
+                active = torch.is_autocast_enabled(dev_type)
+            except (TypeError, RuntimeError):
+                active = False
+            if active:
+                cm = torch.autocast(dev_type, enabled=False)
+                cm.__enter__()
+                self._autocast.append(cm)
         return self
 
     def __exit__(self, *exc):
+        for cm in reversed(self._autocast):
+            cm.__exit__(*exc)
         if _FP32_KNOBS is not None:
             for knob, prev in zip(_FP32_KNOBS, self._prev):
                 knob.fp32_precision = prev
@@ -800,13 +817,28 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
     w, mu, cov : torch.Tensor
         Fitted parameters, same shapes as the inputs.
     ll : torch.Tensor of shape (n_replicates,)
-        Final weighted mean per-sample log-likelihood.
+        Weighted mean per-sample log-likelihood of the parameters that
+        ENTERED the final iteration's M-step: it lags the returned
+        parameters by one M-step (for converged replicates, by less than
+        `threshold_fit`). Score the returned parameters with `val_ll` when
+        an exact final-state likelihood is needed.
+
+    A RuntimeWarning (one per call) reports replicates that exhausted
+    `max_iter` without meeting `threshold_fit`; their last iterates are
+    returned.
     """
     R = s.shape[0]
     outs = _run_chunked(R, em_chunk, lambda sl: _em_fit_core(
         X, s[sl], w[sl], mu[sl], cov[sl], reg_covar, threshold_fit, max_iter, n_chunk))
+    n_unconverged = sum(o[4] for o in outs)
+    if n_unconverged:
+        warnings.warn(
+            f"{n_unconverged} of {R} EM replicate(s) did not converge "
+            f"within max_iter={max_iter} iterations; their last iterates "
+            f"are used (raise max_iter or loosen threshold_fit)",
+            RuntimeWarning, stacklevel=3)   # em_fit -> _full_precision -> caller
     if len(outs) == 1:
-        return outs[0]
+        return outs[0][:4]
     return tuple(torch.cat([o[j] for o in outs]) for j in range(4))
 
 
@@ -870,8 +902,10 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
     X: (N,d) shared data; s: (R,N) per-replicate sample weights.
     n_chunk: sample-dimension chunk size for the per-iteration E/M
     accumulation (None = original single-pass path, kept verbatim).
-    Returns (w, mu, cov, train_ll) with train_ll the final weighted
-    mean per-sample log-likelihood, shape (R,).
+    Returns (w, mu, cov, train_ll, n_unconverged) with train_ll the last
+    E-step's weighted mean per-sample log-likelihood, shape (R,), and
+    n_unconverged the number of replicates that exhausted max_iter
+    (aggregated and warned about once by em_fit).
     """
     R, N = s.shape
     dev = X.device
@@ -917,12 +951,12 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
             ai, sa, prev = ai[keep], sa[keep], ll[keep]
             w, mu, cov = w[keep], mu[keep], cov[keep]
             if ai.shape[0] == 0:
-                return w_out, mu_out, cov_out, ll_out
+                return w_out, mu_out, cov_out, ll_out, 0
         else:
             prev = ll
     # unconverged stragglers: write back current state
     w_out[ai], mu_out[ai], cov_out[ai], ll_out[ai] = w, mu, cov, prev
-    return w_out, mu_out, cov_out, ll_out
+    return w_out, mu_out, cov_out, ll_out, int(ai.shape[0])
 
 
 @_full_precision
@@ -958,32 +992,35 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None, em_chunk=None):
 
 
 def _val_ll_core(X, s_val, w, mu, cov, n_chunk=None):
-    """`val_ll` for one replicate batch."""
+    """`val_ll` for one replicate batch.  The cross-chunk accumulator runs
+    at float64, as in the EM kernels: at float32 the drift of a working-
+    dtype sum grows as sqrt(#chunks) x ulp and reaches a visible fraction
+    of threshold_components at large N — and this metric decides k."""
     R, N = s_val.shape
     if _EM_KERNEL == 'gemm':
         coef, const = _gauss_coef(w, mu, cov)
-        acc = torch.zeros(R, dtype=X.dtype, device=X.device)
+        acc = torch.zeros(R, dtype=torch.float64, device=X.device)
         for i in range(0, N, n_chunk or N):
             Fc = _features(X[i:i+(n_chunk or N)])
             lj = torch.matmul(Fc.unsqueeze(0), coef.transpose(1, 2))
             lj += const.unsqueeze(1)
             acc = acc + (s_val[:, i:i+(n_chunk or N)]
-                         * torch.logsumexp(lj, -1)).sum(1)
+                         * torch.logsumexp(lj, -1)).sum(1).double()
     else:
         chol, _ = _chol(cov)
         if n_chunk is None:
             ll_n = gmm_score(X.expand(R, N, X.shape[-1]), w, mu, chol)
-            acc = (s_val * ll_n).sum(1)
+            acc = (s_val * ll_n).sum(1).double()
         else:
-            acc = torch.zeros(R, dtype=X.dtype, device=X.device)
+            acc = torch.zeros(R, dtype=torch.float64, device=X.device)
             for i in range(0, N, n_chunk):
                 Xc = X[i:i+n_chunk]
                 nc = Xc.shape[0]
                 ll_n = gmm_score(Xc.expand(R, nc, X.shape[-1]), w, mu, chol)
-                acc = acc + (s_val[:, i:i+n_chunk] * ll_n).sum(1)
-    tot = s_val.sum(1)
+                acc = acc + (s_val[:, i:i+n_chunk] * ll_n).sum(1).double()
+    tot = s_val.sum(1).double()
     return torch.where(tot > 0, acc / tot.clamp_min(1e-30),
-                       torch.full_like(acc, -torch.inf))
+                       torch.full_like(acc, -torch.inf)).to(X.dtype)
 
 
 # ----------------------------------------------------------------------
@@ -1008,10 +1045,14 @@ def _validate_folds(N, n_folds, what='X'):
 
 
 def _cv_masks(N, n_folds, n_inits, dtype, seed=42):
-    """0/1 train masks and val masks, shape (n_inits*n_folds, N)."""
+    """0/1 train masks and val masks, shape (n_inits*n_folds, N).
+
+    Factories are pinned to the CPU: the masks are built with a CPU
+    generator and moved by the caller, and torch.set_default_device('cuda')
+    must not reroute them mid-construction."""
     g = torch.Generator().manual_seed(seed)
-    perm = torch.randperm(N, generator=g)
-    fold_id = torch.zeros(N, dtype=torch.long)
+    perm = torch.randperm(N, generator=g, device='cpu')
+    fold_id = torch.zeros(N, dtype=torch.long, device='cpu')
     for f in range(n_folds):
         fold_id[perm[f::n_folds]] = f
     val = torch.stack([(fold_id == f).to(dtype) for f in range(n_folds)])  # CPU; moved by caller
@@ -1181,8 +1222,13 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
         rk = torch.arange(max_components, device=X.device) * IF \
             + best_i_k * n_folds + best_f_k
         ones = torch.ones(max_components, N, dtype=X.dtype, device=X.device)
-        _, _, _, llf = em_fit(X, ones, w[rk], mu[rk], cov[rk], reg_covar, threshold_fit,
-                              max_iter, em_chunk=em_chunk, n_chunk=n_chunk)
+        wf, muf, covf, _ = em_fit(X, ones, w[rk], mu[rk], cov[rk], reg_covar, threshold_fit,
+                                  max_iter, em_chunk=em_chunk, n_chunk=n_chunk)
+        # score the parameters the refit RETURNS: em_fit's ll lags them by
+        # one M-step (see its docstring), which would shift the criterion
+        # by up to 2 * N * threshold_fit
+        llf = val_ll(X, ones, wf, muf, covf, n_chunk=n_chunk,
+                     em_chunk=em_chunk)
         ks = torch.arange(1, max_components + 1, dtype=X.dtype, device=X.device)
         n_par = (ks - 1) + ks * d + ks * d * (d + 1) / 2
         pen = 2.0 if metric_method == 'aic' else math.log(N)
@@ -1515,7 +1561,11 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         failed Cholesky factorisations; 1e-6 is safe at float32, where
         GMM-MI's 1e-15 would regularise nothing. The data are internally
         standardised (see Notes), so this floor is relative to each
-        variable's variance; a component whose factorisation still fails
+        variable's variance — except for the KL quantities, whose two
+        columns must share one map (KL invariance), making the floor
+        relative to their POOLED variance: with strongly mismatched
+        marginal scales, use a smaller reg_covar so the narrow marginal is
+        not over-regularised. A component whose factorisation still fails
         receives escalating diagonal regularisation automatically (with a
         RuntimeWarning) instead of aborting the fit.
     threshold_fit : float, default=1e-5
