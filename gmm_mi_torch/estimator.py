@@ -184,6 +184,21 @@ def _index_arg(value, name, minimum=None):
     return value
 
 
+def _as_array(X):
+    """Unwrap array-protocol containers that torch.as_tensor cannot inspect:
+    a pandas DataFrame exposes __array__ but torch's sequence path fails on
+    it with "could not determine the shape of object type 'DataFrame'".
+    The container converts itself, so no numpy import is needed, and a
+    plain ndarray returns itself (no copy). Read-only arrays (pandas
+    copy-on-write hands those out) are copied so torch.as_tensor does not
+    warn about non-writable memory."""
+    if not isinstance(X, torch.Tensor) and hasattr(X, '__array__'):
+        X = X.__array__()
+        if getattr(getattr(X, 'flags', None), 'writeable', True) is False:
+            X = X.copy()
+    return X
+
+
 def _validate_entry_args(seed, n_bootstrap, mc_samples, max_components,
                          n_folds, n_inits, max_iter,
                          fixed_components_number, reg_covar,
@@ -1584,7 +1599,7 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     standardised units), and the absence of float32 failures on
     unstandardised data.
     """
-    X = torch.as_tensor(X, dtype=dtype, device=device).detach()
+    X = torch.as_tensor(_as_array(X), dtype=dtype, device=device).detach()
     if quantity not in _INTEGRANDS:
         raise ValueError(f"quantity must be one of "
                          f"{sorted(_INTEGRANDS)}; found '{quantity}'")
@@ -1728,6 +1743,10 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         The continuous variable.
     Y : array-like of shape (n_samples,)
         The categorical variable; categories are its unique values.
+        Numeric labels are used as-is; string/object labels are factorised
+        through numpy's unique (categories in sorted label order).
+        Non-finite labels (NaN/inf) are rejected — torch.unique would
+        otherwise make every NaN its own category.
     category_weights : {'empirical', 'uniform'}, default='empirical'
         'empirical' sets pi_c = N_c / N from the observed category counts —
         the correct weighting for MI of the observed joint (X, Y).
@@ -1753,7 +1772,7 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     k : list of int
         Selected component count per category; only if `return_k` is True.
     """
-    X = torch.as_tensor(X, dtype=dtype, device=device).detach()
+    X = torch.as_tensor(_as_array(X), dtype=dtype, device=device).detach()
     if X.dim() > 2 or (X.dim() == 2 and X.shape[1] != 1):
         raise ValueError(f"X must be 1-D or a single column; found shape "
                          f"{tuple(X.shape)}")
@@ -1763,7 +1782,24 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
             "X contains non-finite values (NaN or inf in the working "
             "dtype); the standardisation propagates them into every "
             "replicate — remove or impute them first")
-    Y = torch.as_tensor(Y, device=device).detach()
+    cat_labels = None
+    try:
+        Y = torch.as_tensor(_as_array(Y), device=device).detach()
+    except (TypeError, ValueError):
+        # non-numeric labels (strings, objects — the common case for
+        # categorical astrophysical data) are factorised via numpy:
+        # categories are the sorted unique labels, as np.unique orders
+        # them, and MI only needs the partition
+        import numpy as np
+        arr = np.asarray(Y)
+        if arr.ndim == 2 and arr.shape[1] == 1:
+            arr = arr.reshape(-1)
+        if arr.ndim != 1:
+            raise ValueError(f"Y must be 1-D; found shape "
+                             f"{arr.shape}") from None
+        cats_np, inv = np.unique(arr, return_inverse=True)
+        cat_labels = [str(v) for v in cats_np]
+        Y = torch.as_tensor(inv.reshape(-1), device=device)
     if Y.dim() > 2 or (Y.dim() == 2 and Y.shape[1] != 1):
         raise ValueError(f"Y must be 1-D; found shape {tuple(Y.shape)}")
     Y = Y.reshape(-1)
@@ -1792,8 +1828,10 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     cats, counts = torch.unique(Y, return_counts=True)
     C = cats.shape[0]
     ci_min = int(counts.argmin())
+    label_min = (cat_labels[int(cats[ci_min])] if cat_labels is not None
+                 else cats[ci_min].item())
     _validate_folds(int(counts[ci_min]), n_folds,
-                    what=f"the smallest category (Y == {cats[ci_min].item()})")
+                    what=f"the smallest category (Y == {label_min})")
     if category_weights == 'empirical':
         pi = counts.to(dtype) / Y.shape[0]
     elif category_weights == 'uniform':
