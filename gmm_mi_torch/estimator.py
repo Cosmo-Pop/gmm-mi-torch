@@ -1022,17 +1022,48 @@ _INTEGRANDS = {'MI': _integrand_MI, 'cMI': _integrand_cMI, 'TC': _integrand_TC,
                'KL_reverse': _integrand_KL_reverse}
 
 
+# Tie fraction (1 - n_unique/N per column) above which gaussianise warns:
+# genuinely continuous data has essentially no ties, so a noticeable
+# fraction means quantised or zero-inflated input, where the rank-probit
+# transform cannot make the marginal Gaussian.
+_GAUSSIANISE_TIE_WARN_FRACTION = 0.01
+
+
 def _rank_gaussianise(X):
     """Per-variable rank-probit transform: X -> Phi^{-1}(rank / (N+1)).
 
     MI, cMI and TC are invariant under per-variable diffeomorphisms, so no
-    correction term is needed."""
+    correction term is needed.  Tied values share their average rank (the
+    scipy `rankdata` convention), so a tied block maps to a single probit
+    atom instead of a monotone ramp in row order — a positional tiebreak
+    fabricates MI whenever row order correlates with another variable
+    (sorted catalogues, concatenated bins, zero-inflated data).
+    """
     N = X.shape[0]
-    ranks = X.argsort(dim=0).argsort(dim=0).to(X.dtype) + 1.0
-    p = ranks / (N + 1.0)
+    # ranks and quantiles at float64: float32 integer ranks round above
+    # 2^24 samples, corrupting the quantiles exactly in the large-N regime
+    cols, tie_frac = [], []
+    for j in range(X.shape[1]):
+        vals, inv, cnt = torch.unique(X[:, j], return_inverse=True,
+                                      return_counts=True)
+        # average rank of a tied block: (#smaller values) + (count+1)/2
+        csum = torch.cumsum(cnt, 0)
+        avg_rank = (csum - cnt).double() + (cnt.double() + 1.0) / 2.0
+        cols.append(avg_rank[inv])
+        tie_frac.append(1.0 - vals.shape[0] / N)
+    tied = [j for j, f in enumerate(tie_frac)
+            if f > _GAUSSIANISE_TIE_WARN_FRACTION]
+    if tied:
+        warnings.warn(
+            f"gaussianise: column(s) {tied} have tied values (tie fraction "
+            f"{', '.join(f'{tie_frac[j]:.2f}' for j in tied)}); tied blocks "
+            f"map to one probit atom, so the transformed marginal is not "
+            f"Gaussian and the GMM fit may be degraded on heavily "
+            f"quantised data", RuntimeWarning, stacklevel=3)
+    p = torch.stack(cols, 1) / (N + 1.0)
     # ndtri/erfinv are JIT (nvrtc) kernels on CUDA and nvrtc rejects the
     # GB10 arch; this is one-off data prep, so run the probit on CPU
-    return torch.special.ndtri(p.cpu()).to(p.device)
+    return torch.special.ndtri(p.cpu()).to(dtype=X.dtype, device=X.device)
 
 
 class FittedGMM:
@@ -1152,6 +1183,9 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         If True, also return the selected model as a `FittedGMM` (refitted on
         the full data, warm-started from the CV-selected parameters — the
         same warm start the bootstrap replicates use), e.g. for plotting.
+        With preprocess='gaussianise' the returned model describes the
+        rank-probit-transformed data, not the original units (the rank
+        transform has no parametric inverse); a RuntimeWarning says so.
     device : str, default='cpu'
         Torch device on which to fit and integrate (e.g. 'cuda').
     dtype : torch.dtype, default=torch.float64
@@ -1177,8 +1211,12 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         diffeomorphisms, so this changes only the difficulty of the density
         estimation: heavy tails and monotone nonlinearities that would
         require many components (or defeat the fit entirely) are removed.
-        Rejected (ValueError) for the KL quantities, which are not invariant
-        under marginal transforms.
+        Tied values share their average rank, so quantised data maps tied
+        blocks to probit atoms (a RuntimeWarning is raised above a 1% tie
+        fraction: atoms are not Gaussian, and the invariance argument needs
+        a continuous variable in the first place). Rejected (ValueError) for
+        the KL quantities, which are not invariant under marginal
+        transforms.
     init_type : {'random_responsibilities', 'minmax', 'kmeans', 'randomized_kmeans'}, default='random_responsibilities'
         GMM initialisation scheme (torch ports of GMM-MI's initialisations).
         'random_responsibilities' is cheap and adequate for easy fits; the
@@ -1229,7 +1267,9 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     affinely mapped to zero mean and unit variance (the KL quantities use a
     single map shared by both columns, under which KL is invariant). All
     estimated quantities are exactly invariant under these maps, and the
-    `return_fit` model is transformed back, so the standardisation is
+    `return_fit` model is transformed back (only through this affine map:
+    with preprocess='gaussianise' the model stays in rank-probit space),
+    so the standardisation is
     unobservable except through `reg_covar` (now a scale-free floor), the
     `scale` argument of the minmax/randomized k-means initialisers (now in
     standardised units), and the absence of float32 failures on
@@ -1242,6 +1282,13 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
                 "preprocess='gaussianise' is invalid for KL quantities: "
                 "KL is not invariant under marginal transforms (the "
                 "gaussianised marginals have ~zero KL by construction)")
+        if return_fit:
+            warnings.warn(
+                "return_fit with preprocess='gaussianise': the returned "
+                "model is a fit to the rank-probit-transformed data, not "
+                "to the original units — the rank transform has no "
+                "parametric inverse. Its sample/score_samples/contours "
+                "live in gaussianised space.", RuntimeWarning, stacklevel=2)
         X = _rank_gaussianise(X)
     elif preprocess != 'none':
         raise ValueError(f"preprocess must be 'none' or 'gaussianise'; "

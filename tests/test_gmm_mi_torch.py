@@ -682,6 +682,53 @@ def test_chol_corrupted_component_recovers():
     assert torch.isfinite(L).all()
 
 
+def test_gaussianise_ties_average_rank_regression():
+    # review finding: positional (double-argsort) tie-breaking mapped a tied
+    # block to a monotone probit ramp in row order, fabricating MI whenever
+    # row order correlates with another variable. The worst case — a sorted
+    # variable next to a constant column — used to return ~1.06 nats; with
+    # average ranks the constant column carries no information and the MI
+    # must be consistent with zero. The heavy ties must also warn.
+    rng = np.random.default_rng(0)
+    X = np.column_stack([np.sort(rng.normal(size=4000)), np.zeros(4000)])
+    with pytest.warns(RuntimeWarning, match='tied values'):
+        mi_mean, mi_std = estimate(X, 'MI', preprocess='gaussianise',
+                                   max_components=3, n_bootstrap=10)
+    assert abs(mi_mean) < 0.05
+
+
+def test_gaussianise_matches_scipy_average_rankdata():
+    # the rank-probit transform must follow scipy's 'average' rankdata
+    # convention, computed at float64, on data with and without ties
+    from scipy.stats import norm, rankdata
+    E = gmm_mi_torch.estimator
+    rng = np.random.default_rng(1)
+    X = np.column_stack([rng.integers(0, 5, 300).astype(float),
+                         rng.normal(size=300)])
+    with pytest.warns(RuntimeWarning, match='tied values'):
+        out = E._rank_gaussianise(torch.as_tensor(X, dtype=torch.float64))
+    ref = norm.ppf(np.column_stack(
+        [rankdata(X[:, j], method='average') for j in range(2)])
+        / (X.shape[0] + 1))
+    assert np.allclose(out.cpu().numpy(), ref, atol=1e-12)
+
+
+def test_return_fit_gaussianise_warns_probit_space():
+    # return_fit with gaussianise cannot be returned in original units (the
+    # rank transform has no parametric inverse): it must warn, and the model
+    # it returns lives in rank-probit space (means ~0, not the data's ~100)
+    rho = 0.6
+    cov = np.array([[1.0, rho], [rho, 1.0]])
+    rng = np.random.default_rng(0)
+    X = rng.multivariate_normal([100.0, 100.0], cov, 4000)
+    with pytest.warns(RuntimeWarning, match='gaussianise'):
+        _, _, fit = estimate(X, 'MI', preprocess='gaussianise',
+                             max_components=3, n_bootstrap=5,
+                             return_fit=True)
+    mean_fit = (fit.weights_[:, None] * fit.means_).sum(0)
+    assert np.all(np.abs(mean_fit) < 1.0)
+
+
 def test_spike_pair_fp32_end_to_end():
     # beta-test regression: a pair of zero-inflated variables at float32 with
     # the tester's settings used to abort ("covariance factorisation failed
