@@ -10,7 +10,7 @@ g=torch.Generator(device='cuda').manual_seed(0)
 w,mu,cov=E._init_params(Xt,20,Ra,1e-6,generator=g,em_chunk=Ra)
 s=torch.ones(Ra,N,device='cuda')
 def step():
-    chol=E._chol(cov); logw=torch.log(w.clamp_min(1e-300))
+    chol=E._chol(cov)[0]; logw=torch.log(w.clamp_min(1e-300))
     Xr=Xt.expand(Ra,N,2)
     lj=logw.unsqueeze(1)+E.log_gauss(Xr,mu,chol)
     ll_n=torch.logsumexp(lj,-1); resp=torch.exp(lj-ll_n.unsqueeze(-1))

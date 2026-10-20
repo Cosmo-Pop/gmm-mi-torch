@@ -31,7 +31,7 @@ cd gmm-mi-torch
 pip install .          # or: pip install -e ".[test]"
 ```
 
-The only runtime dependency is `torch` (numpy inputs are accepted; tests additionally need `numpy` and `pytest`). The plotting helpers in `gmm_mi_torch.plotting` need `numpy`, `matplotlib` and `scipy`, installed via the `plot` extra: `pip install ".[plot]"`.
+The only runtime dependency is `torch` (numpy inputs are accepted; tests additionally need `numpy >= 2.0`, `scipy` and `pytest`, installed by the `test` extra). The plotting helpers in `gmm_mi_torch.plotting` need `numpy`, `matplotlib` and `scipy`, installed via the `plot` extra: `pip install ".[plot]"`.
 
 ## Quickstart
 
@@ -136,7 +136,7 @@ pytest                                                    # CPU, float64
 GMM_MI_DEVICE=cuda GMM_MI_DTYPE=float32 GMM_MI_EM_CHUNK=1000 pytest   # GPU, float32
 ```
 
-The suite (58 tests) checks analytic Gaussian targets, Monte-Carlo/quadrature targets for multimodal and non-Gaussian cases, chunking parity, categorical MI, and error paths; `tests/conftest.py` routes the whole suite to a device/dtype via the `GMM_MI_*` environment variables (tests that call internals directly always run on CPU at float64, whatever the variables say). One additional statistical test — bootstrap-errorbar coverage calibration over 40 independent datasets — is slow and therefore gated behind `GMM_MI_OFFLINE=1`.
+The suite checks analytic Gaussian targets, Monte-Carlo/quadrature targets for multimodal and non-Gaussian cases, chunking parity, categorical MI, and error paths; `tests/conftest.py` routes the whole suite to a device/dtype via the `GMM_MI_*` environment variables (tests that call internals directly ignore the variables and run on CPU, at float64 except for the float32-specific guard tests). Two tests are gated: the bootstrap-errorbar coverage calibration over 40 independent datasets (slow; runs under `GMM_MI_OFFLINE=1`) and the full-strength float32 spike-pair regression (runs when `GMM_MI_DEVICE=cuda` or `GMM_MI_OFFLINE=1`); a default CPU run skips both.
 
 For most readers, [docs/validation_summary.pdf](docs/validation_summary.pdf) is the right entry point to the validation results. The [validation/](validation/) directory additionally contains the full working report from the port's GB10 acceptance run ([validation/README.md](validation/README.md) explains its contents and provenance), kept in the repository for team review while it is private.
 
