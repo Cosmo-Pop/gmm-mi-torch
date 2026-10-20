@@ -139,13 +139,18 @@ def _run_chunked(n, chunk, fn):
 # ----------------------------------------------------------------------
 
 def _chol(cov):
-    """Cholesky of (R,K,d,d) covariances.
+    """Cholesky of (R,K,d,d) covariances; returns (chol, cov).
 
-    Dead components (zero cov) are padded to I.  A component whose
-    factorisation fails — round-off can make a near-degenerate covariance
-    indefinite, especially at float32 — gets escalating diagonal
-    regularisation scaled to its own mean variance until the factorisation
-    succeeds (with a RuntimeWarning): the per-component analogue of GMM-MI's
+    The returned covariance is the matrix that was actually factorised, and
+    every caller uses it in place of its input, so cov == chol @ chol^T is
+    an invariant: marginals and refactorisations downstream then describe
+    the same mixture the factor does.  Dead components (zero cov) are padded
+    to I.  A non-finite component is reset to I (with a RuntimeWarning).  A
+    component whose factorisation fails — round-off can make a
+    near-degenerate covariance indefinite, especially at float32 — gets
+    escalating diagonal regularisation scaled to its own largest absolute
+    diagonal entry until the factorisation succeeds (with a RuntimeWarning
+    reporting the cumulative bump): the per-component analogue of GMM-MI's
     refit-at-larger-reg_covar fallback, without abandoning the whole fit.
     """
     d = cov.shape[-1]
@@ -154,31 +159,37 @@ def _chol(cov):
     broken = ~torch.isfinite(cov).all(dim=(-2, -1))       # (R,K)
     safe = torch.where((dead | broken)[..., None, None], eye.expand_as(cov),
                        cov)
+    if bool(broken.any()):
+        warnings.warn(f"{int(broken.sum())} non-finite covariance(s) "
+                      f"reset to identity", RuntimeWarning, stacklevel=2)
     L, info = torch.linalg.cholesky_ex(safe)
     if not bool(info.any()):
-        if bool(broken.any()):
-            warnings.warn(f"{int(broken.sum())} non-finite covariance(s) "
-                          f"reset to identity", RuntimeWarning, stacklevel=2)
-        return L
+        return L, safe
     # positive by construction: a corrupted component can have a negative or
     # near-zero mean diagonal, which must not flip the bump's sign
     scale = torch.diagonal(safe, dim1=-2, dim2=-1).abs().amax(-1)
     scale = scale.clamp_min(torch.finfo(cov.dtype).tiny)      # (R,K)
-    bump = 1e-6
+    bump, total = 1e-6, 0.0
+    repaired = info > 0
     for _ in range(10):
         bad = info > 0
+        repaired = repaired | bad
         safe = torch.where(bad[..., None, None],
                            safe + (bump * scale)[..., None, None] * eye, safe)
+        total += bump
         L, info = torch.linalg.cholesky_ex(safe)
         if not bool(info.any()):
             warnings.warn(
-                f"{int(bad.sum())} covariance factorisation(s) needed extra "
-                f"diagonal regularisation (up to {bump:g} x largest "
-                f"diagonal entry)", RuntimeWarning, stacklevel=2)
-            return L
+                f"{int(repaired.sum())} covariance factorisation(s) needed "
+                f"extra diagonal regularisation (up to {total:g} x the "
+                f"component's largest absolute diagonal entry)",
+                RuntimeWarning, stacklevel=2)
+            return L, safe
         bump *= 10.0
-    raise RuntimeError("covariance factorisation failed even after diagonal "
-                       "regularisation up to 1e4 x mean variance")
+    raise RuntimeError(
+        f"covariance factorisation failed even after diagonal "
+        f"regularisation up to {total:g} x the component's largest "
+        f"absolute diagonal entry")
 
 
 def log_gauss(X, mu, chol):
@@ -284,7 +295,8 @@ def marginal_score(X_full, w, mu, cov, idx):
     torch.Tensor of shape (R, N)
     """
     mu_m, cov_m = marginal_params(mu, cov, idx)
-    return gmm_score(X_full[..., list(idx)], w, mu_m, _chol(cov_m))
+    chol_m, _ = _chol(cov_m)
+    return gmm_score(X_full[..., list(idx)], w, mu_m, chol_m)
 
 
 # ----------------------------------------------------------------------
@@ -339,7 +351,7 @@ def _gauss_coef(w, mu, cov):
     """
     dt = cov.dtype
     d = cov.shape[-1]
-    L = _chol(cov)
+    L, _ = _chol(cov)
     Y = _tri_inv(L)
     P = (Y.transpose(-2, -1) @ Y).double()                 # (R,K,d,d)
     logdet = torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1).double()
@@ -570,7 +582,8 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
             s = 1.0 if scale is None else float(scale)
             eps = torch.randn(R, K, d, dtype=dt, device=dev,
                               generator=generator)
-            push = (_chol(cov) @ eps.unsqueeze(-1)).squeeze(-1)
+            L, cov = _chol(cov)
+            push = (L @ eps.unsqueeze(-1)).squeeze(-1)
             mu = torch.where((w > 0)[..., None], mu + s * push, mu)
         return w, mu, cov
 
@@ -638,22 +651,25 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
     return tuple(torch.cat([o[j] for o in outs]) for j in range(4))
 
 
-def _em_step_nchunked(X, s, w, mu, cov, chol, logw, reg_covar, n_chunk):
+def _em_step_nchunked(X, s, w, mu, chol, logw, reg_covar, n_chunk):
     """One EM iteration accumulated over sample chunks (streaming M-step).
 
     Accumulates N_k, sum resp*(x - mu_old) and sum resp*(x - mu_old)(..)^T
     per sample-chunk; shifting the moments by the incoming means is algebraically
     identical to accumulating resp*x / resp*xx^T but avoids the fp32
-    cancellation of the origin-moment form when |mu|^2 >> var."""
+    cancellation of the origin-moment form when |mu|^2 >> var.  As in the
+    GEMM path, the cross-chunk accumulators run at float64 and the finished
+    diagonal is clamped back to the reg_covar floor, which float32 rounding
+    of the shifted moments can otherwise undercut."""
     Ra, N = s.shape
     d = X.shape[-1]
     K = w.shape[-1]
     dt, dev = X.dtype, X.device
-    eye = torch.eye(d, dtype=dt, device=dev)
-    Nk = torch.zeros(Ra, K, dtype=dt, device=dev)
-    Sd = torch.zeros(Ra, K, d, dtype=dt, device=dev)
-    Sdd = torch.zeros(Ra, K, d, d, dtype=dt, device=dev)
-    ll_sum = torch.zeros(Ra, dtype=dt, device=dev)
+    eye = torch.eye(d, dtype=torch.float64, device=dev)
+    Nk = torch.zeros(Ra, K, dtype=torch.float64, device=dev)
+    Sd = torch.zeros(Ra, K, d, dtype=torch.float64, device=dev)
+    Sdd = torch.zeros(Ra, K, d, d, dtype=torch.float64, device=dev)
+    ll_sum = torch.zeros(Ra, dtype=torch.float64, device=dev)
     for i in range(0, N, n_chunk):
         Xc = X[i:i+n_chunk]
         nc = Xc.shape[0]
@@ -663,25 +679,29 @@ def _em_step_nchunked(X, s, w, mu, cov, chol, logw, reg_covar, n_chunk):
         ll_n = torch.logsumexp(logjoint, dim=-1)
         resp = torch.exp(logjoint - ll_n.unsqueeze(-1))
         wr = resp * sc.unsqueeze(-1)
-        ll_sum += (sc * ll_n).sum(1)
-        Nk += wr.sum(1)
+        ll_sum += (sc * ll_n).sum(1).double()
+        Nk += wr.sum(1).double()
         diff = Xc.view(1, nc, 1, d) - mu.unsqueeze(1)            # (Ra,nc,K,d)
-        Sd += torch.einsum('rnk,rnkd->rkd', wr, diff)
-        Sdd += torch.einsum('rnk,rnki,rnkj->rkij', wr, diff, diff)
-    ll = ll_sum / s.sum(1)
+        Sd += torch.einsum('rnk,rnkd->rkd', wr, diff).double()
+        Sdd += torch.einsum('rnk,rnki,rnkj->rkij', wr, diff, diff).double()
+    ll = (ll_sum / s.sum(1).double()).to(dt)
     dead = Nk < 1e-10
     Nk_safe = Nk.clamp_min(1e-10)
     delta = Sd / Nk_safe.unsqueeze(-1)                           # mu_new-mu_old
-    mu_new = mu + delta
+    mu_new = mu.double() + delta
     cov_new = Sdd / Nk_safe[..., None, None] \
         - delta.unsqueeze(-1) * delta.unsqueeze(-2) + reg_covar * eye
+    # the shifted moments can round the variance below the reg_covar floor
+    # for a component collapsed onto near-duplicate points; restore the floor
+    diag = torch.diagonal(cov_new, dim1=-2, dim2=-1)
+    diag.clamp_(min=reg_covar)
     w_new = torch.where(dead, torch.zeros_like(Nk),
-                        Nk / s.sum(1, keepdim=True))
+                        Nk / s.sum(1, keepdim=True).double())
     w_new = w_new / w_new.sum(-1, keepdim=True).clamp_min(1e-30)
     mu_new = torch.where(dead[..., None], torch.zeros_like(mu_new), mu_new)
     cov_new = torch.where(dead[..., None, None], eye.expand_as(cov_new),
                           cov_new)
-    return ll, w_new, mu_new, cov_new
+    return ll, w_new.to(dt), mu_new.to(dt), cov_new.to(dt)
 
 
 def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500,
@@ -714,7 +734,7 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
                 ll, w, mu, cov = _em_step_gemm_nchunked(X, sa, w, mu, cov,
                                                         reg_covar, n_chunk)
         elif n_chunk is None:
-            chol = _chol(cov)
+            chol, cov = _chol(cov)
             logw = torch.where(w > 0, torch.log(w.clamp_min(1e-300)),
                                torch.full_like(w, -torch.inf))
             Xr = X.expand(Ra, N, X.shape[-1])
@@ -724,10 +744,10 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
             ll = (sa * ll_n).sum(1) / sa.sum(1)
             w, mu, cov = _m_step(Xr, resp, sa, reg_covar)
         else:
-            chol = _chol(cov)
+            chol, cov = _chol(cov)
             logw = torch.where(w > 0, torch.log(w.clamp_min(1e-300)),
                                torch.full_like(w, -torch.inf))
-            ll, w, mu, cov = _em_step_nchunked(X, sa, w, mu, cov, chol,
+            ll, w, mu, cov = _em_step_nchunked(X, sa, w, mu, chol,
                                                logw, reg_covar, n_chunk)
         done = (ll - prev).abs() < threshold_fit
         if done.any():
@@ -775,7 +795,7 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None):
             acc = acc + (s_val[:, i:i+(n_chunk or N)]
                          * torch.logsumexp(lj, -1)).sum(1)
         return acc / s_val.sum(1).clamp_min(1e-30)
-    chol = _chol(cov)
+    chol, _ = _chol(cov)
     if n_chunk is None:
         ll_n = gmm_score(X.expand(R, N, X.shape[-1]), w, mu, chol)
         return (s_val * ll_n).sum(1) / s_val.sum(1).clamp_min(1e-30)
@@ -1004,8 +1024,8 @@ def _integrand_KL_forward(pts, w, mu, cov, chol):
     x = pts[..., [0]]
     mu_x, cov_x = marginal_params(mu, cov, [0])
     mu_y, cov_y = marginal_params(mu, cov, [1])
-    return gmm_score(x, w, mu_x, _chol(cov_x)) \
-        - gmm_score(x, w, mu_y, _chol(cov_y))
+    return gmm_score(x, w, mu_x, _chol(cov_x)[0]) \
+        - gmm_score(x, w, mu_y, _chol(cov_y)[0])
 
 
 def _integrand_KL_reverse(pts, w, mu, cov, chol):
@@ -1013,8 +1033,8 @@ def _integrand_KL_reverse(pts, w, mu, cov, chol):
     y = pts[..., [1]]
     mu_x, cov_x = marginal_params(mu, cov, [0])
     mu_y, cov_y = marginal_params(mu, cov, [1])
-    return gmm_score(y, w, mu_y, _chol(cov_y)) \
-        - gmm_score(y, w, mu_x, _chol(cov_x))
+    return gmm_score(y, w, mu_y, _chol(cov_y)[0]) \
+        - gmm_score(y, w, mu_x, _chol(cov_x)[0])
 
 
 _INTEGRANDS = {'MI': _integrand_MI, 'cMI': _integrand_cMI, 'TC': _integrand_TC,
@@ -1077,17 +1097,22 @@ class FittedGMM:
     """
 
     def __init__(self, w, mu, cov):
-        self._w, self._mu, self._cov = w, mu, cov
+        # factorise once: if the back-transformed covariance needs repair,
+        # covariances_, sample and score_samples all describe the same
+        # (repaired) mixture, and the repair warning fires here, not on use
+        chol, cov = _chol(cov.unsqueeze(0))
+        self._w, self._mu, self._cov = w, mu, cov[0]
+        self._chol = chol[0]
         self.weights_ = w.cpu().numpy()
         self.means_ = mu.cpu().numpy()
-        self.covariances_ = cov.cpu().numpy()
+        self.covariances_ = self._cov.cpu().numpy()
         self.n_components = int(w.shape[0])
 
     def sample(self, n_samples, seed=0):
         """Draw `n_samples` from the mixture; returns a (n_samples, d) numpy array."""
         g = torch.Generator(device=self._w.device).manual_seed(seed)
         pts = gmm_sample(self._w.unsqueeze(0), self._mu.unsqueeze(0),
-                         _chol(self._cov.unsqueeze(0)), int(n_samples),
+                         self._chol.unsqueeze(0), int(n_samples),
                          generator=g)
         return pts[0].cpu().numpy()
 
@@ -1095,7 +1120,7 @@ class FittedGMM:
         """Mixture log-density at X of shape (n, d); returns a (n,) numpy array."""
         Xt = torch.as_tensor(X, dtype=self._mu.dtype, device=self._mu.device)
         ll = gmm_score(Xt.unsqueeze(0), self._w.unsqueeze(0),
-                       self._mu.unsqueeze(0), _chol(self._cov.unsqueeze(0)))
+                       self._mu.unsqueeze(0), self._chol.unsqueeze(0))
         return ll[0].cpu().numpy()
 
 
@@ -1379,7 +1404,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     w, mu, cov, _ = em_fit(X, s, w0, mu0, cov0, reg_covar, threshold_fit, max_iter,
                            em_chunk=em_chunk_boot, n_chunk=n_chunk)
 
-    chol = _chol(cov)
+    # write the repaired covariances back: the integrands' marginal scores
+    # refactorise cov, so sampling under the repaired factor while scoring
+    # marginals from the raw covariance would mix two different mixtures
+    chol, cov = _chol(cov)
 
     def _mc(sl):
         pts = gmm_sample(w[sl], mu[sl], chol[sl], mc_samples, generator=g)
@@ -1513,7 +1541,8 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         cov0 = cov1.unsqueeze(0).expand(B, K, 1, 1).contiguous()
         w, mu, cov, _ = em_fit(Xc, s, w0, mu0, cov0, reg_covar, threshold_fit, max_iter,
                                em_chunk=em_chunk_b, n_chunk=n_chunk)
-        fits.append((w, mu, cov, _chol(cov)))
+        chol, cov = _chol(cov)
+        fits.append((w, mu, cov, chol))
 
     g = torch.Generator(device=X.device).manual_seed(seed + 20_000)
     K_max = max(f[0].shape[1] for f in fits)

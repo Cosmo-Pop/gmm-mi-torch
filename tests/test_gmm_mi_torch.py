@@ -585,13 +585,16 @@ def test_return_fit_original_units():
 
 def test_chol_escalation_recovers():
     # a slightly indefinite covariance must be repaired by escalating
-    # diagonal regularisation, with a RuntimeWarning, not abort
+    # diagonal regularisation, with a RuntimeWarning, not abort; the
+    # returned covariance is the repaired one, so cov == L @ L^T holds
     E = gmm_mi_torch.estimator
     cov = torch.tensor([[[[1.0, 1.0 + 1e-6], [1.0 + 1e-6, 1.0]]]],
                        dtype=torch.float64)
     with pytest.warns(RuntimeWarning):
-        L = E._chol(cov)
+        L, cov_r = E._chol(cov)
     assert torch.isfinite(L).all()
+    assert torch.allclose(cov_r, L @ L.transpose(-2, -1), atol=1e-12)
+    assert not torch.equal(cov_r, cov)
 
 
 def test_gemm_step_matches_legacy_step_fp64():
@@ -603,7 +606,7 @@ def test_gemm_step_matches_legacy_step_fp64():
     g = torch.Generator().manual_seed(0)
     w, mu, cov = E._init_params(X, 4, 6, 1e-6, generator=g)
     s = torch.rand(6, 1500, dtype=torch.float64) + 0.5
-    chol = E._chol(cov)
+    chol, cov = E._chol(cov)
     logw = torch.log(w.clamp_min(1e-300))
     Xr = X.expand(6, 1500, 3)
     lj = logw.unsqueeze(1) + E.log_gauss(Xr, mu, chol)
@@ -673,13 +676,74 @@ def test_chol_corrupted_component_recovers():
     neg = torch.tensor([[[[-1.59e-6, -7.6e-8], [-7.6e-8, 1.03e-6]]]],
                        dtype=torch.float64)
     with pytest.warns(RuntimeWarning):
-        L = E._chol(neg)
+        L, _ = E._chol(neg)
     assert torch.isfinite(L).all()
     nan = torch.tensor([[[[float('nan'), 0.0], [0.0, 1.0]]]],
                        dtype=torch.float64)
     with pytest.warns(RuntimeWarning):
-        L = E._chol(nan)
+        L, nan_r = E._chol(nan)
     assert torch.isfinite(L).all()
+    assert torch.isfinite(nan_r).all()
+
+
+def test_chol_write_back_invariant_and_warning_counts():
+    # the repaired covariance returned by _chol must equal L @ L^T for every
+    # component (dead -> identity, non-finite -> identity, indefinite ->
+    # escalated); when a batch holds both a non-finite and an indefinite
+    # component, BOTH warnings must fire (the non-finite reset used to be
+    # swallowed whenever escalation also ran), with per-event counts
+    E = gmm_mi_torch.estimator
+    cov = torch.tensor([[[[float('nan'), 0.0], [0.0, 1.0]],   # non-finite
+                         [[-0.5, 0.0], [0.0, 1.0]],           # indefinite
+                         [[0.0, 0.0], [0.0, 0.0]],            # dead
+                         [[2.0, 0.3], [0.3, 1.0]]]],          # healthy
+                       dtype=torch.float64)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter('always')
+        L, cov_r = E._chol(cov)
+    msgs = [str(w.message) for w in rec
+            if issubclass(w.category, RuntimeWarning)]
+    assert any('1 non-finite' in m for m in msgs), msgs
+    assert any('1 covariance factorisation' in m for m in msgs), msgs
+    assert torch.allclose(cov_r, L @ L.transpose(-2, -1), atol=1e-12)
+    eye = torch.eye(2, dtype=torch.float64)
+    assert torch.equal(cov_r[0, 0], eye)       # non-finite reset
+    assert torch.equal(cov_r[0, 2], eye)       # dead padding
+    assert torch.equal(cov_r[0, 3], cov[0, 3])  # healthy untouched
+
+
+def test_mc_integrand_consistent_after_repair():
+    # review finding: the MC stage sampled the joint under the REPAIRED
+    # factor but scored marginals from the RAW covariance, mixing two
+    # mixtures. With the write-back, an independent (diagonal) repaired
+    # mixture must give an MI integrand of ~0: the marginals refactorised
+    # from the written-back covariance describe the sampled joint exactly.
+    E = gmm_mi_torch.estimator
+    cov = torch.tensor([[[[-0.5, 0.0], [0.0, 1.0]]]], dtype=torch.float64)
+    with pytest.warns(RuntimeWarning):
+        chol, cov_r = E._chol(cov)
+    w = torch.ones(1, 1, dtype=torch.float64)
+    mu = torch.zeros(1, 1, 2, dtype=torch.float64)
+    g = torch.Generator().manual_seed(0)
+    pts = E.gmm_sample(w, mu, chol, 20_000, generator=g)
+    v = E._integrand_MI(pts, w, mu, cov_r, chol).mean().item()
+    assert abs(v) < 1e-10
+
+
+def test_legacy_nchunk_mstep_covariance_floor():
+    # float32 rounding of the shifted moments can push a collapsed
+    # component's variance below the reg_covar floor (observed live on the
+    # GB10); the chunked legacy M-step must restore the floor. The inputs
+    # below give a pre-fix variance of -1.2e-4 (true variance 2.5e-7).
+    E = gmm_mi_torch.estimator
+    X = torch.tensor([[1.0], [1.0 + 1e-3]] * 50, dtype=torch.float32)
+    w = torch.ones(1, 1, dtype=torch.float32)
+    mu = torch.tensor([[[-30.0]]], dtype=torch.float32)
+    chol, _ = E._chol(torch.ones(1, 1, 1, 1, dtype=torch.float32))
+    logw = torch.zeros(1, 1, dtype=torch.float32)
+    s = torch.ones(1, X.shape[0], dtype=torch.float32)
+    _, _, _, cov2 = E._em_step_nchunked(X, s, w, mu, chol, logw, 1e-6, 16)
+    assert cov2[0, 0, 0, 0].item() >= np.float32(1e-6) * (1 - 1e-6)
 
 
 def test_gaussianise_ties_average_rank_regression():
