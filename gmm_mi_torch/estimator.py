@@ -286,6 +286,28 @@ def _mc_bytes_per_replicate(mc_samples, K, d, dtype):
     return mc_samples * K * dtype.itemsize * (3 * d + 2)
 
 
+def _n_rows(s):
+    """Replicate count of a per-replicate weight tensor whose leading dims
+    (all but the sample axis) form the replicate axis."""
+    return s.shape[:-1].numel()
+
+
+def _rows(s, sl):
+    """Rows [sl] of the per-replicate weights `s` along its flattened
+    leading dims. A 2-D `s` is sliced (a view of the caller's tensor); an
+    N-D `s` — typically an expand() view whose repeat structure (CV masks
+    tiled over inits and candidate k) must never be materialised — is
+    gathered into one (chunk, N) copy per replicate chunk."""
+    if s.dim() == 2:
+        return s[sl]
+    idx = torch.arange(sl.start, min(sl.stop, _n_rows(s)), device=s.device)
+    multi = []
+    for size in reversed(s.shape[:-1]):
+        multi.append(idx % size)
+        idx = idx // size
+    return s[tuple(reversed(multi))]
+
+
 def _run_chunked(n, chunk, fn):
     """Apply fn(slice) over [0, n) in chunks of `chunk`, halving the chunk
     and retrying on a CUDA out-of-memory error.  Results are chunk-invariant,
@@ -845,6 +867,10 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
     s : torch.Tensor of shape (n_replicates, n_samples)
         Per-replicate non-negative sample weights: 0/1 masks for CV folds,
         multinomial counts for bootstrap realisations, ones for a plain fit.
+        The replicate axis may be split over any number of leading dims
+        (shape (..., n_samples), R = their product, row-major): an
+        expand() view then stays a view, and each replicate chunk gathers
+        only its own (chunk, n_samples) rows.
     w, mu, cov : torch.Tensor
         Initial mixture parameters, shapes (R, K), (R, K, d), (R, K, d, d).
     reg_covar, threshold_fit, max_iter, n_chunk
@@ -868,9 +894,10 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
     `max_iter` without meeting `threshold_fit`; their last iterates are
     returned.
     """
-    R = s.shape[0]
+    R = _n_rows(s)
     outs = _run_chunked(R, em_chunk, lambda sl: _em_fit_core(
-        X, s[sl], w[sl], mu[sl], cov[sl], reg_covar, threshold_fit, max_iter, n_chunk))
+        X, _rows(s, sl), w[sl], mu[sl], cov[sl], reg_covar, threshold_fit,
+        max_iter, n_chunk))
     n_unconverged = sum(o[4] for o in outs)
     if n_unconverged:
         warnings.warn(
@@ -1111,7 +1138,8 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None, em_chunk=None):
     X : torch.Tensor of shape (n_samples, n_variables)
         Shared data.
     s_val : torch.Tensor of shape (n_replicates, n_samples)
-        Non-negative weights selecting (and weighting) the scored samples.
+        Non-negative weights selecting (and weighting) the scored samples;
+        the replicate axis may span several leading dims, as in `em_fit`.
     w, mu, cov : torch.Tensor
         Mixture parameters, shapes (R, K), (R, K, d), (R, K, d, d).
     n_chunk : int, optional
@@ -1127,10 +1155,10 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None, em_chunk=None):
         -inf for a replicate whose weights are all zero (an empty validation
         fold scores worse than any real fit, instead of a spurious 0).
     """
-    R = s_val.shape[0]
+    R = _n_rows(s_val)
     outs = _run_chunked(R, R if em_chunk is None else em_chunk,
-                        lambda sl: _val_ll_core(X, s_val[sl], w[sl], mu[sl],
-                                                cov[sl], n_chunk))
+                        lambda sl: _val_ll_core(X, _rows(s_val, sl), w[sl],
+                                                mu[sl], cov[sl], n_chunk))
     n_rerouted = sum(o[1] for o in outs)
     if n_rerouted:
         warnings.warn(
@@ -1219,22 +1247,27 @@ def _validate_folds(N, n_folds, what='X'):
                          f"in {what}")
 
 
-def _cv_masks(N, n_folds, n_inits, dtype, seed=42):
-    """0/1 train masks and val masks, shape (n_inits*n_folds, N).
+def _cv_masks(N, n_folds, n_inits, dtype, seed=42, device='cpu'):
+    """0/1 train masks and val masks, shape (n_inits, n_folds, N), as
+    expand() views over the inits of one (n_folds, N) mask pair living on
+    `device` — em_fit/val_ll gather the rows each replicate chunk needs, so
+    the tiling over inits (and over candidate k in select_batched) costs
+    nothing. The base masks are moved to the device BEFORE expanding:
+    .to() on an expanded view would materialise it.
 
     Factories are pinned to the CPU: the masks are built with a CPU
-    generator and moved by the caller, and torch.set_default_device('cuda')
-    must not reroute them mid-construction."""
+    generator, and torch.set_default_device('cuda') must not reroute them
+    mid-construction."""
     g = torch.Generator().manual_seed(seed)
     perm = torch.randperm(N, generator=g, device='cpu')
     fold_id = torch.zeros(N, dtype=torch.long, device='cpu')
     for f in range(n_folds):
         fold_id[perm[f::n_folds]] = f
-    val = torch.stack([(fold_id == f).to(dtype) for f in range(n_folds)])  # CPU; moved by caller
-    train = 1.0 - val
-    train = train.repeat(n_inits, 1)                      # (I*F, N)
-    val = val.repeat(n_inits, 1)
-    return train, val
+    val = torch.stack([(fold_id == f).to(dtype) for f in range(n_folds)])
+    train = (1.0 - val).to(device)
+    val = val.to(device)
+    return (train.unsqueeze(0).expand(n_inits, n_folds, N),
+            val.unsqueeze(0).expand(n_inits, n_folds, N))
 
 
 def _cv_fit_for_k(X, K, n_folds, n_inits, reg_covar, threshold_fit, max_iter, seed, em_chunk=8,
@@ -1243,9 +1276,8 @@ def _cv_fit_for_k(X, K, n_folds, n_inits, reg_covar, threshold_fit, max_iter, se
     """CV fits for a single k, batched over inits x folds."""
     g = torch.Generator(device=X.device).manual_seed(seed + K)
     train, val = _cv_masks(X.shape[0], n_folds, n_inits, X.dtype,
-                           seed=seed + _CV_MASK_SEED_OFFSET)
-    train, val = train.to(X.device), val.to(X.device)
-    R = train.shape[0]
+                           seed=seed + _CV_MASK_SEED_OFFSET, device=X.device)
+    R = n_inits * n_folds
     w0, mu0, cov0 = _init_params(X, K, R, reg_covar, generator=g,
                                  init_type=init_type, scale=scale, em_chunk=em_chunk)
     w, mu, cov, _ = em_fit(X, train, w0, mu0, cov0, reg_covar, threshold_fit, max_iter,
@@ -1365,11 +1397,14 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
     N, d = X.shape
     _validate_folds(N, n_folds)
     train, val = _cv_masks(N, n_folds, n_inits, X.dtype,
-                           seed=seed + _CV_MASK_SEED_OFFSET)
-    train, val = train.to(X.device), val.to(X.device)
-    IF = train.shape[0]
+                           seed=seed + _CV_MASK_SEED_OFFSET, device=X.device)
+    IF = n_inits * n_folds
     R = max_components * IF
-    train_r, val_r = train.repeat(max_components, 1), val.repeat(max_components, 1)
+    # (K, I, F, N) views of the (F, N) masks: em_fit/val_ll gather one
+    # (chunk, N) slice per replicate chunk, so the 2(K+1)*I*F*N*itemsize
+    # of repeated masks (40 GiB of the README's 77.5 GiB N=1e8 peak) is gone
+    train_r = train.unsqueeze(0).expand(max_components, n_inits, n_folds, N)
+    val_r = val.unsqueeze(0).expand(max_components, n_inits, n_folds, N)
     active_k = torch.arange(1, max_components + 1, device=X.device).repeat_interleave(IF)
     g = torch.Generator(device=X.device).manual_seed(seed)
     w0, mu0, cov0 = _init_params(X, max_components, R, reg_covar, generator=g,
@@ -1396,7 +1431,8 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
         best_f_k = v[torch.arange(max_components), best_i_k].argmax(-1)
         rk = torch.arange(max_components, device=X.device) * IF \
             + best_i_k * n_folds + best_f_k
-        ones = torch.ones(max_components, N, dtype=X.dtype, device=X.device)
+        ones = torch.ones(1, N, dtype=X.dtype, device=X.device) \
+            .expand(max_components, N)
         wf, muf, covf, _ = em_fit(X, ones, w[rk], mu[rk], cov[rk], reg_covar, threshold_fit,
                                   max_iter, em_chunk=em_chunk, n_chunk=n_chunk)
         # score the parameters the refit RETURNS: em_fit's ll lags them by
