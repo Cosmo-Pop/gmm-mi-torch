@@ -2094,3 +2094,120 @@ def test_moment_gemm_peak_on_device():
             torch.cuda.synchronize()
         peak = torch.cuda.max_memory_allocated() - base
         assert peak <= 1.75 * R * N * K * 4, (N, peak / (R * N * K * 4))
+
+
+def test_byte_models_and_fixed_cost():
+    # hardening batch 4: the auto-chunk models re-derived on the GB10
+    # (validation/bench_mem_models.py). Unit-level pins on their shape;
+    # the measured-peak comparison itself is the bench script's job.
+    E = gmm_mi_torch.estimator
+    f32 = torch.float32
+    em = [E._em_bytes_per_replicate(1000, K, 2, f32) for K in (1, 2, 3, 20)]
+    assert all(b > a for a, b in zip(em, em[1:]))
+    if E._EM_KERNEL == 'gemm':
+        # small K is dominated by the (R,N) temporaries, not by 3K
+        assert E._em_bytes_per_replicate(1000, 1, 2, f32) >= 1000 * 4 * 7
+        assert E._em_bytes_per_replicate(1000, 1, 2, f32) < 1000 * 4 * 9
+        assert E._em_fixed_bytes(1000, 8, f32) == 2 * 1000 * 44 * 4
+        assert E._em_fixed_bytes(1000, 8, f32, n_chunk=100) == 2 * 100 * 44 * 4
+    else:
+        assert E._em_fixed_bytes(1000, 8, f32) == 0
+    # n_chunk caps the per-replicate term; the init stage ignores it and
+    # carries the broadcast (4d+2)K legacy peak over the full N
+    assert E._em_bytes_per_replicate(10**6, 3, 2, f32, n_chunk=1000) \
+        == E._em_bytes_per_replicate(1000, 3, 2, f32)
+    init = E._init_bytes_per_replicate(1000, 20, 8, f32, 'random_responsibilities')
+    assert init >= 1000 * 4 * (34 * 20)
+    assert E._init_bytes_per_replicate(1000, 20, 8, f32, 'kmeans') == init
+    assert E._init_bytes_per_replicate(1000, 20, 8, f32, 'minmax') \
+        == E._em_bytes_per_replicate(1000, 20, 8, f32)
+    # the MC model is bounded below by gmm_sample's (S,d,d) gather at K=1
+    assert E._mc_bytes_per_replicate(1000, 1, 8, f32) >= 1000 * 4 * 98
+    assert E._mc_bytes_per_replicate(1000, 20, 8, f32) >= 1000 * 4 * (25 * 20)
+    # a stage's fixed allocation comes off the budget before the division
+    saved = torch.cuda.mem_get_info
+    torch.cuda.mem_get_info = lambda dev=None: (2 * 10**9, 4 * 10**9)
+    try:
+        n0 = E._auto_chunk(1000, 10**7, 'cuda')
+        n1 = E._auto_chunk(1000, 10**7, 'cuda', fixed_bytes=5 * 10**8)
+        assert n1 == n0 - 50
+        assert E._resolve_chunk('auto', 1000, 10**7, 'cuda',
+                                fixed_bytes=5 * 10**8) == n1
+        assert E._resolve_chunk(7, 1000, 10**7, 'cuda', fixed_bytes=10**12) == 7
+    finally:
+        torch.cuda.mem_get_info = saved
+
+
+def test_init_stage_sized_apart_from_em():
+    # 'auto' sizes the init stage from its own model: at K=20, d=2 the init
+    # peak per replicate is (4d+3)K+4 = 224 units against the EM step's
+    # ~44, so under a tight (mocked) memory budget the init batch must be
+    # smaller than the EM batch; an integer em_chunk is honoured by both
+    E = gmm_mi_torch.estimator
+    seen = {}
+    orig_init, orig_em = E._init_params, E.em_fit
+
+    def spy_init(*a, **k):
+        seen['init'] = k['em_chunk']
+        return orig_init(*a, **k)
+
+    def spy_em(*a, **k):
+        seen.setdefault('em', k['em_chunk'])
+        return orig_em(*a, **k)
+    saved = (E._init_params, E.em_fit, torch.cuda.mem_get_info)
+    E._init_params, E.em_fit = spy_init, spy_em
+    torch.cuda.mem_get_info = lambda dev=None: (10**9, 10**9)
+    try:
+        X = torch.randn(20000, 2, dtype=torch.float32)
+        E._select_and_fit(X, 'batched', None, 20, 2, 3, 1e-6, 1e-5, 2, 0,
+                          'auto', 'minmax', None, 'valid', 1e-5, 1, None)
+        if torch.cuda.is_available():
+            # only a CUDA device resolves 'auto' from the models (and
+            # bypasses the floor at this budget); CPU returns 8 for both
+            Xc = X.cuda()
+            seen.clear()
+            E._select_and_fit(Xc, 'batched', None, 20, 2, 3, 1e-6, 1e-5, 2,
+                              0, 'auto', 'random_responsibilities', None,
+                              'valid', 1e-5, 1, None)
+            if E._EM_KERNEL == 'gemm':
+                assert seen['init'] < seen['em'], seen
+            else:
+                # the legacy EM model ((4d+4)K) is the larger one there, so
+                # both land on the floor at this budget
+                assert seen['init'] >= seen['em'], seen
+        seen.clear()
+        E._select_and_fit(X, 'batched', None, 3, 2, 3, 1e-6, 1e-5, 2, 0,
+                          5, 'minmax', None, 'valid', 1e-5, 1, None)
+        assert seen == {'init': 5, 'em': 5}
+    finally:
+        E._init_params, E.em_fit, torch.cuda.mem_get_info = saved
+
+
+def test_partition_rows_gathered_per_chunk_bitwise():
+    # the rerouted/GEMM partition used to gather s[gi]/s[li] up front — an
+    # (R,N) copy per partition per iteration, N/n_chunk units of the
+    # streamed budget. The rows are now gathered per sample chunk; the
+    # result must be bitwise the per-replicate (unpartitioned) answer at
+    # every em_chunk and n_chunk, and identical to the up-front gather.
+    E = gmm_mi_torch.estimator
+    if E._EM_KERNEL != 'gemm':
+        pytest.skip('partition exists only under the GEMM kernels')
+    g = torch.Generator().manual_seed(0)
+    X = torch.randn(3000, 2, dtype=torch.float32, generator=g)
+    X = (X - X.mean(0)) / X.std(0)
+    w0, mu0, cov0 = E._init_params(X, 2, 6, 1e-6, generator=g,
+                                   init_type='minmax')
+    # collapse one component far from the origin in half the replicates
+    mu0[::2, 0] = 4.0
+    cov0[::2, 0] = 1e-6 * torch.eye(2)
+    s = torch.rand(6, 3000, generator=g) + 0.5
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        for n_chunk in (None, 700):
+            ref = E.em_fit(X, s, w0, mu0, cov0, em_chunk=1, max_iter=6,
+                           n_chunk=n_chunk)
+            for em_chunk in (6, 2):
+                out = E.em_fit(X, s, w0, mu0, cov0, em_chunk=em_chunk,
+                               max_iter=6, n_chunk=n_chunk)
+                for a, b in zip(ref, out):
+                    assert torch.equal(a, b), (n_chunk, em_chunk)

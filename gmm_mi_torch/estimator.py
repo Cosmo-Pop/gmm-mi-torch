@@ -163,22 +163,35 @@ _MC_CAT_STRIDE = 1 << 20
 # per-column permutations are independent).
 _TIE_SEED_OFFSET = 40_000
 
-# Auto-sizing of the replicate chunks (em_chunk / mc_chunk = 'auto').  Peak
-# memory of one EM iteration is replicates x N_eff x K x itemsize x (4d+3),
-# and of one MC chunk replicates x mc_samples x K x itemsize x (3d+1); both
-# measured on GB10 to within 2% over d=1..8, K=5..20, fp32/fp64
-# (validation/bench_mem.py).  The models below carry one extra unit of
-# slack; the EM model describes the legacy kernels, and the GEMM kernels
-# use the smaller model in _em_bytes_per_replicate.  The CUDA floor of 32
-# keeps small problems reasonably batched; 'auto' normally sizes far above
-# it.  CPU keeps the historical default.
+# Auto-sizing of the replicate chunks (em_chunk / mc_chunk = 'auto'). The
+# per-replicate peak-memory models below were re-derived on the GB10 over
+# K = 1..20 and d = 1..8 at fp32/fp64 (validation/bench_mem_models.py,
+# hardening pass of 2026-10-21), in units of N_eff x itemsize per
+# replicate, and carry one to two units of slack over the measured peaks:
+#   GEMM EM step      max(K+4, 2K) + 3Kq/block   (E-step: one (R,N,K)
+#                     buffer plus four (R,N) temporaries; M-step: the
+#                     buffer plus its one blocked copy and the block
+#                     outputs; q = d + d(d+1)/2)
+#   legacy EM step    (4d+4)K + ~2                (broadcast (R,N,K,d)
+#                     operands; the rerouted replicates stream their
+#                     samples so they fit the GEMM budget — _em_fit_core)
+#   init stage        (4d+2)K + ~3 for the default and k-means inits,
+#                     over the FULL N (it ignores n_chunk); ~0 for minmax
+#   MC stage          max((3d+1)K + d + 3, d^2 + 4d + 2) per mc_sample, +4
+#                     (integrand with its analytic marginals; gmm_sample's
+#                     (S,d,d) Cholesky gather dominates at small K)
+# The CUDA floor of 32 keeps small problems reasonably batched and may
+# never exceed what fits in the free memory. CPU keeps the historical
+# default.
 _AUTO_CHUNK_MEM_FRACTION = 0.5      # of the free device memory at call time
 _AUTO_CHUNK_MIN = 32
 _AUTO_CHUNK_CPU_DEFAULT = 8
 
 
-def _auto_chunk(n_items, bytes_per_item, device, default=_AUTO_CHUNK_CPU_DEFAULT):
-    """Chunk size for `n_items` replicates costing `bytes_per_item` each.
+def _auto_chunk(n_items, bytes_per_item, device, default=_AUTO_CHUNK_CPU_DEFAULT,
+                fixed_bytes=0):
+    """Chunk size for `n_items` replicates costing `bytes_per_item` each,
+    after `fixed_bytes` the stage allocates once regardless of the chunk.
 
     `default` on CPU; on CUDA, as many items as fit in a fraction of the free
     device memory, floored at _AUTO_CHUNK_MIN and capped at n_items.
@@ -187,16 +200,18 @@ def _auto_chunk(n_items, bytes_per_item, device, default=_AUTO_CHUNK_CPU_DEFAULT
     if dev.type != 'cuda':
         return max(1, min(int(n_items), int(default)))
     free, _ = torch.cuda.mem_get_info(dev)
-    n = int(free * _AUTO_CHUNK_MEM_FRACTION // max(int(bytes_per_item), 1))
+    n = int((free * _AUTO_CHUNK_MEM_FRACTION - fixed_bytes)
+            // max(int(bytes_per_item), 1))
     return max(1, min(int(n_items), max(_AUTO_CHUNK_MIN, n)))
 
 
-def _resolve_chunk(value, n_items, bytes_per_item, device):
+def _resolve_chunk(value, n_items, bytes_per_item, device, fixed_bytes=0):
     """Turn an `em_chunk` / `mc_chunk` argument ('auto' or int) into an int."""
     if isinstance(value, str):
         if value != 'auto':
             raise ValueError(f"chunk must be a positive int or 'auto'; found '{value}'")
-        return _auto_chunk(n_items, bytes_per_item, device)
+        return _auto_chunk(n_items, bytes_per_item, device,
+                           fixed_bytes=fixed_bytes)
     value = int(value)
     if value < 1:
         raise ValueError(f"chunk must be a positive int or 'auto'; found {value}")
@@ -276,14 +291,37 @@ def _em_bytes_per_replicate(N, K, d, dtype, n_chunk=None):
     """Peak memory per EM replicate, from the measured model above."""
     n_eff = N if n_chunk is None else min(N, int(n_chunk))
     if _EM_KERNEL == 'gemm':
-        # one live (R,N,K) buffer plus GEMM workspace and slack
-        return n_eff * K * dtype.itemsize * 3
-    return n_eff * K * dtype.itemsize * (4 * d + 4)
+        q = d + d * (d + 1) // 2
+        units = max(K + 6, 2 * K + 3) + 3.0 * K * q / _MSTEP_BLOCK
+    else:
+        units = (4 * d + 4) * K + 4
+    return int(1.03 * n_eff * dtype.itemsize * units)   # 3%: allocator rounding
+
+
+def _em_fixed_bytes(N, d, dtype, n_chunk=None):
+    """What an EM/val_ll stage allocates once, whatever the replicate
+    chunk: the (N_eff, q) quadratic features of the GEMM path (the whole
+    (N, q) in the single-pass path, one sample chunk's in the streamed)."""
+    if _EM_KERNEL != 'gemm':
+        return 0
+    n_eff = N if n_chunk is None else min(N, int(n_chunk))
+    # the features plus the product temporary they are assembled from
+    return 2 * n_eff * (d + d * (d + 1) // 2) * dtype.itemsize
+
+
+def _init_bytes_per_replicate(N, K, d, dtype, init_type):
+    """Peak memory per replicate of the initialisation stage: the default
+    and k-means inits run the broadcast M-step / assignment statistics over
+    the full N (n_chunk does not apply); minmax allocates nothing of note."""
+    if init_type == 'minmax':
+        return _em_bytes_per_replicate(N, K, d, dtype)
+    return int(N * dtype.itemsize * ((4 * d + 3) * K + 4))
 
 
 def _mc_bytes_per_replicate(mc_samples, K, d, dtype):
     """Peak memory per MC-integration replicate, from the model above."""
-    return mc_samples * K * dtype.itemsize * (3 * d + 2)
+    return int(1.03 * mc_samples * dtype.itemsize
+               * max((3 * d + 1) * K + d + 7, d * d + 4 * d + 6))
 
 
 def _n_rows(s):
@@ -674,9 +712,14 @@ def _mstep_gemm(F, resp, s, reg_covar, d):
                                F.dtype)
 
 
-def _em_step_gemm_nchunked(X, s, w, mu, cov, reg_covar, n_chunk):
-    """One GEMM EM iteration streamed over sample chunks (float64 moments)."""
+def _em_step_gemm_nchunked(X, s, w, mu, cov, reg_covar, n_chunk, rows=None):
+    """One GEMM EM iteration streamed over sample chunks (float64 moments).
+    With `rows`, only those replicates of `s` take part, gathered one
+    sample chunk at a time (an up-front s[rows] would be an (R,N) copy —
+    N/n_chunk units of the streamed budget)."""
     Ra, N = s.shape
+    if rows is not None:
+        Ra = rows.numel()
     d = X.shape[-1]
     K = w.shape[-1]
     dt, dev = X.dtype, X.device
@@ -688,6 +731,8 @@ def _em_step_gemm_nchunked(X, s, w, mu, cov, reg_covar, n_chunk):
     for i in range(0, N, n_chunk):
         Fc = _features(X[i:i+n_chunk])
         sc = s[:, i:i+n_chunk]
+        if rows is not None:
+            sc = sc[rows]
         lj = torch.matmul(Fc.unsqueeze(0), coef.transpose(1, 2))
         lj += const.unsqueeze(1)
         m = lj.amax(-1, keepdim=True)
@@ -698,8 +743,10 @@ def _em_step_gemm_nchunked(X, s, w, mu, cov, reg_covar, n_chunk):
         Nk += wr.sum(1).double()
         S += _moment_gemm(wr, Fc)
         ll_sum += (sc * ll_n).sum(1).double()
-    ll = (ll_sum / s.sum(1).double()).to(dt)
-    w_new, mu_new, cov_new = _mstep_from_moments(S, Nk, s.sum(1), reg_covar, d, dt)
+        del lj, wr      # not carried into the next chunk's allocation
+    tot = s.sum(1) if rows is None else s.sum(1)[rows]
+    ll = (ll_sum / tot.double()).to(dt)
+    w_new, mu_new, cov_new = _mstep_from_moments(S, Nk, tot, reg_covar, d, dt)
     return ll, w_new, mu_new, cov_new
 
 
@@ -935,7 +982,8 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
     return tuple(torch.cat([o[j] for o in outs]) for j in range(4))
 
 
-def _em_step_nchunked(X, s, w, mu, chol, logw, reg_covar, n_chunk):
+def _em_step_nchunked(X, s, w, mu, chol, logw, reg_covar, n_chunk,
+                      rows=None):
     """One EM iteration accumulated over sample chunks (streaming M-step).
 
     Accumulates N_k, sum resp*(x - mu_old) and sum resp*(x - mu_old)(..)^T
@@ -944,8 +992,11 @@ def _em_step_nchunked(X, s, w, mu, chol, logw, reg_covar, n_chunk):
     cancellation of the origin-moment form when |mu|^2 >> var.  As in the
     GEMM path, the cross-chunk accumulators run at float64 and the finished
     diagonal is clamped back to the reg_covar floor, which float32 rounding
-    of the shifted moments can otherwise undercut."""
+    of the shifted moments can otherwise undercut. `rows` as in
+    _em_step_gemm_nchunked."""
     Ra, N = s.shape
+    if rows is not None:
+        Ra = rows.numel()
     d = X.shape[-1]
     K = w.shape[-1]
     dt, dev = X.dtype, X.device
@@ -958,6 +1009,8 @@ def _em_step_nchunked(X, s, w, mu, chol, logw, reg_covar, n_chunk):
         Xc = X[i:i+n_chunk]
         nc = Xc.shape[0]
         sc = s[:, i:i+n_chunk]
+        if rows is not None:
+            sc = sc[rows]
         logjoint = logw.unsqueeze(1) + log_gauss(Xc.expand(Ra, nc, d),
                                                  mu, chol)       # (Ra,nc,K)
         ll_n = torch.logsumexp(logjoint, dim=-1)
@@ -968,7 +1021,8 @@ def _em_step_nchunked(X, s, w, mu, chol, logw, reg_covar, n_chunk):
         diff = Xc.view(1, nc, 1, d) - mu.unsqueeze(1)            # (Ra,nc,K,d)
         Sd += torch.einsum('rnk,rnkd->rkd', wr, diff).double()
         Sdd += torch.einsum('rnk,rnki,rnkj->rkij', wr, diff, diff).double()
-    ll = (ll_sum / s.sum(1).double()).to(dt)
+    tot = s.sum(1) if rows is None else s.sum(1)[rows]
+    ll = (ll_sum / tot.double()).to(dt)
     dead = Nk < 1e-10
     Nk_safe = Nk.clamp_min(1e-10)
     delta = Sd / Nk_safe.unsqueeze(-1)                           # mu_new-mu_old
@@ -980,7 +1034,7 @@ def _em_step_nchunked(X, s, w, mu, chol, logw, reg_covar, n_chunk):
     diag = torch.diagonal(cov_new, dim1=-2, dim2=-1)
     diag.clamp_(min=reg_covar)
     w_new = torch.where(dead, torch.zeros_like(Nk),
-                        Nk / s.sum(1, keepdim=True).double())
+                        Nk / tot.unsqueeze(-1).double())
     w_new = w_new / w_new.sum(-1, keepdim=True).clamp_min(1e-30)
     mu_new = torch.where(dead[..., None], torch.zeros_like(mu_new), mu_new)
     cov_new = torch.where(dead[..., None, None], eye.expand_as(cov_new),
@@ -1060,12 +1114,14 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
     gemm = _EM_KERNEL == 'gemm'
     F = _features(X) if gemm and n_chunk is None else None
     # sticky per-replicate reroute mask over the active set; the legacy step
-    # streams its samples so the (4d+4) legacy peak stays inside the 3x GEMM
-    # budget the replicate chunk was sized with
+    # streams its samples in chunks of nl so its (4d+4)K-per-sample peak
+    # stays inside the GEMM budget the replicate chunk was sized with
+    # (three quarters of it: the partition's (R,N) gathers take the rest)
     leg = torch.zeros(R, dtype=torch.bool, device=dev)
     n_rerouted = 0
-    nl = max(1, (3 * (N if n_chunk is None else min(N, n_chunk)))
-             // (4 * d + 4))
+    K = w.shape[-1]
+    nl = max(1, int(0.75 * _em_bytes_per_replicate(N, K, d, X.dtype, n_chunk))
+             // (K * X.dtype.itemsize * (4 * d + 4)))
     for _ in range(max_iter):
         Ra = ai.shape[0]
         if gemm:
@@ -1083,6 +1139,10 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
             if n_chunk is None:
                 resp, ll = _estep_gemm(F, sa, w, mu, cov)
                 w, mu, cov = _mstep_gemm(F, resp, sa, reg_covar, X.shape[-1])
+                # release the consumed responsibilities now: left bound,
+                # they would stay allocated through the next E-step and
+                # double the (R,N,K) peak (measured 2K+4 -> K+4 units)
+                del resp
             else:
                 ll, w, mu, cov = _em_step_gemm_nchunked(X, sa, w, mu, cov,
                                                         reg_covar, n_chunk)
@@ -1096,9 +1156,11 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
                 if n_chunk is None:
                     resp, llg = _estep_gemm(F, sa[gi], w[gi], mu[gi], cov[gi])
                     wg, mug, covg = _mstep_gemm(F, resp, sa[gi], reg_covar, d)
+                    del resp
                 else:
                     llg, wg, mug, covg = _em_step_gemm_nchunked(
-                        X, sa[gi], w[gi], mu[gi], cov[gi], reg_covar, n_chunk)
+                        X, sa, w[gi], mu[gi], cov[gi], reg_covar, n_chunk,
+                        rows=gi)
                 ll[gi] = llg
                 w_n[gi], mu_n[gi], cov_n[gi] = wg, mug, covg
             if li.numel():
@@ -1107,7 +1169,8 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
                     w[li] > 0, torch.log(w[li].clamp_min(1e-300)),
                     torch.full_like(w[li], -torch.inf))
                 lll, wl, mul, covl = _em_step_nchunked(
-                    X, sa[li], w[li], mu[li], chol_l, logw_l, reg_covar, nl)
+                    X, sa, w[li], mu[li], chol_l, logw_l, reg_covar, nl,
+                    rows=li)
                 ll[li] = lll
                 w_n[li], mu_n[li], cov_n[li] = wl, mul, covl
             w, mu, cov = w_n, mu_n, cov_n
@@ -1288,14 +1351,18 @@ def _cv_masks(N, n_folds, n_inits, dtype, seed=42, device='cpu'):
 
 def _cv_fit_for_k(X, K, n_folds, n_inits, reg_covar, threshold_fit, max_iter, seed, em_chunk=8,
                   init_type='random_responsibilities', scale=None,
-                  n_chunk=None):
-    """CV fits for a single k, batched over inits x folds."""
+                  n_chunk=None, init_chunk=None):
+    """CV fits for a single k, batched over inits x folds. `init_chunk`
+    (default em_chunk) batches the initialisation stage, whose peak per
+    replicate differs from the EM step's (see _init_bytes_per_replicate)."""
     g = torch.Generator(device=X.device).manual_seed(seed + K)
     train, val = _cv_masks(X.shape[0], n_folds, n_inits, X.dtype,
                            seed=seed + _CV_MASK_SEED_OFFSET, device=X.device)
     R = n_inits * n_folds
     w0, mu0, cov0 = _init_params(X, K, R, reg_covar, generator=g,
-                                 init_type=init_type, scale=scale, em_chunk=em_chunk)
+                                 init_type=init_type, scale=scale,
+                                 em_chunk=em_chunk if init_chunk is None
+                                 else init_chunk)
     w, mu, cov, _ = em_fit(X, train, w0, mu0, cov0, reg_covar, threshold_fit, max_iter,
                            em_chunk=em_chunk, n_chunk=n_chunk)
     v = val_ll(X, val, w, mu, cov, n_chunk=n_chunk,
@@ -1312,7 +1379,7 @@ def select_sequential(X, max_components=20, n_folds=2, n_inits=3,
                       threshold_components=1e-5, patience=1, reg_covar=1e-6, threshold_fit=1e-5,
                       max_iter=500, seed=0, em_chunk=8,
                       init_type='random_responsibilities', scale=None,
-                      n_chunk=None):
+                      n_chunk=None, init_chunk=None):
     """Select the number of components by GMM-MI's sequential protocol.
 
     Components are added one at a time; the search stops when the validation
@@ -1339,6 +1406,10 @@ def select_sequential(X, max_components=20, n_folds=2, n_inits=3,
     n_folds, n_inits, reg_covar, threshold_fit, max_iter, seed, em_chunk,
     init_type, scale, n_chunk
         As in `estimate`.
+    init_chunk : int, optional
+        Replicates per batch for the initialisation stage (default
+        em_chunk); `estimate` sizes it from the init stage's own memory
+        model.
 
     Returns
     -------
@@ -1355,7 +1426,7 @@ def select_sequential(X, max_components=20, n_folds=2, n_inits=3,
         metric, params = _cv_fit_for_k(X, K, n_folds, n_inits, reg_covar, threshold_fit,
                                        max_iter, seed, em_chunk=em_chunk,
                                        init_type=init_type, scale=scale,
-                                       n_chunk=n_chunk)
+                                       n_chunk=n_chunk, init_chunk=init_chunk)
         history[K] = (metric, params)
         if metric - best_metric > threshold_components:
             best_metric, best_k, pat = metric, K, 0
@@ -1373,7 +1444,7 @@ def select_sequential(X, max_components=20, n_folds=2, n_inits=3,
 def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_components=1e-5,
                    reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, seed=0, em_chunk=8,
                    init_type='random_responsibilities', scale=None,
-                   metric_method='valid', n_chunk=None):
+                   metric_method='valid', n_chunk=None, init_chunk=None):
     """Select the number of components with all candidate k fitted at once.
 
     Every k = 1..max_components (times inits and folds) is fitted as a single
@@ -1399,6 +1470,9 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
     n_folds, n_inits, reg_covar, threshold_fit, max_iter, seed, em_chunk,
     init_type, scale, n_chunk
         As in `estimate`.
+    init_chunk : int, optional
+        Replicates per batch for the initialisation stage (default
+        em_chunk), as in `select_sequential`.
 
     Returns
     -------
@@ -1425,7 +1499,9 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
     g = torch.Generator(device=X.device).manual_seed(seed)
     w0, mu0, cov0 = _init_params(X, max_components, R, reg_covar, generator=g,
                                  active_k=active_k, init_type=init_type,
-                                 scale=scale, em_chunk=em_chunk)
+                                 scale=scale,
+                                 em_chunk=em_chunk if init_chunk is None
+                                 else init_chunk)
     w, mu, cov, _ = em_fit(X, train_r, w0, mu0, cov0, reg_covar, threshold_fit, max_iter,
                            em_chunk=em_chunk, n_chunk=n_chunk)
     v = val_ll(X, val_r, w, mu, cov, n_chunk=n_chunk,
@@ -1657,20 +1733,26 @@ def _select_and_fit(X, protocol, fixed_components_number, max_components,
         k_sel, r_sel = max_components, max_components * IF
     em_chunk_sel = _resolve_chunk(
         em_chunk, r_sel, _em_bytes_per_replicate(N, k_sel, d, X.dtype, n_chunk),
-        X.device)
+        X.device, fixed_bytes=_em_fixed_bytes(N, d, X.dtype, n_chunk))
+    # the init stage has its own (larger, n_chunk-blind) model: an
+    # integer em_chunk is honoured as given, 'auto' sizes the two apart
+    init_chunk_sel = _resolve_chunk(
+        em_chunk, r_sel,
+        _init_bytes_per_replicate(N, k_sel, d, X.dtype, init_type), X.device)
     if fixed_components_number is not None:
         k_best = int(fixed_components_number)
         _, params = _cv_fit_for_k(X, k_best, n_folds, n_inits, reg_covar,
                                   threshold_fit, max_iter, seed,
                                   em_chunk=em_chunk_sel, init_type=init_type,
-                                  scale=scale, n_chunk=n_chunk)
+                                  scale=scale, n_chunk=n_chunk,
+                                  init_chunk=init_chunk_sel)
     else:
         kw = dict(max_components=max_components, n_folds=n_folds,
                   n_inits=n_inits, reg_covar=reg_covar,
                   threshold_fit=threshold_fit, max_iter=max_iter, seed=seed,
                   threshold_components=threshold_components,
                   em_chunk=em_chunk_sel, init_type=init_type, scale=scale,
-                  n_chunk=n_chunk)
+                  n_chunk=n_chunk, init_chunk=init_chunk_sel)
         if protocol == 'sequential':
             sel = select_sequential
             kw['patience'] = patience
@@ -1874,15 +1956,18 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         same way. Larger values are faster on GPU at higher peak memory
         (results are chunk-invariant). 'auto' keeps 8 on CPU; on CUDA it
         sizes each stage's batch to fill half of the free device memory from
-        the measured peak-memory model: replicates x N_eff x K x itemsize
-        x 3 for the default GEMM kernels, x (4d+4) for the legacy kernels
-        (N_eff = min(N, n_chunk)), floored at 32 and capped at the stage's
-        replicate count. A CUDA out-of-memory error
-        during EM halves the chunk and retries, with a RuntimeWarning.
+        the measured peak-memory models (per replicate, in units of N_eff x
+        itemsize with N_eff = min(N, n_chunk): max(K+6, 2K+3) plus a small
+        block term for the default GEMM kernels, (4d+4)K + 4 for the legacy
+        kernels, (4d+3)K + 4 over the full N for the initialisation stage of
+        the default and k-means inits, which gets its own batch), floored
+        at 32 where that fits and capped at the stage's replicate count.
+        A CUDA out-of-memory error during EM halves the chunk and
+        retries, with a RuntimeWarning.
     mc_chunk : int or 'auto', default='auto'
         Number of bootstrap replicates whose MC integration is evaluated per
-        batch; 'auto' as for `em_chunk` (model mc_samples x K x (3d+2) x
-        itemsize). Each replicate draws its MC samples from its own seeded
+        batch; 'auto' as for `em_chunk` (model mc_samples x itemsize x
+        max((3d+1)K + d + 7, d^2 + 4d + 6)). Each replicate draws its MC samples from its own seeded
         stream, so results are independent of `mc_chunk` and of the
         out-of-memory retry.
     preprocess : {'none', 'gaussianise'}, default='none'
@@ -2074,7 +2159,8 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     B = max(n_bootstrap, 1)
     K = w1.shape[0]
     em_chunk_boot = _resolve_chunk(
-        em_chunk, B, _em_bytes_per_replicate(N, K, d, dtype, n_chunk), device)
+        em_chunk, B, _em_bytes_per_replicate(N, K, d, dtype, n_chunk), device,
+        fixed_bytes=_em_fixed_bytes(N, d, dtype, n_chunk))
     mc_chunk = _resolve_chunk(
         mc_chunk, B, _mc_bytes_per_replicate(mc_samples, K, d, dtype), device)
     if return_fit:
@@ -2295,7 +2381,8 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
             s = torch.ones(1, Nc, dtype=X.dtype, device=X.device)
         K = w1.shape[0]
         em_chunk_b = _resolve_chunk(
-            em_chunk, B, _em_bytes_per_replicate(Nc, K, 1, dtype, n_chunk), device)
+            em_chunk, B, _em_bytes_per_replicate(Nc, K, 1, dtype, n_chunk), device,
+            fixed_bytes=_em_fixed_bytes(Nc, 1, dtype, n_chunk))
         w0, mu0, cov0 = _warm_start(w1, mu1, cov1, B)
         w, mu, cov, _ = em_fit(Xc, s, w0, mu0, cov0, reg_covar, threshold_fit, max_iter,
                                em_chunk=em_chunk_b, n_chunk=n_chunk)
