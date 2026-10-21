@@ -512,7 +512,9 @@ def marginal_score(X_full, w, mu, cov, idx):
 # features F(x) = [x, x_i x_j (i<=j)] it is one matrix product with
 # per-component coefficients, and the M-step moments are the transposed
 # product resp^T F (Machlica, Vanek & Zajic 2011). The only tensor of shape
-# (n_replicates, n_samples, n_components) is the responsibilities.
+# (n_replicates, n_samples, n_components) is the responsibilities, plus
+# one transient float32 copy of it inside the blocked M-step (see
+# _moment_gemm).
 # The expanded quadratic form cancels almost completely for points inside a
 # component, so the coefficients are assembled at float64 and the moments
 # accumulated at float64 (see _gauss_coef and _moment_gemm); the data are
@@ -631,7 +633,17 @@ _MSTEP_BLOCK = 512
 def _moment_gemm(wr, F):
     """S = wr^T F accumulated at float64: one GEMM at float64 input, else
     block-wise float32 GEMMs reduced in float64 (accumulation error scales
-    with sqrt(block) instead of sqrt(N), at plain-SGEMM cost)."""
+    with sqrt(block) instead of sqrt(N), at plain-SGEMM cost).
+
+    The float32 blocks are batched over BLOCKS only, with (k, r) folded
+    into the GEMM's row dimension: one transient copy of wr[:, :N0] (a
+    view at K = 1), and F is never broadcast. The previous form batched
+    torch.matmul over (R, nb) against a (1, nb, b, q) F, which expanded
+    and copied F R times (q/K responsibility buffers every M-step, 23x at
+    d=8, K=2) and copied wr too whenever N % block != 0. Per block the
+    dot products are the same 512 float32 terms, the cross-block sum the
+    same float64 terms; CPU results are bitwise those of the old form.
+    """
     R, N, K = wr.shape
     q = F.shape[-1]
     if F.dtype == torch.float64:
@@ -640,11 +652,15 @@ def _moment_gemm(wr, F):
     S = torch.zeros(R, K, q, dtype=torch.float64, device=F.device)
     if nb > 0:
         N0 = nb * _MSTEP_BLOCK
-        wrb = (wr[:, :N0].transpose(1, 2).reshape(R, K, nb, _MSTEP_BLOCK)
-               .permute(0, 2, 1, 3))                       # (R,nb,K,b)
-        Fb = F[:N0].reshape(nb, _MSTEP_BLOCK, q)
-        S += torch.matmul(wrb, Fb.unsqueeze(0)).double().sum(1)
+        A = (wr[:, :N0].reshape(R, nb, _MSTEP_BLOCK, K)   # view
+             .permute(1, 3, 0, 2)                        # (nb,K,R,b), view
+             .reshape(nb, K * R, _MSTEP_BLOCK))          # the one copy
+        S += (torch.bmm(A, F[:N0].reshape(nb, _MSTEP_BLOCK, q))  # (nb,K*R,q)
+              .double().sum(0).view(K, R, q).transpose(0, 1))
     if N % _MSTEP_BLOCK:
+        # the tail is a 3-D broadcast matmul that copies nothing (kept
+        # verbatim on the reviewer's ruling: a folded-row tail would add
+        # a copy of its own and move the tail-only regime off bitwise)
         N0 = nb * _MSTEP_BLOCK
         S += torch.matmul(wr[:, N0:].transpose(1, 2), F[N0:].unsqueeze(0)).double()
     return S
