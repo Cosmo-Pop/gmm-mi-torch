@@ -2027,3 +2027,70 @@ def test_cv_masks_are_expand_views(monkeypatch):
         assert torch.equal(a, b)
     assert torch.equal(E.val_ll(X, s, *ov[:3], em_chunk=7),
                        E.val_ll(X, dense, *od[:3], em_chunk=7))
+
+
+def _moment_cases():
+    # (R, N, K, d): R != K both ways with a tail, block-exact at q=2,
+    # tail-only (nb=0), K=1 (the reshape is a view there) and R=1
+    return [(3, 1300, 5, 2), (5, 1300, 3, 2), (5, 512, 3, 1), (4, 300, 2, 2),
+            (16, 4000, 1, 3), (1, 4000, 6, 3)]
+
+
+def _moment_inputs(R, N, K, d, dtype, device):
+    g = torch.Generator().manual_seed(R * 1000 + N + K)
+    X = torch.randn(N, d, dtype=dtype, generator=g).to(device)
+    # asymmetric in (r, k) so a swapped index cannot hide
+    scale = (10 * torch.arange(R).view(R, 1, 1) + torch.arange(K).view(1, 1, K)
+             + 1).to(dtype)
+    wr = (torch.rand(R, N, K, dtype=dtype, generator=g) + 0.5) * scale
+    return wr.to(device), gmm_mi_torch.estimator._features(X)
+
+
+def test_moment_gemm_float32_block_bound():
+    # hardening batch 3 (ruling's pin 1): the block-batched float32
+    # _moment_gemm against a float64 einsum of the SAME float32 inputs,
+    # elementwise inside the order-independent bound
+    # block * 2^-24 * (|wr|^T |F|) (observed error is ~2% of it); and the
+    # float64 branch against the einsum at 1e-13 relative
+    E = gmm_mi_torch.estimator
+    devices = ['cpu'] + (['cuda'] if torch.cuda.is_available() else [])
+    for dev in devices:
+        for R, N, K, d in _moment_cases():
+            wr, F = _moment_inputs(R, N, K, d, torch.float32, dev)
+            ref = torch.einsum('rnk,nq->rkq', wr.double(), F.double())
+            bound = (E._MSTEP_BLOCK * 2.0 ** -24
+                     * torch.einsum('rnk,nq->rkq', wr.abs().double(),
+                                    F.abs().double()) + 1e-12 * ref.abs())
+            with E._pinned_precision():
+                S = E._moment_gemm(wr, F)
+            assert S.dtype == torch.float64 and S.shape == (R, K, d + d * (d + 1) // 2)
+            assert ((S - ref).abs() <= bound).all(), (dev, R, N, K, d)
+            wr64, F64 = _moment_inputs(R, N, K, d, torch.float64, dev)
+            ref64 = torch.einsum('rnk,nq->rkq', wr64, F64)
+            with E._pinned_precision():
+                S64 = E._moment_gemm(wr64, F64)
+            assert ((S64 - ref64).abs() <= 1e-13 * ref64.abs().max()).all()
+
+
+def test_moment_gemm_peak_on_device():
+    # ruling's pin 2: the M-step moment GEMM may hold one copy of wr plus
+    # the block outputs (theory 1 + 3q/b = 1.26 units at d=8, observed
+    # 1.26-1.45 with allocator rounding); a second copy would read >= 2.26,
+    # the old R-fold broadcast of F 22-23. Warm up first: the first call
+    # in a process lands the cuBLAS workspace in max_memory_allocated.
+    if not torch.cuda.is_available():
+        pytest.skip('peak-memory measurement needs a CUDA device')
+    E = gmm_mi_torch.estimator
+    R, K, d = 16, 2, 8
+    for N in (65536, 65636):          # block-exact, and with a tail
+        wr, F = _moment_inputs(R, N, K, d, torch.float32, 'cuda')
+        with E._pinned_precision():
+            E._moment_gemm(wr, F)
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            base = torch.cuda.memory_allocated()
+            E._moment_gemm(wr, F)
+            torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - base
+        assert peak <= 1.75 * R * N * K * 4, (N, peak / (R * N * K * 4))
