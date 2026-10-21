@@ -684,9 +684,10 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
                               (scale defaults to 1, as in GMM-MI).
     active_k: optional (R,) tensor of active component counts per replicate
     (for the batched-over-k protocol); components >= active_k[r] are dead.
-    The initial M-step / assignment stats run in replicate chunks of
-    `em_chunk`, under the same halve-and-retry CUDA out-of-memory guard as
-    `em_fit` (results are chunk-invariant).
+    The responsibility draw and the initial M-step / assignment stats run
+    in replicate chunks of `em_chunk`, under the same halve-and-retry CUDA
+    out-of-memory guard as `em_fit`; results are chunk-invariant (the
+    default init seeds one generator per replicate from `generator`).
     """
     N, d = X.shape
     dev, dt = X.device, X.dtype
@@ -696,17 +697,32 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
     eye = torch.eye(d, dtype=dt, device=dev)
 
     if init_type == 'random_responsibilities':
-        resp = torch.rand(R, N, K, dtype=dt, device=dev, generator=generator)
-        if active_k is not None:
-            comp = torch.arange(K, device=dev).view(1, 1, K)
-            resp = resp * (comp < active_k.view(R, 1, 1))
-        resp = resp / resp.sum(-1, keepdim=True).clamp_min(1e-30)
+        # The (R,N,K) responsibility draw is the largest allocation of the
+        # selection stage (R = max_components x n_inits x n_folds), so it
+        # is drawn per replicate chunk inside the OOM-guarded closure, in
+        # place (mask, normalise) so no second full-size transient exists.
+        # Each replicate draws from its own generator seeded from one
+        # value taken off the caller's stream: the draw is then invariant
+        # to em_chunk and to the halve-and-retry by construction on every
+        # device (CUDA's Philox streams are NOT sequential across calls,
+        # so chunked draws from one generator would depend on the chunking).
+        seeds = torch.randint(0, 1 << 62, (R,), generator=generator,
+                              device=dev).tolist()
+        comp = torch.arange(K, device=dev).view(1, 1, K)
+        ones = torch.ones(1, N, dtype=dt, device=dev)
 
         def _init_mstep(sl):
-            r = resp[sl]
-            c = r.shape[0]
-            return _m_step(X.expand(c, N, d), r,
-                           torch.ones(c, N, dtype=dt, device=dev), reg_covar)
+            lo, hi = sl.start, min(sl.stop, R)
+            c = hi - lo
+            r = torch.empty(c, N, K, dtype=dt, device=dev)
+            for j in range(c):
+                r[j].uniform_(generator=torch.Generator(device=dev)
+                              .manual_seed(seeds[lo + j]))
+            if active_k is not None:
+                r.mul_(comp < ak[lo:hi].view(c, 1, 1))
+            r.div_(r.sum(-1, keepdim=True).clamp_min(1e-30))
+            return _m_step(X.expand(c, N, d), r, ones.expand(c, N),
+                           reg_covar)
         outs = _run_chunked(R, em_chunk, _init_mstep)
         return tuple(torch.cat([o[j] for o in outs]) for j in range(3))
 
@@ -1843,8 +1859,8 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         GMM initialisation scheme (torch ports of GMM-MI's initialisations).
         'random_responsibilities' is cheap and adequate for easy fits; the
         k-means variants are more robust on well-separated multimodal data.
-        At very large N the responsibility draw of the default binds on
-        memory first; 'minmax' avoids it.
+        The default's responsibility draw is made per replicate chunk
+        (`em_chunk`), so it no longer binds on memory before the EM stage.
     scale : float, optional
         Mean-perturbation scale for 'randomized_kmeans' (GMM-MI's default 1
         when None).

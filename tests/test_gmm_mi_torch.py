@@ -1909,3 +1909,76 @@ def test_spike_pair_fp32_end_to_end():
                         max_components=20, n_inits=5, n_folds=3,
                         mc_samples=10_000)
     assert np.isfinite(m) and np.isfinite(s)
+
+
+def test_init_draw_chunk_invariant():
+    # hardening batch 1: the default init draws its (R,N,K) responsibilities
+    # per replicate chunk, each replicate from its own generator seeded off
+    # the caller's stream, so the init (and everything downstream) is
+    # independent of em_chunk and of the OOM halve-and-retry by
+    # construction — on CUDA too, where chunked draws from ONE Philox
+    # generator would differ with the chunking
+    E = gmm_mi_torch.estimator
+    orig = E._m_step
+    devices = ['cpu'] + (['cuda'] if torch.cuda.is_available() else [])
+    for dev in devices:
+        X = torch.randn(600, 2, generator=torch.Generator().manual_seed(0),
+                        dtype=torch.float64).to(dev)
+        ak = torch.arange(1, 4, device=dev).repeat_interleave(4)   # R=12
+        outs, draws = [], []
+        for chunk in (12, 5, 1):
+            seen = []
+
+            def spy(Xr, resp, s, reg, seen=seen):
+                seen.append(resp.clone())
+                return orig(Xr, resp, s, reg)
+            E._m_step = spy
+            try:
+                g = torch.Generator(device=dev).manual_seed(11)
+                outs.append(E._init_params(X, 3, 12, 1e-6, generator=g,
+                                           active_k=ak, em_chunk=chunk))
+            finally:
+                E._m_step = orig
+            draws.append(torch.cat(seen))
+        for dr, o in zip(draws[1:], outs[1:]):
+            # the normalised draw is bitwise chunk-invariant everywhere; the
+            # M-step's reduction order depends on the batch on CUDA (as
+            # documented for em_chunk), so the parameters are compared at
+            # float64 roundoff there
+            assert torch.equal(draws[0], dr), dev
+            for a, b in zip(outs[0], o):
+                if dev == 'cpu':
+                    assert torch.equal(a, b)
+                else:
+                    assert torch.allclose(a, b, rtol=1e-12, atol=1e-12)
+        # dead padding stays exact identity / zero
+        w, mu, cov = outs[0]
+        assert torch.equal(w[0, 1:], torch.zeros_like(w[0, 1:]))
+        assert torch.equal(cov[0, 1], torch.eye(2, dtype=cov.dtype,
+                                                 device=dev))
+
+
+def test_init_draw_is_chunked_on_device():
+    # the responsibility draw used to be one (R,N,K) allocation plus two
+    # full-size transients regardless of em_chunk; now the peak scales with
+    # the chunk (measured on the GB10: 2.14x -> 1.26x the draw at
+    # em_chunk=R/8, the remainder being the per-chunk init M-step)
+    if not torch.cuda.is_available():
+        pytest.skip('peak-memory measurement needs a CUDA device')
+    E = gmm_mi_torch.estimator
+    R, N, K = 64, 20000, 8
+    X = torch.randn(N, 2, device='cuda', dtype=torch.float32)
+    g = torch.Generator(device='cuda').manual_seed(0)
+    E._init_params(X, K, 8, 1e-6, generator=g, em_chunk=8)   # warm-up
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    E._init_params(X, K, R, 1e-6, generator=g, em_chunk=8)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - base
+    draw = R * N * K * 4
+    # what remains is the per-chunk legacy init M-step ((4d+4) units per
+    # chunk replicate = 1.25x at d=2 and an R/8 chunk); v0.4.0 measured
+    # 2.14x here because it held the full draw plus one transient
+    assert peak < 1.6 * draw, peak / draw
