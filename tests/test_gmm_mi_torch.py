@@ -791,9 +791,9 @@ def test_seed_controls_cv_folds(monkeypatch):
     seen = []
     orig = E._cv_masks
 
-    def spy(N, n_folds, n_inits, dtype, seed=42):
+    def spy(N, n_folds, n_inits, dtype, seed=42, **kw):
         seen.append(seed)
-        return orig(N, n_folds, n_inits, dtype, seed=seed)
+        return orig(N, n_folds, n_inits, dtype, seed=seed, **kw)
 
     monkeypatch.setattr(E, '_cv_masks', spy)
     rng = np.random.default_rng(0)
@@ -1982,3 +1982,48 @@ def test_init_draw_is_chunked_on_device():
     # chunk replicate = 1.25x at d=2 and an R/8 chunk); v0.4.0 measured
     # 2.14x here because it held the full draw plus one transient
     assert peak < 1.6 * draw, peak / draw
+
+
+def test_cv_masks_are_expand_views(monkeypatch):
+    # hardening batch 2: select_batched used to repeat the (I*F, N) CV masks
+    # max_components times as dense working-dtype copies (finding 12:
+    # 2(K+1)*I*F*N*itemsize un-chunked; 40 GiB of the README's N=1e8 peak).
+    # The masks are now (K, I, F, N) expand() views of one (F, N) pair, and
+    # em_fit/val_ll gather each chunk's rows — same values, no copies.
+    E = gmm_mi_torch.estimator
+    N, F, I, K = 5000, 2, 3, 4
+    seen = []
+    orig_em, orig_vl = E.em_fit, E.val_ll
+
+    def spy_em(X, s, *a, **k):
+        seen.append(s)
+        return orig_em(X, s, *a, **k)
+
+    def spy_vl(X, s, *a, **k):
+        seen.append(s)
+        return orig_vl(X, s, *a, **k)
+    monkeypatch.setattr(E, 'em_fit', spy_em)
+    monkeypatch.setattr(E, 'val_ll', spy_vl)
+    X = torch.randn(N, 2, dtype=torch.float64,
+                    generator=torch.Generator().manual_seed(0))
+    E.select_batched(X, max_components=K, n_folds=F, n_inits=I,
+                     init_type='minmax', em_chunk=5, max_iter=3)
+    assert len(seen) >= 2
+    for s in seen[:2]:
+        assert s.shape == (K, I, F, N)
+        assert s.untyped_storage().nbytes() == F * N * 8     # one (F,N) base
+    # the gather reproduces the materialised rows for every chunk cut
+    s = seen[0]
+    dense = s.reshape(-1, N)
+    for sl in (slice(0, 5), slice(5, 10), slice(20, 25), slice(22, 40)):
+        assert torch.equal(E._rows(s, sl), dense[sl])
+    # and the kernels give bitwise the same answer on the view and the copy
+    g = torch.Generator().manual_seed(1)
+    w0, mu0, cov0 = E._init_params(X, 2, K * I * F, 1e-6, generator=g,
+                                   init_type='minmax')
+    ov = E.em_fit(X, s, w0, mu0, cov0, em_chunk=7, max_iter=5)
+    od = E.em_fit(X, dense, w0, mu0, cov0, em_chunk=7, max_iter=5)
+    for a, b in zip(ov, od):
+        assert torch.equal(a, b)
+    assert torch.equal(E.val_ll(X, s, *ov[:3], em_chunk=7),
+                       E.val_ll(X, dense, *od[:3], em_chunk=7))
