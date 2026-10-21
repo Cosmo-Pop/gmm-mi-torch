@@ -200,9 +200,20 @@ def _auto_chunk(n_items, bytes_per_item, device, default=_AUTO_CHUNK_CPU_DEFAULT
     if dev.type != 'cuda':
         return max(1, min(int(n_items), int(default)))
     free, _ = torch.cuda.mem_get_info(dev)
-    n = int((free * _AUTO_CHUNK_MEM_FRACTION - fixed_bytes)
-            // max(int(bytes_per_item), 1))
-    return max(1, min(int(n_items), max(_AUTO_CHUNK_MIN, n)))
+    # the driver counts torch's cached-but-unallocated blocks as used;
+    # they are ours to reuse, so every stage after the first (and every
+    # later call in the process) would otherwise be sized against
+    # free - cache, about half the intended batch in the memory-bound
+    # regime, and never recover
+    free += torch.cuda.memory_reserved(dev) - torch.cuda.memory_allocated(dev)
+    bytes_per_item = max(int(bytes_per_item), 1)
+    n = int((free * _AUTO_CHUNK_MEM_FRACTION - fixed_bytes) // bytes_per_item)
+    # the throughput floor may never exceed what fits in the free memory:
+    # it used to bind exactly when memory was tight, requesting up to 32x
+    # the budget and guaranteeing OOM attempts that transiently take all
+    # free device memory (a neighbour's allocation can fail meanwhile)
+    floor = min(_AUTO_CHUNK_MIN, int(free // bytes_per_item))
+    return max(1, min(int(n_items), max(floor, n)))
 
 
 def _resolve_chunk(value, n_items, bytes_per_item, device, fixed_bytes=0):
@@ -353,12 +364,18 @@ def _run_chunked(n, chunk, fn):
     outs, i = [], 0
     chunk = max(1, min(int(chunk), int(n)))
     while i < n:
+        retry = False
         try:
             outs.append(fn(slice(i, i + chunk)))
         except torch.cuda.OutOfMemoryError:
             if chunk == 1:
                 raise
             chunk = max(1, chunk // 2)
+            retry = True
+        if retry:
+            # outside the handler: inside it the in-flight exception's
+            # traceback still references the failed attempt's frame and
+            # tensors, so an empty_cache there released nothing of its own
             torch.cuda.empty_cache()
             warnings.warn(f"CUDA out of memory; retrying with chunk={chunk}",
                           RuntimeWarning, stacklevel=3)
@@ -1784,17 +1801,38 @@ def _bootstrap_counts(N, B, dtype, device, generator):
     Identical in distribution to index resampling. torch.multinomial caps
     its category count at 2^24; above that the counts are accumulated from
     randint draws instead (identically distributed for uniform
-    probabilities; this size used to raise, so no existing result changed
-    when the fallback was added). This helper is the fallback's only home.
+    probabilities). This helper is the fallback's only home.
+
+    Memory: the multinomial path's draw is the validated resample stream,
+    so it stays ONE call on the whole (B, N) index matrix — but its
+    probability input is a single (1, N) row expanded to (B, N) (bitwise
+    the same draw on CPU and CUDA, measured) and the scatter source an
+    expanded ones row, so the only full-size transient is torch.multinomial's
+    own (B, N) int64 index matrix plus its internal prefix sums. The randint
+    path (N > 2^24, where the weights alone are GiB) draws and histograms
+    one replicate at a time from per-replicate generators seeded off
+    `generator`, so its transient is one (N,) index vector; that path's
+    stream is therefore chunk- and retry-invariant by construction, and
+    differs from the (B, N) draw of earlier versions.
     """
     if N <= _MULTINOMIAL_MAX_CATEGORIES:
         idx = torch.multinomial(
-            torch.full((B, N), 1.0 / N, dtype=dtype, device=device),
-            N, replacement=True, generator=generator)
-    else:
-        idx = torch.randint(0, N, (B, N), device=device, generator=generator)
-    return torch.zeros(B, N, dtype=dtype, device=device).scatter_add_(
-        1, idx, torch.ones(B, N, dtype=dtype, device=device))
+            torch.full((1, N), 1.0 / N, dtype=dtype, device=device)
+            .expand(B, N), N, replacement=True, generator=generator)
+        # the counts are allocated after the draw: torch.multinomial's own
+        # transient is the peak, and nothing else is live during it
+        return torch.zeros(B, N, dtype=dtype, device=device).scatter_add_(
+            1, idx, torch.ones(1, N, dtype=dtype, device=device).expand(B, N))
+    s = torch.zeros(B, N, dtype=dtype, device=device)
+    seeds = torch.randint(0, 1 << 62, (B,), generator=generator,
+                          device=device).tolist()
+    one = torch.ones((), dtype=dtype, device=device).expand(N)
+    for b in range(B):
+        idx = torch.randint(0, N, (N,), device=device,
+                            generator=torch.Generator(device=device)
+                            .manual_seed(seeds[b]))
+        s[b].scatter_add_(0, idx, one)
+    return s
 
 
 def _warm_start(w1, mu1, cov1, B):
@@ -2390,8 +2428,11 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         fits.append((w, mu, cov, chol))
 
     K_max = max(f[0].shape[1] for f in fits)
+    # the per-category MC closure holds three (b,S) tensors beyond the
+    # d=1 integrand (running logaddexp over categories, no (C,b,S) stack)
     mc_chunk = _resolve_chunk(
-        mc_chunk, B, C * _mc_bytes_per_replicate(mc_samples, K_max, 1, dtype), device)
+        mc_chunk, B, _mc_bytes_per_replicate(mc_samples, K_max, 1, dtype)
+        + 4 * mc_samples * dtype.itemsize, device)
     vals = torch.zeros(B, dtype=X.dtype, device=X.device)
     for ci in range(C):
         w, mu, cov, chol = fits[ci]
@@ -2407,11 +2448,20 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
                            .manual_seed(seed + _MC_SEED_OFFSET
                                         + ci * _MC_CAT_STRIDE + r))
                 for r in range(sl.start, min(sl.stop, B))])
-            scores = torch.stack(
-                [gmm_score(pts, fits[cj][0][sl], fits[cj][1][sl],
-                           fits[cj][3][sl]) for cj in range(C)])   # (C,b,S)
-            log_pbar = torch.logsumexp(scores + logpi[:, None, None], dim=0)
-            return pi[ci] * (scores[ci] - log_pbar).mean(1)
+            # log sum_c' pi_c' p(x|c') as a running logaddexp over the
+            # categories, so the peak holds three (b,S) tensors instead of
+            # a (C,b,S) stack plus its C-element list; results differ from
+            # the stacked logsumexp at floating-point roundoff only
+            log_pbar = own = None
+            for cj in range(C):
+                sc = gmm_score(pts, fits[cj][0][sl], fits[cj][1][sl],
+                               fits[cj][3][sl])                      # (b,S)
+                if cj == ci:
+                    own = sc
+                sc = sc + logpi[cj]
+                log_pbar = sc if log_pbar is None \
+                    else torch.logaddexp(log_pbar, sc)
+            return pi[ci] * (own - log_pbar).mean(1)
         vals += torch.cat(_run_chunked(B, mc_chunk, _mc))
     mean = vals.mean().item()
     std = vals.std(unbiased=True).item() if n_bootstrap >= 2 else None

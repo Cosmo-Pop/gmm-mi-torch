@@ -449,15 +449,29 @@ def test_return_fit_model():
 
 def test_auto_chunk_sizing(monkeypatch):
     # CPU keeps the historical default (capped at the item count); CUDA takes
-    # half the free memory, floored at 32 and capped at the item count
+    # half the free memory, floored at 32 — but never above what fits in the
+    # free memory (hardening batch 5: the floor used to bind exactly when
+    # memory was tight, requesting up to 32x the budget and guaranteeing OOM
+    # attempts) — and capped at the item count. Torch's cached-but-free
+    # blocks count as free: the driver's view excludes them, which used to
+    # under-size every stage after the first by the size of the cache.
     E = gmm_mi_torch.estimator
     assert E._auto_chunk(100, 10**6, 'cpu') == 8
     assert E._auto_chunk(3, 10**6, 'cpu') == 3
+    state = {'free': 2 * 10**9, 'reserved': 0, 'allocated': 0}
     monkeypatch.setattr(torch.cuda, 'mem_get_info',
-                        lambda dev=None: (2 * 10**9, 4 * 10**9))
+                        lambda dev=None: (state['free'], 4 * 10**9))
+    monkeypatch.setattr(torch.cuda, 'memory_reserved',
+                        lambda dev=None: state['reserved'])
+    monkeypatch.setattr(torch.cuda, 'memory_allocated',
+                        lambda dev=None: state['allocated'])
     assert E._auto_chunk(1000, 10**7, 'cuda') == 100
-    assert E._auto_chunk(1000, 10**9, 'cuda') == 32
+    assert E._auto_chunk(1000, 4 * 10**7, 'cuda') == 32    # floor binds, fits
+    assert E._auto_chunk(1000, 10**9, 'cuda') == 2         # floor capped
+    assert E._auto_chunk(1000, 10**10, 'cuda') == 1
     assert E._auto_chunk(20, 10**6, 'cuda') == 20
+    state.update(free=10**9, reserved=1.5 * 10**9, allocated=5 * 10**8)
+    assert E._auto_chunk(1000, 10**7, 'cuda') == 100       # cache counted
     with pytest.raises(ValueError):
         E._resolve_chunk('big', 10, 1, 'cpu')
     with pytest.raises(ValueError):
@@ -2211,3 +2225,86 @@ def test_partition_rows_gathered_per_chunk_bitwise():
                                max_iter=6, n_chunk=n_chunk)
                 for a, b in zip(ref, out):
                     assert torch.equal(a, b), (n_chunk, em_chunk)
+
+
+def test_bootstrap_counts_stream_and_transients(monkeypatch):
+    # hardening batch 5: the multinomial path's draw is the validated
+    # resample stream and must be bitwise the (B,N)-matrix draw it replaces
+    # (the probability row is expanded, the scatter source is a view); the
+    # randint path (N > 2^24) draws one replicate at a time from
+    # per-replicate generators — one (N,) index vector live, no (B,N) int64
+    E = gmm_mi_torch.estimator
+    N, B = 3000, 5
+    for dt in (torch.float64, torch.float32):
+        g = torch.Generator().manual_seed(7)
+        got = E._bootstrap_counts(N, B, dt, 'cpu', g)
+        g = torch.Generator().manual_seed(7)
+        idx = torch.multinomial(torch.full((B, N), 1.0 / N, dtype=dt), N,
+                                replacement=True, generator=g)
+        ref = torch.zeros(B, N, dtype=dt).scatter_add_(
+            1, idx, torch.ones(B, N, dtype=dt))
+        assert torch.equal(got, ref)
+        assert torch.equal(got.sum(1), torch.full((B,), float(N), dtype=dt))
+    shapes = []
+    orig = torch.randint
+
+    def spy(*a, **k):
+        out = orig(*a, **k)
+        shapes.append(tuple(out.shape))
+        return out
+    monkeypatch.setattr(torch, 'randint', spy)
+    monkeypatch.setattr(E, '_MULTINOMIAL_MAX_CATEGORIES', 8)
+    g = torch.Generator().manual_seed(7)
+    got = E._bootstrap_counts(N, B, torch.float32, 'cpu', g)
+    assert torch.equal(got.sum(1), torch.full((B,), float(N)))
+    assert shapes == [(B,)] + [(N,)] * B          # seeds, then one row at a time
+    assert (got >= 0).all() and got.dtype == torch.float32
+
+
+def test_oom_retry_releases_after_handler(monkeypatch):
+    # the OOM handler used to call empty_cache inside the except clause,
+    # where the in-flight exception still referenced the failed attempt's
+    # frame and tensors (a no-op); now it runs once the exception is cleared
+    import sys
+    E = gmm_mi_torch.estimator
+    states = []
+    monkeypatch.setattr(torch.cuda, 'empty_cache',
+                        lambda: states.append(sys.exc_info()[0]))
+
+    def fn(sl):
+        if sl.stop - sl.start > 2:
+            raise torch.cuda.OutOfMemoryError('synthetic')
+        return torch.arange(sl.start, sl.stop)
+    with pytest.warns(RuntimeWarning):
+        out = torch.cat(E._run_chunked(8, 8, fn))
+    assert torch.equal(out, torch.arange(8))
+    assert states == [None, None]
+
+
+def test_categorical_mc_peak_independent_of_categories():
+    # the categorical MC stage stacked all C per-category scores into a
+    # (C,b,S) tensor; it now accumulates a running logaddexp, so the peak
+    # no longer scales with C (results differ at roundoff only; the CPU
+    # reference comparison of the hardening pass was bitwise)
+    if not torch.cuda.is_available():
+        pytest.skip('peak-memory measurement needs a CUDA device')
+    rng = np.random.default_rng(3)
+    peaks = []
+    for C in (3, 12):
+        Y = rng.integers(0, C, 200 * C)
+        X = rng.normal(1.0 * Y, 1.0)
+        estimate_categorical(X, Y, max_components=1, n_bootstrap=4,
+                             mc_samples=20_000, mc_chunk=4, device='cuda',
+                             dtype=torch.float32)          # warm-up
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        m, s = estimate_categorical(X, Y, max_components=1, n_bootstrap=4,
+                                    mc_samples=100_000, mc_chunk=4,
+                                    device='cuda', dtype=torch.float32)
+        torch.cuda.synchronize()
+        peaks.append(torch.cuda.max_memory_allocated() - base)
+        assert np.isfinite(m)
+    # a (C,b,S) stack would add (12-3)*4*1e5*4 = 14.4 MB between the two
+    assert peaks[1] < peaks[0] + 4 * 10**6, peaks
