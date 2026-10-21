@@ -2308,3 +2308,123 @@ def test_categorical_mc_peak_independent_of_categories():
         assert np.isfinite(m)
     # a (C,b,S) stack would add (12-3)*4*1e5*4 = 14.4 MB between the two
     assert peaks[1] < peaks[0] + 4 * 10**6, peaks
+
+
+def test_degenerate_sample_sizes_raise_or_warn():
+    # hardening batch 6: N=2-3 used to pass the fold check and return MI of
+    # ~5-6 nats without a word. Now: a training fold with fewer than d+1
+    # samples cannot estimate a covariance -> ValueError at entry; below
+    # 100 samples (per dataset / per category) a RuntimeWarning names the
+    # finite-sample bias.
+    rng = np.random.default_rng(0)
+    E = gmm_mi_torch.estimator
+    for N in (2, 3, 5):
+        with pytest.raises(ValueError, match='smallest training fold'):
+            estimate(rng.normal(size=(N, 2)), 'MI', max_components=2,
+                     n_bootstrap=0, mc_samples=100)
+    # exact arithmetic of the floor: N - ceil(N / n_folds) >= d + 1
+    with pytest.raises(ValueError, match='smallest training fold'):
+        E._validate_folds(5, 2, d=2)          # 5 - 3 = 2 < 3
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        E._validate_folds(200, 2, d=2)        # silent at N >= 100
+    with pytest.warns(RuntimeWarning, match='finite-sample bias'):
+        E._validate_folds(6, 2, d=2)          # 6 - 3 = 3 >= 3: passes, warns
+    with pytest.warns(RuntimeWarning, match='finite-sample bias'):
+        m, s = estimate(rng.normal(size=(60, 2)), 'MI', max_components=2,
+                        n_bootstrap=2, mc_samples=500)
+    assert np.isfinite(m)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', RuntimeWarning)
+        estimate(rng.normal(size=(300, 2)), 'MI', max_components=2,
+                 n_bootstrap=2, mc_samples=500)
+    # categorical: per category, d=1 -> a category of 3 has a 1-sample
+    # training fold
+    Y = np.array([0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+    with pytest.raises(ValueError, match='smallest category'):
+        estimate_categorical(rng.normal(size=12), Y, max_components=1,
+                             n_bootstrap=0, mc_samples=100)
+
+
+def test_device_argument_validated_at_entry():
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(300, 2))
+    common = dict(max_components=2, n_bootstrap=2, mc_samples=500)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        m0, _ = estimate(X, 'MI', device='cpu', **common)
+        m1, _ = estimate(X, 'MI', device=torch.device('cpu'), **common)
+    assert m0 == m1
+    with pytest.raises(ValueError, match='device must be'):
+        estimate(X, 'MI', device='cuad', **common)
+    with pytest.raises(ValueError, match='device'):
+        estimate_categorical(X[:, 0], (X[:, 1] > 0).astype(int),
+                             device='cuad', max_components=1,
+                             n_bootstrap=0, mc_samples=100)
+    n_cuda = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    with pytest.raises(ValueError, match='CUDA'):
+        estimate(X, 'MI', device=f'cuda:{n_cuda + 5}', **common)
+    if n_cuda:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            for dev in ('cuda', 'cuda:0', torch.device('cuda'),
+                        torch.device('cuda', 0)):
+                m, s = estimate(X, 'MI', device=dev, dtype=torch.float32,
+                                **common)
+                assert np.isfinite(m)
+
+
+def test_fitted_gmm_score_samples_shapes():
+    rng = np.random.default_rng(0)
+    X = rng.multivariate_normal([0, 0], [[1, .5], [.5, 1]], 500)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        m, s, fit = estimate(X, 'MI', max_components=2, n_bootstrap=2,
+                             mc_samples=500, return_fit=True)
+    pts = np.zeros((4, 2))
+    assert fit.score_samples(pts).shape == (4,)
+    one = fit.score_samples(np.array([0.1, 0.2]))        # one 2-D point
+    assert one.shape == (1,)
+    assert np.isclose(one[0], fit.score_samples(np.array([[0.1, 0.2]]))[0])
+    with pytest.raises(ValueError, match=r'shape \(n, 2\)'):
+        fit.score_samples(np.zeros((4, 3)))
+    with pytest.raises(ValueError, match=r'shape \(n, 2\)'):
+        fit.score_samples(np.zeros((2, 2, 2)))
+    # a 1-D model takes a 1-D array as n points
+    E = gmm_mi_torch.estimator
+    g1 = E.FittedGMM(torch.tensor([1.0]), torch.zeros(1, 1), torch.ones(1, 1, 1))
+    assert g1.score_samples(np.array([0.0, 1.0, 2.0])).shape == (3,)
+
+
+def test_plotting_internals_hardened():
+    matplotlib = pytest.importorskip('matplotlib')
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    P = pytest.importorskip('gmm_mi_torch.plotting')
+    rng = np.random.default_rng(0)
+    X = rng.multivariate_normal([0, 0], [[1, .9], [.9, 1]], 2000)
+    # repeated mass levels used to raise 'Contour levels must be increasing'
+    fig = P.plot_contours(X, X[::2], mass_levels=(0.5, 0.5, 0.9))
+    plt.close(fig)
+    # a coarse grid with a narrow ridge: thresholds above the grid maximum
+    fig = P.plot_contours(X, X[::2], gridsize=8, mass_levels=(0.01, 0.68))
+    plt.close(fig)
+    # a constant column fails with a readable ValueError, not scipy's
+    Xc = X.copy()
+    Xc[:, 1] = 1.0
+    with pytest.raises(ValueError, match='non-singular covariance'):
+        P.plot_contours(Xc, Xc)
+    # list input to the histogram helper
+    fig, ax = plt.subplots()
+    P.histogram_estimates([0.1, 0.2, 0.15], ax=ax)
+    plt.close(fig)
+    # the ellipse's weight marker is drawn once, not once per contour level
+    fig, ax = plt.subplots()
+    P.draw_ellipse(np.zeros(2), np.eye(2), 0.5, ax=ax, contour_levels=[1, 2, 3])
+    assert len(ax.patches) == 3 and len(ax.collections) == 1
+    plt.close(fig)
+    est = np.column_stack([rng.normal(0.5, 0.05, 30), np.full(30, 0.05)])
+    fig, ax = plt.subplots()
+    biases, red_chi2, df = P.plot_bias_chi2_histogram(est.tolist(), 0.5, ax=ax)
+    assert df == 29 and np.isfinite(red_chi2)
+    plt.close(fig)

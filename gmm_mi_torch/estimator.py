@@ -1332,15 +1332,66 @@ def _val_ll_core(X, s_val, w, mu, cov, n_chunk=None):
 _CV_MASK_SEED_OFFSET = 30_000
 
 
-def _validate_folds(N, n_folds, what='X'):
+# Below this many samples (per dataset, or per category) the estimator
+# warns: the GMM MI estimate carries a positive finite-sample bias that the
+# bootstrap errorbar does not include, and the validation campaign started
+# at N ~ 1e3.
+_SMALL_SAMPLE_WARN = 100
+
+
+def _validate_folds(N, n_folds, what='X', d=None, stacklevel=4):
     """Reject CV settings that produce empty or degenerate folds up front:
-    they otherwise surface as 0/0 NaN metrics and far-away index errors."""
-    if int(n_folds) < 2:
+    they otherwise surface as 0/0 NaN metrics and far-away index errors.
+
+    With `d` given, also reject sizes whose smallest TRAINING fold holds
+    fewer than d+1 samples — a full covariance cannot be estimated from
+    them, every component sits on the reg_covar floor, and the pipeline
+    used to return MI ~ 5-6 nats from N=2-3 points without a word — and
+    warn below _SMALL_SAMPLE_WARN samples."""
+    N, n_folds = int(N), int(n_folds)
+    if n_folds < 2:
         raise ValueError(f"n_folds must be >= 2 (each fit needs a held-out "
                          f"validation fold); found {n_folds}")
-    if int(N) < int(n_folds):
+    if N < n_folds:
         raise ValueError(f"n_folds={n_folds} exceeds the {N} samples "
                          f"in {what}")
+    if d is None:
+        return
+    n_train_min = N - (-(-N // n_folds))      # N minus the largest fold
+    if n_train_min < d + 1:
+        raise ValueError(
+            f"{what} has {N} samples: with n_folds={n_folds} the smallest "
+            f"training fold holds {n_train_min}, fewer than the d+1={d + 1} "
+            f"needed to estimate a {d}-D covariance, so every fit would sit "
+            f"on the reg_covar floor and the estimate would be meaningless")
+    if N < _SMALL_SAMPLE_WARN:
+        warnings.warn(
+            f"{what} has only {N} samples: GMM MI estimates carry a "
+            f"positive finite-sample bias that the bootstrap errorbar does "
+            f"not include, and the component selection is unreliable at "
+            f"this size (the validation campaign started at N ~ 1e3)",
+            RuntimeWarning, stacklevel=stacklevel)
+
+
+def _validate_device(device):
+    """Resolve `device` to a torch.device and fail at entry, under the
+    argument's own name, for strings torch cannot parse or CUDA devices
+    that are not there — instead of deep inside the first transfer."""
+    try:
+        dev = torch.device(device)
+    except (RuntimeError, TypeError) as e:
+        raise ValueError(f"device must be a torch.device or a device "
+                         f"string such as 'cpu', 'cuda' or 'cuda:1'; found "
+                         f"{device!r} ({e})") from None
+    if dev.type == 'cuda':
+        if not torch.cuda.is_available():
+            raise ValueError(f"device={device!r} requested but CUDA is not "
+                             f"available to this torch build/process")
+        if dev.index is not None and dev.index >= torch.cuda.device_count():
+            raise ValueError(f"device={device!r}: only "
+                             f"{torch.cuda.device_count()} CUDA device(s) "
+                             f"are visible")
+    return dev
 
 
 def _cv_masks(N, n_folds, n_inits, dtype, seed=42, device='cpu'):
@@ -1880,8 +1931,17 @@ class FittedGMM:
         return pts[0].cpu().numpy()
 
     def score_samples(self, X):
-        """Mixture log-density at X of shape (n, d); returns a (n,) numpy array."""
+        """Mixture log-density at X of shape (n, d); returns a (n,) numpy
+        array. A 1-D X is n points of a 1-D model, or one point of a d-D
+        model (sklearn rejects 1-D input; here it used to produce a wrong
+        shape error from deep inside the kernel)."""
         Xt = torch.as_tensor(X, dtype=self._mu.dtype, device=self._mu.device)
+        d = self._mu.shape[-1]
+        if Xt.dim() == 1:
+            Xt = Xt.view(-1, 1) if d == 1 else Xt.view(1, -1)
+        if Xt.dim() != 2 or Xt.shape[1] != d:
+            raise ValueError(f"X must have shape (n, {d}) for this "
+                             f"{d}-D model; found {tuple(Xt.shape)}")
         ll = gmm_score(Xt.unsqueeze(0), self._w.unsqueeze(0),
                        self._mu.unsqueeze(0), self._chol.unsqueeze(0))
         return ll[0].cpu().numpy()
@@ -2103,6 +2163,7 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     if dtype not in (torch.float32, torch.float64):
         raise ValueError(f"dtype must be torch.float32 or torch.float64; "
                          f"found {dtype}")
+    device = _validate_device(device)
     # The entry pipeline (finiteness check, rank transform, affine
     # standardisation) runs at float64 BEFORE the cast to the working dtype:
     # casting first quantises large-offset columns (MJDs, Julian dates,
@@ -2138,7 +2199,7 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
             "silently rank them as extreme values and the standardisation "
             "path propagates them into every replicate — remove or impute "
             "them first")
-    _validate_folds(X.shape[0], n_folds)
+    _validate_folds(X.shape[0], n_folds, d=X.shape[1])
     if n_chunk is not None and int(n_chunk) < 1:
         raise ValueError(f"n_chunk must be a positive int or None; "
                          f"found {n_chunk}")
@@ -2319,6 +2380,7 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     if dtype not in (torch.float32, torch.float64):
         raise ValueError(f"dtype must be torch.float32 or torch.float64; "
                          f"found {dtype}")
+    device = _validate_device(device)
     # as in estimate: the entry pipeline runs at float64 and the cast to the
     # working dtype happens after the standardisation (see the comment there)
     X = X.to(torch.float64)
@@ -2386,7 +2448,7 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     label_min = (cat_labels[int(cats[ci_min])] if cat_labels is not None
                  else cats[ci_min].item())
     _validate_folds(int(counts[ci_min]), n_folds,
-                    what=f"the smallest category (Y == {label_min})")
+                    what=f"the smallest category (Y == {label_min})", d=1)
     if category_weights == 'empirical':
         pi = counts.to(dtype) / Y.shape[0]
     elif category_weights == 'uniform':

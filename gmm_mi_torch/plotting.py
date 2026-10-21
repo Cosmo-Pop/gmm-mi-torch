@@ -216,18 +216,19 @@ def draw_ellipse(mean, covariance, weight, ax=None, fill=False, marker='X',
     angle, width, height = calculate_ellipse_params(covariance)
     # find the contour sigma levels
     contours = find_contours(contour_levels)
-    # draw the ellipse
+    # draw the ellipse(s), and the weight marker once (upstream drew it once
+    # per contour level, stacking identical markers)
     for contour in contours:
         ax.add_patch(Ellipse(mean, contour*width, contour*height, angle=angle, fill=fill,
                              label=label if component_count==0 else "", **kwargs))
-        ax.scatter(mean[0], mean[1], s=weight_size*weight, marker=marker, **kwargs)
+    ax.scatter(mean[0], mean[1], s=weight_size*weight, marker=marker, **kwargs)
 
 
 def _kde_contours_2d(samples, x_range, y_range, ax, color, mass_levels,
                      gridsize, shade_alpha, linewidths, seed=0):
     """Draw KDE contours of 2-D samples at the given probability-mass levels."""
     from scipy.stats import gaussian_kde
-    kde = gaussian_kde(samples.T)
+    kde = _kde(samples.T)
     xx, yy = np.meshgrid(np.linspace(*x_range, gridsize),
                          np.linspace(*y_range, gridsize))
     zz = kde(np.vstack([xx.ravel(), yy.ravel()])).reshape(xx.shape)
@@ -238,12 +239,31 @@ def _kde_contours_2d(samples, x_range, y_range, ax, color, mass_levels,
         keep = np.random.default_rng(seed).choice(len(pts), 5000, replace=False)
         pts = pts[keep]
     dens = kde(pts.T)
-    thresholds = sorted(np.quantile(dens, 1.0 - np.asarray(mass_levels)))
+    # matplotlib requires strictly increasing levels: repeated mass levels
+    # give repeated thresholds, and a threshold taken at the samples can
+    # exceed the grid's maximum on a coarse grid or a narrow ridge
+    thresholds = np.unique(np.quantile(dens, 1.0 - np.asarray(mass_levels)))
     if shade_alpha:
-        ax.contourf(xx, yy, zz, levels=[*thresholds, zz.max() * 1.01],
+        top = max(zz.max(), thresholds[-1]) * 1.01 + np.finfo(float).tiny
+        ax.contourf(xx, yy, zz, levels=[*thresholds, top],
                     colors=[color], alpha=shade_alpha)
     ax.contour(xx, yy, zz, levels=thresholds, colors=[color],
                linewidths=linewidths)
+
+
+def _kde(data):
+    """scipy gaussian_kde with a readable error for degenerate samples
+    (a constant or collinear set of columns has a singular covariance; scipy
+    reports a LinAlgError about lower-dimensional subspaces)."""
+    from scipy.stats import gaussian_kde
+    try:
+        return gaussian_kde(data)
+    except np.linalg.LinAlgError:
+        raise ValueError(
+            "KDE contours need samples with a non-singular covariance; a "
+            "constant or exactly collinear variable cannot be contoured "
+            "(drop it from the plot, or add the jitter you want shown)") \
+            from None
 
 
 def plot_contours(input_samples, fitted_samples, parameters=None, extents=None,
@@ -313,9 +333,8 @@ def plot_contours(input_samples, fitted_samples, parameters=None, extents=None,
             for samples, color, label in zip((input_samples, fitted_samples),
                                              colors, labels):
                 if i == j:
-                    from scipy.stats import gaussian_kde
                     grid = np.linspace(*ranges[i], 512)
-                    ax.plot(grid, gaussian_kde(samples[:, i])(grid),
+                    ax.plot(grid, _kde(samples[:, i])(grid),
                             color=color, lw=linewidths, label=label)
                 else:
                     _kde_contours_2d(samples[:, [j, i]], ranges[j], ranges[i],
@@ -429,6 +448,7 @@ def histogram_estimates(estimates, ax=None, bins=20, alpha=1, title='',
     None
     """    
     fig, ax = choose_ax(ax)
+    estimates = np.asarray(estimates)
     mean_value, mean_error, significance = calculate_summary_and_significance(estimates)
     ax.hist(estimates.flatten(), alpha=alpha, bins=bins, color=color, histtype=histtype, lw=lw,
             label=(f'MI values, {significance:.1f}' + '$\\sigma$,\n'
@@ -550,13 +570,14 @@ def plot_bias_chi2_histogram(estimates, analytic, ax=None, bins=20, alpha=0.5, s
     df : int
         The number of degrees of freedom.
     """  
+    estimates = np.asarray(estimates)
     biases = np.array((estimates[:, 0]-analytic)/(estimates[:, 1]))
     chi2 = np.sum(biases**2)
     df = len(estimates)-1    
     red_chi2 = chi2/df
     fig, ax = choose_ax(ax)
     ax.hist(biases, alpha=alpha, bins=bins, 
-             label='GMM-MI', color=color, density='True')
+             label='GMM-MI', color=color, density=True)
     plot_multivariate_normal(ax=ax)    
     if show_title:
         title = (f'{ds}: {np.mean(biases):.2f}' + '$\\pm$'
