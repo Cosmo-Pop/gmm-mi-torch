@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.6.0 (2026-10-23)
+
+The fix pass for the six medium findings of the closing adversarial
+review of v0.5.0 (scoping/review-findings-2026-10-23.md), built under
+report-before-code (scoping/design-report-v0.5.1-2026-10-23.md, ruled in
+design-review-v0.6.0-2026-10-23.md; all amendments adopted) and read as
+a landed diff by the independent reviewer before the tag. The
+minor-version bump follows the project's precedent for random-stream
+changes: the float32 bootstrap resample and the CUDA default-init stream
+move (both corrections; see the first two items). Everything single-pass
+and float64 is bitwise v0.5.0 on CPU; the streamed (n_chunk) path moves
+at reduction order for real-valued weights passed directly to em_fit or
+val_ll (the module's own 0/1 masks and resample counts sum exactly), and
+rerouted replicates' val_ll moves at float32 reduction order.
+
+Test matrix at the tag: 114 passed / 2 skipped (CPU fp64), 115 / 1
+(CUDA fp32), 112 / 4 (CPU fp64 legacy), 113 / 3 (CUDA fp32 legacy).
+
+- The bootstrap probability row is float64 whatever the working dtype.
+  torch's CPU multinomial accumulates the row's CDF sequentially in the
+  row's dtype, and at float32 the step 1/N rounded differently in each
+  binade of the running sum: a fixed, replicate-independent tilt of the
+  sampling weights by index region (16 sigma at N=1e6; 33% max/min
+  predicted at N=1e7) — a bias on index-ordered data the errorbar could
+  not see. The float32 resample is now uniform and bitwise the float64
+  one on CPU and CUDA; the float64 stream (the beta-validated one) is
+  untouched, so every float32 run with a bootstrap moves at
+  bootstrap-noise level. torch.multinomial's internal CUDA transient
+  grows from 5.1x to 8.3x the float32 weights (outside the OOM guard;
+  material only near the 2^24 cap with large n_bootstrap on small GPUs).
+- The default and k-means initialisations stream with n_chunk, in two
+  passes (means, then centred second moments, float64 accumulators), and
+  the default init draws each replicate's responsibilities in fixed
+  blocks of 2^14 samples from the replicate's generator on both paths,
+  so the draw is invariant to em_chunk and n_chunk by construction on
+  every device. v0.5.0 ran the init over the full N per replicate
+  regardless of n_chunk (binding on memory 50-5700x before EM at the
+  README's shapes and dying in an uncaught OutOfMemoryError at chunk 1)
+  and its init_type docstring claimed the opposite; the caveat is back
+  in its correct form, and the hopeless case (no n_chunk at huge N on
+  CUDA) raises a RuntimeError naming n_chunk and init_type='minmax'.
+  Behaviour: the CPU init draw is bitwise v0.5.0 (sequential blocks ==
+  one shot); the CUDA default-init stream changes once more (init-noise
+  level). The init model is (4d+3)K+12 units of the streamed sample
+  chunk (GB10: at or below 0.97 of budget over d=1,2,8, K=1,3,20).
+- The streamed EM and scoring paths read the per-replicate weights
+  through an accessor one sample block at a time: no (R,N) copies for
+  the expand()-view CV masks, no compaction copy when replicates
+  converge, no unconditional s_val[gi] in val_ll. Measured (GB10, fp32,
+  N=4e5, R=32, n_chunk=4096): em_fit 18x -> 1.06x and val_ll 21x -> 0.95x
+  of the model at K=3 (K=1: 0.95x / 0.68x). The one remaining N-sized
+  tensor per stage is the caller's own weights, held once.
+- val_ll scores rerouted (collapsed) replicates with the legacy kernels
+  in the same model-derived sample chunk em_fit streams them with: the
+  CV scoring stage peaked 3.1x (d=2, K=20) to 9.1x (d=8, K=20) the
+  budget em_chunk was sized with; now 0.28-0.99x on every measured row.
+  Rerouted replicates' val_ll moves at float32 reduction order.
+- The precision pin restores inherited fp32_precision knobs as
+  inherited (torch >= 2.9): it wrote resolved values back explicitly,
+  so a caller who had set only the generic knob left estimate() with
+  the cuda/mkldnn matmul knobs pinned and their later generic change
+  silently ignored. The one case the rule cannot tell apart — a child
+  set explicitly to its parent's value — comes back inherited.
+- metric_method='aic'/'bic' with device='cpu' no longer fails under
+  torch.set_default_device('cuda') (the module's last unpinned factory).
+
 ## 0.5.0 (2026-10-21)
 
 The hardening round that follows the v0.4.0 design pass: the deferred
