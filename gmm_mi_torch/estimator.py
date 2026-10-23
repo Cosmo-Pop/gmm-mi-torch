@@ -193,9 +193,11 @@ _TIE_SEED_OFFSET = 40_000
 
 # Auto-sizing of the replicate chunks (em_chunk / mc_chunk = 'auto'). The
 # per-replicate peak-memory models below were re-derived on the GB10 over
-# K = 1..20 and d = 1..8 at fp32/fp64 (validation/bench_mem_models.py,
-# hardening pass of 2026-10-21), in units of N_eff x itemsize per
-# replicate, and carry one to two units of slack over the measured peaks:
+# K = 1..20 and d = 1..8 (validation/bench_mem_models.py: 207 measured rows
+# per dtype at fp32 and at fp64 as of 2026-10-23, every stage incl. val_ll,
+# the streamed paths with expand-view masks, the init stage and the d=1 MC
+# stage; all at or below 0.97 of their model), in units of N_eff x itemsize
+# per replicate, and carry one to two units of slack over the measured peaks:
 #   GEMM EM step      max(K+4, 2K) + 3Kq/block   (E-step: one (R,N,K)
 #                     buffer plus four (R,N) temporaries; M-step: the
 #                     buffer plus its one blocked copy and the block
@@ -206,22 +208,36 @@ _TIE_SEED_OFFSET = 40_000
 #   init stage        (4d+3)K + 12 for the default and k-means inits over
 #                     N, or over the n_chunk-rounded sample chunk when
 #                     streamed; ~0 for minmax
-#   MC stage          max((3d+1)K + d + 3, d^2 + 4d + 2) per mc_sample, +4
+#   MC stage          max((3d+2)K + d + 7, d^2 + 4d + 6) per mc_sample
 #                     (integrand with its analytic marginals; gmm_sample's
 #                     (S,d,d) Cholesky gather dominates at small K)
-# The CUDA floor of 32 keeps small problems reasonably batched and may
-# never exceed what fits in the free memory. CPU keeps the historical
-# default.
-_AUTO_CHUNK_MEM_FRACTION = 0.5      # of the free device memory at call time
-_AUTO_CHUNK_MIN = 32
+# On CUDA a stage's batch is whatever fits the budget fraction of the
+# memory this process can still allocate; there is no replicate floor (the
+# 32-replicate floor of v0.1.1-v0.6.0 only ever bound when memory was
+# tight, i.e. exactly where it over-requested — retired 2026-10-23). CPU
+# keeps the historical default.
+_AUTO_CHUNK_MEM_FRACTION = 0.5      # of the allocatable device memory at call time
 _AUTO_CHUNK_CPU_DEFAULT = 8
 
 
 def _cuda_free_bytes(dev):
     """Bytes this process can still allocate on `dev`: the driver's free
-    memory plus torch's cached-but-unallocated blocks (ours to reuse)."""
-    free, _ = torch.cuda.mem_get_info(dev)
-    return free + torch.cuda.memory_reserved(dev) - torch.cuda.memory_allocated(dev)
+    memory plus torch's cached-but-unallocated blocks (ours to reuse),
+    capped by torch.cuda.set_per_process_memory_fraction when one is set
+    (the allocator then refuses anything above fraction x total, so sizing
+    against the device's free memory would open every stage with a
+    guaranteed-OOM attempt)."""
+    dev = torch.device(dev)
+    free, total = torch.cuda.mem_get_info(dev)
+    allocated = torch.cuda.memory_allocated(dev)
+    free += torch.cuda.memory_reserved(dev) - allocated
+    getter = getattr(torch.cuda, 'get_per_process_memory_fraction', None)
+    if getter is not None:
+        idx = dev.index if dev.index is not None else torch.cuda.current_device()
+        frac = getter(idx)
+        if frac < 1.0:
+            free = min(free, int(frac * total) - allocated)
+    return max(int(free), 0)
 
 
 def _auto_chunk(n_items, bytes_per_item, device, default=_AUTO_CHUNK_CPU_DEFAULT,
@@ -229,8 +245,8 @@ def _auto_chunk(n_items, bytes_per_item, device, default=_AUTO_CHUNK_CPU_DEFAULT
     """Chunk size for `n_items` replicates costing `bytes_per_item` each,
     after `fixed_bytes` the stage allocates once regardless of the chunk.
 
-    `default` on CPU; on CUDA, as many items as fit in a fraction of the free
-    device memory, floored at _AUTO_CHUNK_MIN and capped at n_items.
+    `default` on CPU; on CUDA, as many items as fit in a fraction of the
+    allocatable device memory (at least 1), capped at n_items.
     """
     dev = torch.device(device)
     if dev.type != 'cuda':
@@ -243,12 +259,7 @@ def _auto_chunk(n_items, bytes_per_item, device, default=_AUTO_CHUNK_CPU_DEFAULT
     free = _cuda_free_bytes(dev)
     bytes_per_item = max(int(bytes_per_item), 1)
     n = int((free * _AUTO_CHUNK_MEM_FRACTION - fixed_bytes) // bytes_per_item)
-    # the throughput floor may never exceed what fits in the free memory:
-    # it used to bind exactly when memory was tight, requesting up to 32x
-    # the budget and guaranteeing OOM attempts that transiently take all
-    # free device memory (a neighbour's allocation can fail meanwhile)
-    floor = min(_AUTO_CHUNK_MIN, int(free // bytes_per_item))
-    return max(1, min(int(n_items), max(floor, n)))
+    return max(1, min(int(n_items), n))
 
 
 def _resolve_chunk(value, n_items, bytes_per_item, device, fixed_bytes=0,
@@ -399,7 +410,7 @@ def _init_bytes_per_replicate(N, K, d, dtype, init_type, n_chunk=None):
 def _mc_bytes_per_replicate(mc_samples, K, d, dtype):
     """Peak memory per MC-integration replicate, from the model above."""
     return int(1.03 * mc_samples * dtype.itemsize
-               * max((3 * d + 1) * K + d + 7, d * d + 4 * d + 6))
+               * max((3 * d + 2) * K + d + 7, d * d + 4 * d + 6))
 
 
 def _n_rows(s):
@@ -731,10 +742,21 @@ def marginal_score(X_full, w, mu, cov, idx):
 
 
 def _features(X):
-    """Quadratic features [x, x_i x_j (i<=j)] of X (..., d): (..., d + d(d+1)/2)."""
+    """Quadratic features [x, x_i x_j (i<=j)] of X (..., d): (..., d + d(d+1)/2).
+
+    Assembled in place — the output, one gathered operand copied into it,
+    the second gathered operand multiplied in — so the transient is
+    q + d(d+1)/2 units of n x itemsize (the cat of the product held both
+    gathers and the product beside the output: 108 vs 80 units at d=8,
+    measured); the products are bitwise the same."""
     d = X.shape[-1]
     iu = torch.triu_indices(d, d, device=X.device)
-    return torch.cat([X, X[..., iu[0]] * X[..., iu[1]]], -1)
+    F = torch.empty(*X.shape[:-1], d + iu.shape[1], dtype=X.dtype,
+                    device=X.device)
+    F[..., :d] = X
+    F[..., d:] = X[..., iu[0]]
+    F[..., d:].mul_(X[..., iu[1]])
+    return F
 
 
 def _tri_inv(L):
@@ -901,7 +923,10 @@ def _em_step_gemm_nchunked(X, wc, w, mu, cov, reg_covar, n_chunk, rows=None):
         Nk += wr.sum(1).double()
         S += _moment_gemm(wr, Fc)
         ll_sum += (sc * ll_n).sum(1).double()
-        del lj, wr      # not carried into the next chunk's allocation
+        # not carried into the next chunk's allocation: the next chunk's
+        # features are assembled while these would still be bound (two
+        # feature blocks at once — 1.3x the model at R=1, measured)
+        del lj, wr, Fc
     tot = wc.totals() if rows is None else wc.totals()[rows]   # float64
     ll = (ll_sum / tot).to(dt)
     w_new, mu_new, cov_new = _mstep_from_moments(S, Nk, tot, reg_covar, d, dt)
@@ -1576,6 +1601,7 @@ def _val_ll_core(X, s_val, w, mu, cov, n_chunk=None):
                 lj += const.unsqueeze(1)
                 accg = accg + (wc.rows(i, n, rows_g)
                                * torch.logsumexp(lj, -1)).sum(1).double()
+                del lj, Fc
             acc[gi] = accg
         if li.numel():
             # rerouted rows are scored by the centred legacy kernels in
@@ -2401,14 +2427,15 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         itemsize with N_eff = min(N, n_chunk): max(K+6, 2K+3) plus a small
         block term for the default GEMM kernels, (4d+4)K + 4 for the legacy
         kernels, (4d+3)K + 4 over the full N for the initialisation stage of
-        the default and k-means inits, which gets its own batch), floored
-        at 32 where that fits and capped at the stage's replicate count.
+        the default and k-means inits, which gets its own batch), capped at
+        the stage's replicate count, with no replicate floor (and capped by
+        torch.cuda.set_per_process_memory_fraction when one is set).
         A CUDA out-of-memory error during EM halves the chunk and
         retries, with a RuntimeWarning.
     mc_chunk : int or 'auto', default='auto'
         Number of bootstrap replicates whose MC integration is evaluated per
         batch; 'auto' as for `em_chunk` (model mc_samples x itemsize x
-        max((3d+1)K + d + 7, d^2 + 4d + 6)). Each replicate draws its MC samples from its own seeded
+        max((3d+2)K + d + 7, d^2 + 4d + 6)). Each replicate draws its MC samples from its own seeded
         stream, so results are independent of `mc_chunk` and of the
         out-of-memory retry.
     preprocess : {'none', 'gaussianise'}, default='none'
@@ -2510,7 +2537,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     offsets (MJDs, timestamps): the cast sees already-centred values. This
     costs a one-off float64 copy of X at entry. Input that is itself float32
     cannot be un-quantised; pass float64 (or raw) data where offsets are
-    large relative to the spread.
+    large relative to the spread. The entry transient is that float64
+    copy plus the standardisation's reductions and the finiteness mask
+    (about two to three times the float64 size of X, more under
+    gaussianise), on the input's device for tensor input.
     """
     X = torch.as_tensor(_as_array(X)).detach()
     if dtype not in (torch.float32, torch.float64):
@@ -2525,7 +2555,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     # half-precision inputs are promoted the same way; already-float32 input
     # cannot be un-quantised, so the upcast there is best effort. The one-off
     # float64 copy of X at entry is the price.
-    X = X.to(torch.float64)
+    # a private float64 copy (copy=True also for float64 input, whose
+    # storage torch.as_tensor shares with the caller) that the
+    # standardisation below then updates in place
+    X = X.to(torch.float64, copy=True)
     if quantity not in _INTEGRANDS:
         raise ValueError(f"quantity must be one of "
                          f"{sorted(_INTEGRANDS)}; found '{quantity}'")
@@ -2591,7 +2624,9 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         col_mean = X.mean(0)
         col_std = X.std(0)
     col_std = torch.where(col_std > 0, col_std, torch.ones_like(col_std))
-    X = (X - col_mean) / col_std
+    # in place on the private copy: elementwise identical to
+    # (X - col_mean) / col_std, without the two further full-size copies
+    X.sub_(col_mean).div_(col_std)
     # the float64 col_mean/col_std are kept for the return_fit back-transform;
     # the fit itself runs at the working dtype on the target device
     X = X.to(dtype=dtype, device=device)
@@ -2736,7 +2771,7 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     device = _validate_device(device)
     # as in estimate: the entry pipeline runs at float64 and the cast to the
     # working dtype happens after the standardisation (see the comment there)
-    X = X.to(torch.float64)
+    X = X.to(torch.float64, copy=True)
     if X.dim() > 2 or (X.dim() == 2 and X.shape[1] != 1):
         raise ValueError(f"X must be 1-D or a single column; found shape "
                          f"{tuple(X.shape)}")
@@ -2802,7 +2837,7 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     # shared affine standardisation of the continuous variable: MI with a
     # categorical variable is invariant, and reg_covar becomes scale-free
     x_std = X.std()
-    X = (X - X.mean()) / torch.where(x_std > 0, x_std, torch.ones_like(x_std))
+    X.sub_(X.mean()).div_(torch.where(x_std > 0, x_std, torch.ones_like(x_std)))
     X = X.to(dtype=dtype, device=device)
     if not torch.isfinite(X).all():
         raise ValueError(

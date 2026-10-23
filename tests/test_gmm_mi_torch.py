@@ -450,29 +450,47 @@ def test_return_fit_model():
 
 def test_auto_chunk_sizing(monkeypatch):
     # CPU keeps the historical default (capped at the item count); CUDA takes
-    # half the free memory, floored at 32 — but never above what fits in the
-    # free memory (hardening batch 5: the floor used to bind exactly when
-    # memory was tight, requesting up to 32x the budget and guaranteeing OOM
-    # attempts) — and capped at the item count. Torch's cached-but-free
-    # blocks count as free: the driver's view excludes them, which used to
-    # under-size every stage after the first by the size of the cache.
+    # the budget fraction of what the process can still allocate: physical
+    # free memory plus torch's cached-but-free blocks, capped by a
+    # per-process memory fraction when one is set (2026-10-23 review L14).
+    # There is no replicate floor any more (L9): the 32-replicate floor only
+    # bound when memory was tight, exactly where it over-requested, and its
+    # fixed_bytes-blind cap still opened with a guaranteed-OOM attempt.
     E = gmm_mi_torch.estimator
     assert E._auto_chunk(100, 10**6, 'cpu') == 8
     assert E._auto_chunk(3, 10**6, 'cpu') == 3
-    state = {'free': 2 * 10**9, 'reserved': 0, 'allocated': 0}
+    state = {'free': 2 * 10**9, 'total': 4 * 10**9, 'reserved': 0,
+             'allocated': 0, 'frac': 1.0}
     monkeypatch.setattr(torch.cuda, 'mem_get_info',
-                        lambda dev=None: (state['free'], 4 * 10**9))
+                        lambda dev=None: (state['free'], state['total']))
     monkeypatch.setattr(torch.cuda, 'memory_reserved',
                         lambda dev=None: state['reserved'])
     monkeypatch.setattr(torch.cuda, 'memory_allocated',
                         lambda dev=None: state['allocated'])
+    monkeypatch.setattr(torch.cuda, 'get_per_process_memory_fraction',
+                        lambda dev=None: state['frac'])
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: 0)
     assert E._auto_chunk(1000, 10**7, 'cuda') == 100
-    assert E._auto_chunk(1000, 4 * 10**7, 'cuda') == 32    # floor binds, fits
-    assert E._auto_chunk(1000, 10**9, 'cuda') == 2         # floor capped
+    assert E._auto_chunk(1000, 10**9, 'cuda') == 1          # no floor
     assert E._auto_chunk(1000, 10**10, 'cuda') == 1
     assert E._auto_chunk(20, 10**6, 'cuda') == 20
+    # the tight regime with a fixed term (K=1, d=8: features ~12 replicates'
+    # worth): the first attempt stays inside the budget fraction
+    bpi, fixed = 5_700_000, 67_100_000
+    for free in (30, 36, 44, 60):
+        state['free'] = free * bpi
+        n = E._auto_chunk(1000, bpi, 'cuda', fixed_bytes=fixed)
+        assert n >= 1 and n * bpi + fixed <= 0.5 * state['free'] + bpi
+    state['free'] = 2 * 10**9
+    # cached-but-free blocks count as allocatable
     state.update(free=10**9, reserved=1.5 * 10**9, allocated=5 * 10**8)
-    assert E._auto_chunk(1000, 10**7, 'cuda') == 100       # cache counted
+    assert E._auto_chunk(1000, 10**7, 'cuda') == 100
+    # a per-process memory fraction caps what the process may allocate
+    state.update(free=3 * 10**9, reserved=0, allocated=2 * 10**8, frac=0.25)
+    assert E._auto_chunk(1000, 10**7, 'cuda') == 40     # (0.25*4e9 - 2e8)/2/1e7
+    # unindexed 'cuda' and torch.device('cuda') resolve the current device
+    assert E._auto_chunk(1000, 10**7, torch.device('cuda')) == 40
+    state['frac'] = 1.0
     with pytest.raises(ValueError):
         E._resolve_chunk('big', 10, 1, 'cpu')
     with pytest.raises(ValueError):
