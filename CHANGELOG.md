@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.6.1 (2026-10-23)
+
+The pass for the 19 low findings and 3 sweep extras of the v0.5.0
+closing review and the 3 docstring items of the v0.6.0 landed read,
+built under report-before-code (scoping/design-report-v0.6.1-2026-10-23.md,
+ruled in design-review-v0.6.1-2026-10-23.md; all amendments adopted) and
+read as a landed diff before the tag. No random stream moves: results
+are bitwise v0.6.0 on CPU everywhere except the repair of components
+whose diagonal clamped (none in the reference set), and CUDA auto-sized
+batches change only in the tight regime and in capped processes (the
+accepted reduction-order class).
+
+- Entry validation: n_chunk, threshold_fit, patience, em_chunk and
+  mc_chunk fail at entry under their own names (a float n_chunk died
+  inside the first streamed EM step; em_chunk=2.7 ran as 2 and
+  mc_chunk=1.5 as 1; threshold_fit <= 0 or NaN turned every fit into a
+  max_iter run); device accepts only 'cpu' and 'cuda[:i]' (other
+  backends failed deep inside the fit or not at all); None/NaN/pd.NA
+  among string labels raise the readable missing-label error;
+  FittedGMM.score_samples takes the DataFrame it was fitted on and
+  reports the caller's shape. New ValueErrors/TypeErrors on input that
+  previously ran or failed late.
+- One non-finite replicate metric no longer poisons selection: 'valid'
+  ranks the finite k only (it was an IndexError), aic/bic mask the
+  criterion and pick the best finite init (a NaN k was selected
+  silently), the sequential search skips a non-finite k with a warning
+  without consuming patience (it could end the search early).
+- The init hopeless-case guard runs whatever em_chunk is, quotes the
+  memory model's estimate, names n_chunk first and no longer recommends
+  'minmax' to a 'minmax' run; the n_chunk docstring states the init
+  chunk's block rounding.
+- Auto-chunking: the 32-replicate floor is retired (it only bound when
+  memory was tight, exactly where it over-requested; its fixed-term-blind
+  cap still opened with a certain OOM); batches honour
+  torch.cuda.set_per_process_memory_fraction; the MC model's slope is
+  3d+2 per component (the d=1 categorical stage was 12% over at K=20);
+  the features are assembled in place (108 -> 80 units at d=8, model
+  unchanged) and the streamed paths release the previous chunk's
+  features before the next (1.34x the model at R=1 -> 0.88x); the entry
+  pipeline standardises in place on its private float64 copy (7.6 ->
+  5.9 float64 copies of X at the peak of a CUDA-tensor run). The memory
+  bench runs at fp32 and fp64 with val_ll, d=1 MC and small-R rows: 207
+  rows per dtype, all at or below 0.97 of their model.
+- Collapsed components: the M-steps bound the off-diagonals of a
+  component whose diagonal was clamped to the reg_covar floor, so a
+  duplicated-point fit at float32 with reg_covar ~1e-10 completes with
+  repair warnings instead of aborting the whole estimate; _chol's error
+  names the remedy.
+- Documented limitations (quantified by the independent review, streams
+  unchanged): the CUDA multinomial's float32-resolution per-sample
+  weight scatter (sd 0.02 at N=1e6 to ~0.24 near 1.1e7, no regional
+  tilt); the N > 2^24 randint path's 32-bit modulo tilt (+2.4% on the
+  first 95% of rows at N=1e8; its 2^53-resolution replacement is held
+  for 0.7.0 together with the owner's decision on the CUDA multinomial);
+  the CPU 2^32 per-replicate seed space; and that on CUDA at float32 the
+  replicate chunk, including an out-of-memory retry, can move the
+  selected k on knife-edge data (float64 or CPU is bit-reproducible).
+- Docs: the memory-model tooling index, the 0.5.0 mask-cost figure, the
+  nine CUDA-gated tests, and the walkthrough's dtype advice.
+
+Test matrix at the tag: 120 passed / 2 skipped (CPU fp64), 121 / 1 (CUDA fp32), 118 / 4 (CPU fp64 legacy), 119 / 3 (CUDA fp32 legacy).
+
 ## 0.6.0 (2026-10-23)
 
 The fix pass for the six medium findings of the closing adversarial
