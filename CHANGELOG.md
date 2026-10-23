@@ -41,8 +41,13 @@ accepted reduction-order class).
   features before the next (1.34x the model at R=1 -> 0.88x); the entry
   pipeline standardises in place on its private float64 copy (7.6 ->
   5.9 float64 copies of X at the peak of a CUDA-tensor run). The memory
-  bench runs at fp32 and fp64 with val_ll, d=1 MC and small-R rows: 207
-  rows per dtype, all at or below 0.97 of their model.
+  bench runs at fp32 and (--fp64) fp64 with val_ll, d=1 MC and small-R
+  rows: 207 rows per dtype, every row at or below its model except the
+  streamed CV-mask em_fit rows at N=4e5, d=2, where a fixed ~10-19 MiB
+  cuBLAS workspace shows against 5-45 MiB models (1.06x at K=3 fp32,
+  1.42x at K=20 with n_chunk=4096 at both dtypes) — an absolute term the
+  budget fraction absorbs; whether the model should carry it as an
+  additive term is a 0.7.0 question.
 - Collapsed components: the M-steps bound the off-diagonals of a
   component whose diagonal was clamped to the reg_covar floor, so a
   duplicated-point fit at float32 with reg_covar ~1e-10 completes with

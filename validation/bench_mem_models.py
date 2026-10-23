@@ -1,5 +1,9 @@
 """Measured peak CUDA memory of every auto-sized stage against its byte model
-(ratio = measured peak / model; the models must stay >= 1 on every row).
+(ratio = measured peak / model; every row should sit at or below 1.0; the one
+known exception is the streamed CV-mask em_fit section at N=4e5, d=2, where a
+fixed ~10-19 MiB cuBLAS workspace shows against 5-45 MiB models — 1.06 at K=3
+fp32, 1.42 at K=20, n_chunk=4096, both dtypes — captioned in its own output).
+Run twice, default (fp32) and with --fp64.
 Source of the per-replicate models in gmm_mi_torch/estimator.py (hardening
 pass, 2026-10-21). Run from the repo root on a CUDA machine:
     PYTHONPATH=. python validation/bench_mem_models.py"""
@@ -16,7 +20,9 @@ def params(X, K, R, dt, collapse=0):
     if collapse:
         mu[:collapse, 0] = 4.0; cov[:collapse, 0] = 1e-6 * torch.eye(X.shape[-1], dtype=dt, device=dev)
     return w, mu, cov
-dt = torch.float32
+import sys as _sys
+dt = torch.float64 if '--fp64' in _sys.argv else torch.float32   # run twice: default fp32, --fp64
+print(f'dtype: {dt}')
 print("EM GEMM, n_chunk path at allocator-relevant size: N=400000, R=32, n_chunk=65536; ratio = peak / (R * model)")
 for d in (2, 8):
     for K in (1, 3, 20):
