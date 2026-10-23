@@ -2962,3 +2962,48 @@ def test_score_samples_dataframe_and_shape_message():
     assert np.allclose(fit.score_samples(df), fit.score_samples(df.to_numpy()))
     with pytest.raises(ValueError, match=r'found \(3,\)'):
         fit.score_samples(np.zeros(3))
+
+
+def test_collapsed_component_offdiagonal_bound():
+    # 2026-10-23 review L3 (C1): both M-steps restored only the diagonal to
+    # the reg_covar floor, leaving the off-diagonal roundoff residue of a
+    # component collapsed on exact duplicates far above it; _chol's
+    # escalation (scaled to the diagonal) could not reach it and the whole
+    # estimate aborted at float32 for reg_covar ~1e-10. The off-diagonals
+    # of clamped components are now bounded PSD-consistently; non-clamped
+    # components pass through bitwise.
+    E = gmm_mi_torch.estimator
+    rng = np.random.default_rng(0)
+    base = rng.multivariate_normal([0, 0], [[1, .5], [.5, 1]], 3000)
+    X = np.concatenate([base, np.tile(np.array([[2.0, -1.0]]), (1500, 1))])
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter('always')
+        m32, s32 = estimate(X, 'MI', max_components=3, n_bootstrap=2,
+                            mc_samples=2000, dtype=torch.float32,
+                            reg_covar=1e-10)
+        m64, s64 = estimate(X, 'MI', max_components=3, n_bootstrap=2,
+                            mc_samples=2000, dtype=torch.float64,
+                            reg_covar=1e-10)
+    assert np.isfinite(m32) and abs(m32 - m64) < 10 * (s32 + s64 + 0.02)
+    # d=3: the pairwise bound alone can leave lambda_min ~ -reg; the matrix
+    # is then within the escalation's reach (completes with warnings)
+    X3 = np.concatenate([rng.multivariate_normal([0, 0, 0], np.eye(3), 3000),
+                         np.tile(np.array([[2.0, -1.0, 0.5]]), (1500, 1))])
+    with warnings.catch_warnings(record=True) as rec3:
+        warnings.simplefilter('always')
+        m3, s3 = estimate(X3, 'TC', max_components=3, n_bootstrap=2,
+                          mc_samples=2000, dtype=torch.float32,
+                          reg_covar=1e-10)
+    assert np.isfinite(m3)
+    # the helper: a clamped 2x2 with a large residue becomes factorisable,
+    # an unclamped healthy matrix is untouched bitwise
+    reg = 1e-9
+    bad = torch.tensor([[[[reg * 0.5, 2e-6], [2e-6, reg * 0.5]]]],
+                       dtype=torch.float32)
+    fixed = E._restore_floor(bad.clone(), reg)
+    assert torch.linalg.cholesky_ex(fixed)[1].item() == 0
+    healthy = torch.tensor([[[[1.0, 0.3], [0.3, 2.0]]]], dtype=torch.float32)
+    assert torch.equal(E._restore_floor(healthy.clone(), reg), healthy)
+    with pytest.raises(RuntimeError, match='raise reg_covar'):
+        E._chol(torch.tensor([[[[1e-12, 1e-3], [1e-3, 1e-12]]]],
+                             dtype=torch.float32))

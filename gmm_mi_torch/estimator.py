@@ -602,7 +602,9 @@ def _chol(cov, return_repaired=False):
     raise RuntimeError(
         f"covariance factorisation failed even after diagonal "
         f"regularisation up to {total:g} x the component's largest "
-        f"absolute diagonal entry")
+        f"absolute diagonal entry — a component has collapsed below what "
+        f"this dtype can represent: raise reg_covar, or use "
+        f"dtype=torch.float64")
 
 
 def log_gauss(X, mu, chol):
@@ -820,6 +822,36 @@ def _estep_gemm(F, s, w, mu, cov):
     return resp, ll
 
 
+def _restore_floor(cov, reg_covar):
+    """Restore the reg_covar floor on a finished M-step covariance, in place.
+
+    Rounding of the (origin or shifted) moments can push a collapsed
+    component's variance below reg_covar; the diagonal is clamped back. For
+    the components WHOSE DIAGONAL WAS CLAMPED the off-diagonal roundoff
+    residue (~u x O(1), i.e. ~1e-6 at float32) can then exceed the floor
+    and leave [[reg, e], [e, reg]] indefinite beyond the reach of _chol's
+    escalation (scaled to the diagonal, capped at ~1e3 x): the estimate
+    aborted at float32 for reg_covar <= ~1e-9 on duplicated-point data.
+    Those components' off-diagonals are bounded to the PSD-consistent
+    |c_ij| <= sqrt(c_ii c_jj) (1 - 1e-6); every other component is copied
+    verbatim, so results on data that never clamps are bitwise unchanged.
+    At d >= 3 the pairwise bound is necessary, not sufficient — the
+    residue's signs can leave lambda_min ~ -reg_covar — but the matrix is
+    then inside the escalation's reach (one warning), where the raw one
+    aborted."""
+    diag = torch.diagonal(cov, dim1=-2, dim2=-1)
+    clamped = (diag < reg_covar).any(-1)                        # (R,K)
+    diag.clamp_(min=reg_covar)
+    if bool(clamped.any()):
+        d = cov.shape[-1]
+        bound = (diag.unsqueeze(-1) * diag.unsqueeze(-2)).sqrt() * (1 - 1e-6)
+        eye = torch.eye(d, dtype=torch.bool, device=cov.device)
+        bounded = torch.where(eye, cov, torch.maximum(torch.minimum(cov, bound),
+                                                      -bound))
+        cov.copy_(torch.where(clamped[..., None, None], bounded, cov))
+    return cov
+
+
 def _mstep_from_moments(S, Nk, ssum, reg_covar, d, dt):
     """Finalise the M-step from float64 moments S=(resp*s)^T F, Nk, s.sum(1)."""
     dev = S.device
@@ -836,8 +868,7 @@ def _mstep_from_moments(S, Nk, ssum, reg_covar, d, dt):
     cov = cov + reg_covar * eye
     # the accumulated M2 - m1^2 can round below the reg_covar floor for a
     # component collapsed onto near-duplicate points; restore the floor
-    diag = torch.diagonal(cov, dim1=-2, dim2=-1)
-    diag.clamp_(min=reg_covar)
+    cov = _restore_floor(cov, reg_covar)
     w = torch.where(dead, torch.zeros_like(Nk), Nk / ssum.double().unsqueeze(-1))
     w = w / w.sum(-1, keepdim=True).clamp_min(1e-30)
     m1 = torch.where(dead[..., None], torch.zeros_like(m1), m1)
@@ -987,6 +1018,8 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
         # to em_chunk and to the halve-and-retry by construction on every
         # device (CUDA's Philox streams are NOT sequential across calls,
         # so chunked draws from one generator would depend on the chunking).
+        # CPU manual_seed keeps 32 of these 62 bits (CUDA all 64): the CPU
+        # per-replicate seed space is 2^32, collision R(R-1)/2^33.
         seeds = torch.randint(0, 1 << 62, (R,), generator=generator,
                               device=dev).tolist()
         comp = torch.arange(K, device=dev).view(1, 1, K)
@@ -1210,7 +1243,15 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
         As in `estimate`.
     em_chunk : int, default=8
         Replicates per batch. A CUDA out-of-memory error halves it and
-        retries (with a RuntimeWarning); results are chunk-invariant.
+        retries (with a RuntimeWarning); results are chunk-invariant
+        bitwise on CPU. On CUDA at float32 the blocked M-step folds the
+        batch's replicates into one GEMM, whose summation order follows
+        the batch size, so the chunk — including an out-of-memory retry,
+        which pinning em_chunk does not prevent — moves results at
+        reduction order, and on knife-edge data that can move the
+        selected k (measured: k=5 vs 6, MI 0.4741 vs 0.4745 against an
+        errorbar of 0.008); float64 or a CPU run is the bit-reproducible
+        setting.
 
     Returns
     -------
@@ -1304,8 +1345,7 @@ def _em_step_nchunked(X, wc, w, mu, chol, logw, reg_covar, n_chunk,
         - delta.unsqueeze(-1) * delta.unsqueeze(-2) + reg_covar * eye
     # the shifted moments can round the variance below the reg_covar floor
     # for a component collapsed onto near-duplicate points; restore the floor
-    diag = torch.diagonal(cov_new, dim1=-2, dim2=-1)
-    diag.clamp_(min=reg_covar)
+    cov_new = _restore_floor(cov_new, reg_covar)
     w_new = torch.where(dead, torch.zeros_like(Nk), Nk / tot.unsqueeze(-1))
     w_new = w_new / w_new.sum(-1, keepdim=True).clamp_min(1e-30)
     mu_new = torch.where(dead[..., None], torch.zeros_like(mu_new), mu_new)
@@ -2229,6 +2269,30 @@ def _bootstrap_counts(N, B, dtype, device, generator):
     that the bootstrap errorbar cannot see). With the float64 row the
     float32 and float64 resamples are uniform and bitwise identical to
     each other, on CPU and CUDA.
+
+    Known limitations, kept because this draw is the validated resample
+    stream (documented 2026-10-23, quantified by the independent review):
+    (i) on CUDA, torch.multinomial's kernel draws float32 uniforms even
+    for a float64 row, so each sample's inclusion weight carries a fixed,
+    replicate-independent factor set by how many 2^-24 grid points its
+    1/N interval holds — no regional tilt (index-band means within 4e-4
+    of 1), but a per-sample weight scatter sd(w) of 0.019 at N=1e6, 0.043
+    at 2e6, 0.073 at 4e6, 0.113 at 8e6, peaking ~0.24 near N ~ 1.1e7 and
+    vanishing at exactly 2^24 (closed form: per float32 binade k with
+    m_k = 2^(24+k)/N grid points per interval, variance 2^-(k+1)
+    frac(m_k)(1 - frac(m_k))/m_k^2), i.e. a fixed shift of the bootstrap
+    mean of order sd(w) x one standard error; the CPU path has none
+    (excess variance -1e-5 at N=1e6). (ii) The N > 2^24 fallback's
+    torch.randint reduces a 32-bit draw modulo N, so the first 2^32 mod N
+    indices are drawn ceil(2^32/N)/floor(2^32/N) times as often as the
+    rest (+2.4% for the first 95% of rows at N=1e8; +0.07% at N=3e6) — a
+    regional tilt on that path only; the 2^53-resolution replacement is
+    held for a release that may move streams. (iii) The per-replicate
+    seeds are drawn from [0, 2^62), but CPU torch.Generator.manual_seed
+    keeps 32 bits (CUDA keeps 64), so the CPU per-replicate seed space is
+    2^32: two replicates of one call share a stream with probability
+    R(R-1)/2^33 (1.7e-6 at the default 120 replicates); the same holds
+    for the default init's per-replicate seeds.
     """
     if N <= _MULTINOMIAL_MAX_CATEGORIES:
         idx = torch.multinomial(
