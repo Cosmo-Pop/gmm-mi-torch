@@ -2689,3 +2689,127 @@ def test_val_ll_streams_rerouted_replicates():
             torch.cuda.synchronize()
         peak = torch.cuda.max_memory_allocated() - base
         assert peak < 1.0 * model, peak / model     # v0.5.0: 9.13x
+
+
+def test_init_streams_with_n_chunk_same_draw():
+    # 2026-10-23 review F1: the default and k-means inits ran over the full
+    # N per replicate whatever n_chunk, binding on memory before EM at
+    # large N. With n_chunk they now stream in two passes, and the draw is
+    # made in fixed blocks from each replicate's generator on both paths,
+    # so it is bitwise the same for every n_chunk and em_chunk on CPU and
+    # CUDA (pinned through the _init_draw_block seam); the streamed
+    # parameters agree with the single pass at reduction order.
+    E = gmm_mi_torch.estimator
+    orig = E._init_draw_block
+    for dev in ['cpu'] + (['cuda'] if torch.cuda.is_available() else []):
+        for dt, tol in ((torch.float64, 1e-12), (torch.float32, 2e-4)):
+            X = torch.randn(50_003, 3, generator=torch.Generator().manual_seed(0),
+                            dtype=dt).to(dev) * 2 + 5
+            ak = torch.arange(1, 4, device=dev).repeat_interleave(4)   # R=12
+            runs = {}
+            for nc in (None, 2000, 20000):
+                seen = []
+
+                def spy(out, gen, seen=seen):
+                    orig(out, gen)
+                    seen.append(out.detach().clone().flatten())
+                E._init_draw_block = spy
+                try:
+                    g = torch.Generator(device=dev).manual_seed(11)
+                    out = E._init_params(X, 3, 12, 1e-6, generator=g,
+                                         active_k=ak, em_chunk=12, n_chunk=nc)
+                finally:
+                    E._init_draw_block = orig
+                runs[nc] = (out, torch.cat(seen))
+            params0, draw0 = runs[None]
+            for nc in (2000, 20000):
+                params, draw = runs[nc]
+                # one replicate chunk: pass 1 then pass 2, each the single
+                # pass's block sequence
+                assert draw.numel() == 2 * draw0.numel()
+                assert torch.equal(draw[:draw0.numel()], draw0), (dev, dt, nc)
+                assert torch.equal(draw[draw0.numel():], draw0), (dev, dt, nc)
+                for a, b in zip(params, params0):
+                    assert torch.allclose(a, b, rtol=tol, atol=tol), (dev, dt, nc)
+            # em_chunk-invariance of the streamed init (bitwise: same
+            # chunk sums in the same order per replicate)
+            g = torch.Generator(device=dev).manual_seed(11)
+            out5 = E._init_params(X, 3, 12, 1e-6, generator=g, active_k=ak,
+                                  em_chunk=5, n_chunk=20000)
+            for a, b in zip(out5, runs[20000][0]):
+                if dev == 'cpu':
+                    assert torch.equal(a, b), dt
+                else:       # CUDA reductions depend on the batch size
+                    assert torch.allclose(a, b, rtol=tol, atol=tol), dt
+            # k-means: identical labels in both passes, parameters at
+            # reduction order
+            g = torch.Generator(device=dev).manual_seed(3)
+            k0 = E._init_params(X, 3, 6, 1e-6, generator=g, init_type='kmeans')
+            g = torch.Generator(device=dev).manual_seed(3)
+            k1 = E._init_params(X, 3, 6, 1e-6, generator=g, init_type='kmeans',
+                                n_chunk=7000)
+            for a, b in zip(k0, k1):
+                assert torch.allclose(a, b, rtol=tol, atol=tol), (dev, dt)
+    assert E._init_sample_chunk(10**6, 2000) == E._INIT_DRAW_BLOCK
+    assert E._init_sample_chunk(10**6, 40000) == 2 * E._INIT_DRAW_BLOCK
+    assert E._init_sample_chunk(5000, 40000) == 5000
+    assert E._init_bytes_per_replicate(10**6, 20, 8, torch.float32,
+                                       'random_responsibilities', 2000) \
+        == E._init_bytes_per_replicate(E._INIT_DRAW_BLOCK, 20, 8, torch.float32,
+                                       'random_responsibilities')
+
+
+def test_init_hopeless_case_raises_readably():
+    # without n_chunk at huge N the init stage cannot fit even one replicate;
+    # 'auto' used to request chunk 1 and die with an uncaught OutOfMemoryError
+    # after the first allocation. Now a RuntimeError at entry names the
+    # two ways out. CUDA only (the check reads the device's free memory).
+    if not torch.cuda.is_available():
+        pytest.skip('the check reads CUDA free memory')
+    E = gmm_mi_torch.estimator
+    saved = (torch.cuda.mem_get_info, torch.cuda.memory_reserved,
+             torch.cuda.memory_allocated)
+    # the free-memory query adds torch's cached blocks (batch 5), so pin
+    # those too: earlier CUDA tests leave hundreds of MiB in the cache
+    torch.cuda.mem_get_info = lambda dev=None: (64 * 2**20, 2**40)
+    torch.cuda.memory_reserved = lambda dev=None: 0
+    torch.cuda.memory_allocated = lambda dev=None: 0
+    try:
+        X = torch.randn(200_000, 8, device='cuda', dtype=torch.float32)
+        with pytest.raises(RuntimeError, match="n_chunk.*'minmax'"):
+            E._select_and_fit(X, 'batched', None, 20, 2, 3, 1e-6, 1e-5, 2, 0,
+                              'auto', 'random_responsibilities', None, 'valid',
+                              1e-5, 1, None)
+        # with n_chunk the init streams and the same call proceeds
+        k, params = E._select_and_fit(X[:20000], 'batched', None, 2, 2, 1,
+                                      1e-6, 1e-5, 2, 0, 'auto',
+                                      'random_responsibilities', None,
+                                      'valid', 1e-5, 1, 4096)
+        assert k >= 1
+    finally:
+        (torch.cuda.mem_get_info, torch.cuda.memory_reserved,
+         torch.cuda.memory_allocated) = saved
+
+
+def test_streamed_init_peak_under_model():
+    if not torch.cuda.is_available():
+        pytest.skip('peak-memory measurement needs a CUDA device')
+    E = gmm_mi_torch.estimator
+    N, R, K, d, nc = 400_000, 16, 20, 8, 16384
+    X = torch.randn(N, d, device='cuda', dtype=torch.float32)
+    for init in ('random_responsibilities', 'kmeans'):
+        g = torch.Generator(device='cuda').manual_seed(0)
+        E._init_params(X, K, 2, 1e-6, generator=g, init_type=init, em_chunk=2,
+                       n_chunk=nc)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        g = torch.Generator(device='cuda').manual_seed(0)
+        E._init_params(X, K, R, 1e-6, generator=g, init_type=init, em_chunk=R,
+                       n_chunk=nc)
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - base
+        model = R * E._init_bytes_per_replicate(N, K, d, torch.float32, init, nc)
+        # v0.5.0 ran this over the full N: 24x this model's sample chunk
+        assert peak <= model, (init, peak / model)

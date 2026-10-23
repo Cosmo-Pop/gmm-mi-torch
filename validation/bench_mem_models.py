@@ -99,3 +99,15 @@ for (N, d, K, R, nc) in [(20000, 2, 20, 32, None), (20000, 8, 20, 16, None), (20
         p = peak(lambda: E.val_ll(X, s, w, mu, cov, n_chunk=nc, em_chunk=R))
         m = R * E._em_bytes_per_replicate(N, K, d, dt, nc) + E._em_fixed_bytes(N, d, dt, nc)
         print(f"  N={N} d={d} K={K} R={R} n_chunk={nc} rerouted={coll}/{R}: ratio {p/m:5.2f}")
+print("streamed init stage (2026-10-23 review F1): peak / model, N=4e5, R=16, n_chunk=16384 and 65536")
+N, R = 400000, 16
+for init in ('random_responsibilities', 'kmeans'):
+    for d in (1, 2, 8):
+        for K in (1, 3, 20):
+            for nc in (16384, 65536):
+                X = torch.randn(N, d, device=dev, dtype=dt)
+                g = torch.Generator(device=dev).manual_seed(0)
+                E._init_params(X, K, 2, 1e-6, generator=g, init_type=init, em_chunk=2, n_chunk=nc)
+                g = torch.Generator(device=dev).manual_seed(0)
+                p = peak(lambda: E._init_params(X, K, R, 1e-6, generator=g, init_type=init, em_chunk=R, n_chunk=nc))
+                print(f"  {init[:6]} d={d} K={K:2d} n_chunk={nc:5d}: ratio {p/(R*E._init_bytes_per_replicate(N, K, d, dt, init, nc)):5.2f}")
