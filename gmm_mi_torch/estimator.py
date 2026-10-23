@@ -194,10 +194,14 @@ _TIE_SEED_OFFSET = 40_000
 # Auto-sizing of the replicate chunks (em_chunk / mc_chunk = 'auto'). The
 # per-replicate peak-memory models below were re-derived on the GB10 over
 # K = 1..20 and d = 1..8 (validation/bench_mem_models.py: 207 measured rows
-# per dtype at fp32 and at fp64 as of 2026-10-23, every stage incl. val_ll,
-# the streamed paths with expand-view masks, the init stage and the d=1 MC
-# stage; all at or below 0.97 of their model), in units of N_eff x itemsize
-# per replicate, and carry one to two units of slack over the measured peaks:
+# per dtype, run at fp32 and with --fp64 as of 2026-10-23, every stage incl.
+# val_ll, the streamed paths with expand-view masks, the init stage and the
+# d=1 MC stage; every row at or below its model except the streamed
+# CV-mask em_fit rows at N=4e5, d=2, where a fixed ~10-19 MiB cuBLAS
+# workspace shows against 5-45 MiB models: 1.06 at K=3 fp32, 1.42 at K=20
+# with n_chunk=4096 at both dtypes — an absolute term, irrelevant at real
+# budgets), in units of N_eff x itemsize per replicate, with one to two
+# units of slack over the measured peaks:
 #   GEMM EM step      max(K+4, 2K) + 3Kq/block   (E-step: one (R,N,K)
 #                     buffer plus four (R,N) temporaries; M-step: the
 #                     buffer plus its one blocked copy and the block
@@ -379,7 +383,8 @@ def _em_fixed_bytes(N, d, dtype, n_chunk=None):
     if _EM_KERNEL != 'gemm':
         return 0
     n_eff = N if n_chunk is None else min(N, int(n_chunk))
-    # the features plus the product temporary they are assembled from
+    # the features at 2q units: the in-place assembly peaks at q + d(d+1)/2,
+    # the rest is slack kept on the reviewer's ruling
     return 2 * n_eff * (d + d * (d + 1) // 2) * dtype.itemsize
 
 
@@ -2490,7 +2495,7 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         the measured peak-memory models (per replicate, in units of N_eff x
         itemsize with N_eff = min(N, n_chunk): max(K+6, 2K+3) plus a small
         block term for the default GEMM kernels, (4d+4)K + 4 for the legacy
-        kernels, (4d+3)K + 4 over the full N for the initialisation stage of
+        kernels, (4d+3)K + 12 over the full N for the initialisation stage of
         the default and k-means inits, which gets its own batch), capped at
         the stage's replicate count, with no replicate floor (and capped by
         torch.cuda.set_per_process_memory_fraction when one is set).

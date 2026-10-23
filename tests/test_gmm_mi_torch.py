@@ -467,8 +467,13 @@ def test_auto_chunk_sizing(monkeypatch):
                         lambda dev=None: state['reserved'])
     monkeypatch.setattr(torch.cuda, 'memory_allocated',
                         lambda dev=None: state['allocated'])
+    def frac_getter(dev):
+        # the real getter rejects an unindexed device: the code must resolve
+        # 'cuda' / torch.device('cuda') to an index before asking
+        assert isinstance(dev, int) or dev.index is not None, dev
+        return state['frac']
     monkeypatch.setattr(torch.cuda, 'get_per_process_memory_fraction',
-                        lambda dev=None: state['frac'])
+                        frac_getter)
     monkeypatch.setattr(torch.cuda, 'current_device', lambda: 0)
     assert E._auto_chunk(1000, 10**7, 'cuda') == 100
     assert E._auto_chunk(1000, 10**9, 'cuda') == 1          # no floor
@@ -2898,11 +2903,28 @@ def test_selection_masks_single_nonfinite_metric(monkeypatch):
     k, params, hist = E.select_batched(X, max_components=4, init_type='minmax',
                                        seed=3)
     assert k == ref[0] and math.isnan(hist[2][0])     # k=2 masked, same answer
+    # aic/bic: the discriminating injection is at the k the clean run selects
+    # (k=1 here), all of its inits — v0.6.0 refit from the NaN init's params
+    # and selected it on the refit's finite criterion; now a k whose every
+    # CV fit diverged is not a candidate
+    assert ref[0] == 1
+
+    def poison_all(k_bad):
+        state = {'n': 0}
+
+        def spy(Xs, s, w, mu, cov, n_chunk=None, em_chunk=None):
+            out = orig(Xs, s, w, mu, cov, n_chunk=n_chunk, em_chunk=em_chunk)
+            state['n'] += 1
+            if state['n'] == 1:
+                out = out.clone()
+                out[(k_bad - 1) * 6:k_bad * 6] = float('nan')
+            return out
+        return spy
     for mm in ('aic', 'bic'):
-        monkeypatch.setattr(E, 'val_ll', poison(2, only_once=True))
-        k2, _, _ = E.select_batched(X, max_components=4, init_type='minmax',
-                                    seed=3, metric_method=mm)
-        assert k2 != 2 and 1 <= k2 <= 4
+        monkeypatch.setattr(E, 'val_ll', poison_all(1))
+        k2, _, hist2 = E.select_batched(X, max_components=4, init_type='minmax',
+                                        seed=3, metric_method=mm)
+        assert k2 != 1 and math.isnan(hist2[1][0])
     monkeypatch.setattr(E, 'val_ll', orig)
     # sequential: a NaN at k=1 is skipped without consuming patience
     calls = {'n': 0}
@@ -2995,6 +3017,23 @@ def test_collapsed_component_offdiagonal_bound():
                           mc_samples=2000, dtype=torch.float32,
                           reg_covar=1e-10)
     assert np.isfinite(m3)
+    # the 2-D case repaired at least one factorisation (v0.6.0 aborted)
+    assert any('regularisation' in str(w.message) for w in rec)
+    # d=3 at the helper level: with residue signs (+,+,-) the pairwise bound
+    # leaves lambda_min ~ -reg, but the matrix is then within the
+    # escalation's reach — one warning — where the raw matrix aborts
+    reg3 = 1e-9
+    C = torch.tensor([[[[reg3 / 2, 2e-6, 3e-6], [2e-6, reg3 / 2, -2.5e-6],
+                        [3e-6, -2.5e-6, reg3 / 2]]]], dtype=torch.float32)
+    raw = C.clone()
+    torch.diagonal(raw, dim1=-2, dim2=-1).clamp_(min=reg3)   # the old clamp
+    with pytest.raises(RuntimeError, match='raise reg_covar'):
+        E._chol(raw)
+    bounded = E._restore_floor(C.clone(), reg3)
+    assert torch.linalg.cholesky_ex(bounded)[1].item() != 0   # still indefinite
+    with pytest.warns(RuntimeWarning, match='extra diagonal regularisation'):
+        L, cov_rep = E._chol(bounded)
+    assert torch.linalg.cholesky_ex(cov_rep)[1].item() == 0
     # the helper: a clamped 2x2 with a large residue becomes factorisable,
     # an unclamped healthy matrix is untouched bitwise
     reg = 1e-9
