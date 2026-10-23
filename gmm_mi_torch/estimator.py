@@ -66,7 +66,18 @@ class _pinned_precision:
     block, with any ambient torch.autocast region suspended (an enclosing
     mixed-precision context would otherwise run the cancellation-critical
     GEMMs at bf16/fp16, shifting both the estimate and the selected k).
-    The caller's exact settings are restored on exit. Reentrant."""
+    The caller's effective settings are restored on exit. Reentrant.
+
+    Restore and inheritance (torch >= 2.9): the per-backend getters
+    resolve an inherited ('none') knob to its parent's value, and torch
+    exposes no raw getter, so a child knob is restored to 'none' whenever
+    'none' reproduces the effective value recorded at entry, and to that
+    value explicitly otherwise. A knob that inherited from the generic
+    setting therefore keeps following it after the pin (the v0.5.0 pin
+    wrote the resolved value back and silently severed that link). The
+    one case the rule cannot tell apart: a child set EXPLICITLY to the
+    same value as its parent comes back inherited — the same precision
+    now, and a later change of the parent then moves it too."""
 
     def __enter__(self):
         if _FP32_KNOBS is not None:
@@ -94,8 +105,15 @@ class _pinned_precision:
         for cm in reversed(self._autocast):
             cm.__exit__(*exc)
         if _FP32_KNOBS is not None:
-            for knob, prev in zip(_FP32_KNOBS, self._prev):
-                knob.fp32_precision = prev
+            # the generic knob has no parent (recorded == raw); children
+            # first try 'none' and keep it when that is the recorded
+            # effective value, so inheritance survives the pin
+            generic, children = _FP32_KNOBS[0], _FP32_KNOBS[1:]
+            generic.fp32_precision = self._prev[0]
+            for knob, prev in zip(children, self._prev[1:]):
+                knob.fp32_precision = 'none'
+                if knob.fp32_precision != prev:
+                    knob.fp32_precision = prev
         else:
             torch.set_float32_matmul_precision(self._prev)
         return False

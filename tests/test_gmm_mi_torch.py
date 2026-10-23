@@ -2467,3 +2467,76 @@ def test_bootstrap_resample_uniform_at_float32():
         regional = s32.mean(0).view(8, -1).mean(1).cpu()
         sigma = (1.0 / (B * N / 8)) ** 0.5        # Poisson-ish, per region
         assert ((regional - 1.0).abs() / sigma).max() < 4.0, (dev, regional)
+
+
+def test_precision_pin_preserves_knob_inheritance():
+    # 2026-10-23 review F7: the pin recorded RESOLVED fp32_precision values
+    # and wrote them back explicitly, so a child knob that inherited from
+    # the generic setting left estimate() pinned and no longer followed
+    # the caller's later generic change. The ruled test matrix: fresh
+    # 'none' state, generic-only, explicit child != parent, intermediate
+    # level explicit, nested pins.
+    E = gmm_mi_torch.estimator
+    if E._FP32_KNOBS is None:
+        pytest.skip('per-backend fp32_precision knobs need torch >= 2.9')
+    C = torch._C
+    levels = (('generic', 'all'), ('cuda', 'all'), ('cuda', 'matmul'),
+              ('mkldnn', 'all'), ('mkldnn', 'matmul'))
+    saved = [C._get_fp32_precision_getter(*lv) for lv in levels]
+
+    def reset():
+        for lv in levels:
+            C._set_fp32_precision_setter(*lv, 'none')
+
+    def cuda_mm():
+        return torch.backends.cuda.matmul.fp32_precision
+
+    def mk_mm():
+        return torch.backends.mkldnn.matmul.fp32_precision
+    try:
+        # 0. fresh process: 'none' everywhere, restored as 'none'
+        reset()
+        with E._pinned_precision():
+            assert cuda_mm() == 'ieee' and mk_mm() == 'ieee'
+        assert C._get_fp32_precision_getter('cuda', 'matmul') == 'none'
+        assert C._get_fp32_precision_getter('generic', 'all') == 'none'
+        # 1. generic only: children follow a later generic change
+        reset()
+        torch.backends.fp32_precision = 'tf32'
+        with E._pinned_precision():
+            pass
+        torch.backends.fp32_precision = 'ieee'
+        assert cuda_mm() == 'ieee' and mk_mm() == 'ieee'
+        # 2. explicit children differing from the parent stay explicit
+        reset()
+        torch.backends.fp32_precision = 'ieee'
+        torch.backends.cuda.matmul.fp32_precision = 'tf32'
+        torch.backends.mkldnn.matmul.fp32_precision = 'bf16'
+        with E._pinned_precision():
+            pass
+        assert cuda_mm() == 'tf32' and mk_mm() == 'bf16'
+        torch.backends.fp32_precision = 'tf32'
+        assert mk_mm() == 'bf16'
+        # 3. an explicit intermediate level: untouched, and its inherited
+        #    child keeps following it
+        reset()
+        C._set_fp32_precision_setter('cuda', 'all', 'tf32')
+        with E._pinned_precision():
+            assert C._get_fp32_precision_getter('cuda', 'all') == 'tf32'
+            assert cuda_mm() == 'ieee'
+        assert cuda_mm() == 'tf32'
+        C._set_fp32_precision_setter('cuda', 'all', 'ieee')
+        assert cuda_mm() == 'ieee'
+        # 4. nested pins under a generic-only setting
+        reset()
+        torch.backends.fp32_precision = 'tf32'
+        with E._pinned_precision():
+            with E._pinned_precision():
+                assert cuda_mm() == 'ieee'
+            assert cuda_mm() == 'ieee'
+        assert cuda_mm() == 'tf32'
+        torch.backends.fp32_precision = 'ieee'
+        assert cuda_mm() == 'ieee' and mk_mm() == 'ieee'
+    finally:
+        for lv, v in zip(levels, saved):
+            C._set_fp32_precision_setter(*lv, v)
