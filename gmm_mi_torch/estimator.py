@@ -1858,18 +1858,30 @@ def _bootstrap_counts(N, B, dtype, device, generator):
     Memory: the multinomial path's draw is the validated resample stream,
     so it stays ONE call on the whole (B, N) index matrix — but its
     probability input is a single (1, N) row expanded to (B, N) (bitwise
-    the same draw on CPU and CUDA, measured) and the scatter source an
-    expanded ones row, so the only full-size transient is torch.multinomial's
-    own (B, N) int64 index matrix plus its internal prefix sums. The randint
-    path (N > 2^24, where the weights alone are GiB) draws and histograms
-    one replicate at a time from per-replicate generators seeded off
+    the same draw as the dense matrix on CPU and CUDA, measured) and the
+    scatter source an expanded ones row, so the only full-size transient
+    is torch.multinomial's own (B, N) int64 index matrix plus its internal
+    prefix sums (CUDA, float64 row: ~4x the float64 weights, i.e. ~8x
+    float32 weights; outside the OOM guard by design). The randint path
+    (N > 2^24, where the weights alone are GiB) draws and histograms one
+    replicate at a time from per-replicate generators seeded off
     `generator`, so its transient is one (N,) index vector; that path's
     stream is therefore chunk- and retry-invariant by construction, and
     differs from the (B, N) draw of earlier versions.
+
+    Precision: the probability row is built at float64 whatever the
+    working dtype. torch's CPU multinomial accumulates the row's CDF
+    sequentially in the row's dtype, and at float32 the step 1/N rounds
+    differently in each binade of the running sum: a fixed, replicate-
+    independent tilt of the sampling weights by index region (16 sigma
+    at N=1e6, up to 33% max/min at N=1e7 — a bias on index-ordered data
+    that the bootstrap errorbar cannot see). With the float64 row the
+    float32 and float64 resamples are uniform and bitwise identical to
+    each other, on CPU and CUDA.
     """
     if N <= _MULTINOMIAL_MAX_CATEGORIES:
         idx = torch.multinomial(
-            torch.full((1, N), 1.0 / N, dtype=dtype, device=device)
+            torch.full((1, N), 1.0 / N, dtype=torch.float64, device=device)
             .expand(B, N), N, replacement=True, generator=generator)
         # the counts are allocated after the draw: torch.multinomial's own
         # transient is the peak, and nothing else is live during it

@@ -2244,16 +2244,24 @@ def test_bootstrap_counts_stream_and_transients(monkeypatch):
     # per-replicate generators — one (N,) index vector live, no (B,N) int64
     E = gmm_mi_torch.estimator
     N, B = 3000, 5
+    outs = {}
     for dt in (torch.float64, torch.float32):
         g = torch.Generator().manual_seed(7)
         got = E._bootstrap_counts(N, B, dt, 'cpu', g)
         g = torch.Generator().manual_seed(7)
-        idx = torch.multinomial(torch.full((B, N), 1.0 / N, dtype=dt), N,
+        # the reference is the dense (B,N) FLOAT64 row (2026-10-23 review
+        # F2: the row is float64 whatever the working dtype, see the test
+        # below), scattered the way v0.4.0 did
+        idx = torch.multinomial(torch.full((B, N), 1.0 / N,
+                                           dtype=torch.float64), N,
                                 replacement=True, generator=g)
         ref = torch.zeros(B, N, dtype=dt).scatter_add_(
             1, idx, torch.ones(B, N, dtype=dt))
         assert torch.equal(got, ref)
+        assert got.dtype == dt
         assert torch.equal(got.sum(1), torch.full((B,), float(N), dtype=dt))
+        outs[dt] = got
+    assert torch.equal(outs[torch.float32].double(), outs[torch.float64])
     shapes = []
     orig = torch.randint
 
@@ -2437,3 +2445,25 @@ def test_plotting_internals_hardened():
     biases, red_chi2, df = P.plot_bias_chi2_histogram(est.tolist(), 0.5, ax=ax)
     assert df == 29 and np.isfinite(red_chi2)
     plt.close(fig)
+
+
+def test_bootstrap_resample_uniform_at_float32():
+    # 2026-10-23 review F2: with the probability row at the working dtype,
+    # torch's CPU multinomial accumulated a float32 CDF whose step 1/N
+    # rounds differently in each binade of the running sum — regional
+    # sampling weights 0.9896..1.0049 at N=1e6 (16 sigma), identical in
+    # every replicate, a fixed bias on index-ordered data. The row is now
+    # float64: regional weights within noise, and the float32 resample is
+    # bitwise the float64 one on every device.
+    E = gmm_mi_torch.estimator
+    N, B = 1_000_000, 20
+    devices = ['cpu'] + (['cuda'] if torch.cuda.is_available() else [])
+    for dev in devices:
+        s32 = E._bootstrap_counts(N, B, torch.float32, dev,
+                                  torch.Generator(device=dev).manual_seed(10_000))
+        s64 = E._bootstrap_counts(N, B, torch.float64, dev,
+                                  torch.Generator(device=dev).manual_seed(10_000))
+        assert torch.equal(s32.double(), s64), dev
+        regional = s32.mean(0).view(8, -1).mean(1).cpu()
+        sigma = (1.0 / (B * N / 8)) ** 0.5        # Poisson-ish, per region
+        assert ((regional - 1.0).abs() / sigma).max() < 4.0, (dev, regional)
