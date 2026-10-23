@@ -1410,7 +1410,9 @@ def _val_ll_core(X, s_val, w, mu, cov, n_chunk=None):
     float32 the drift of a working-dtype sum grows as sqrt(#chunks) x ulp
     and reaches a visible fraction of threshold_components at large N — and
     this metric decides k. Replicates the reroute detector trips are scored
-    with the centred legacy kernels, as in em_fit. `s_val` is a dense
+    with the centred legacy kernels in em_fit's model-derived sample chunk,
+    so the scoring stage stays inside the budget em_chunk was sized with
+    (a RuntimeWarning per call reports them, as in em_fit). `s_val` is a dense
     (R,N) tensor or a _WeightChunks accessor; either way the weights are
     read per sample chunk and only the rerouted rows are ever gathered."""
     wc = (s_val if isinstance(s_val, _WeightChunks)
@@ -1438,9 +1440,17 @@ def _val_ll_core(X, s_val, w, mu, cov, n_chunk=None):
                                * torch.logsumexp(lj, -1)).sum(1).double()
             acc[gi] = accg
         if li.numel():
+            # rerouted rows are scored by the centred legacy kernels in
+            # the same model-derived sample chunk em_fit streams them with
+            # (2026-10-23 review F4: one broadcast pass over N peaked 3-9x
+            # the budget the replicate chunk was sized with)
+            nl = _legacy_sample_chunk(N, w.shape[-1], X.shape[-1], X.dtype,
+                                      n_chunk)
             acc[li] = _legacy_score_sum(X, wc, w[li], mu[li], chol_all[li],
-                                        n_chunk, rows=li)
+                                        min(nl, n_chunk or N), rows=li)
     else:
+        # legacy kernels selected by the environment: em_chunk was sized
+        # from the legacy model, so the caller's n_chunk stands
         chol, _ = _chol(cov)
         acc = _legacy_score_sum(X, wc, w, mu, chol, n_chunk)
     tot = wc.totals()

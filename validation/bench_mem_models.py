@@ -89,3 +89,13 @@ for K in (1, 3, 20):
     pe = peak(lambda: E.em_fit(X, train, w, mu, cov, em_chunk=R, max_iter=30))
     pv = peak(lambda: E.val_ll(X, val, w, mu, cov, em_chunk=R))
     print(f"  K={K:2d}: em_fit ratio {pe/m:5.2f}  val_ll ratio {pv/m:5.2f}")
+
+print("val_ll with rerouted replicates (2026-10-23 review F4): peak / em budget")
+for (N, d, K, R, nc) in [(20000, 2, 20, 32, None), (20000, 8, 20, 16, None), (20000, 8, 4, 8, 5000), (200000, 8, 3, 32, None)]:
+    X = torch.randn(N, d, device=dev, dtype=dt); s = torch.ones(R, N, device=dev, dtype=dt)
+    for coll in (R, R // 2, 0):
+        w, mu, cov = params(X, K, R, dt, collapse=coll)
+        E.val_ll(X, s, w, mu, cov, n_chunk=nc, em_chunk=R)
+        p = peak(lambda: E.val_ll(X, s, w, mu, cov, n_chunk=nc, em_chunk=R))
+        m = R * E._em_bytes_per_replicate(N, K, d, dt, nc) + E._em_fixed_bytes(N, d, dt, nc)
+        print(f"  N={N} d={d} K={K} R={R} n_chunk={nc} rerouted={coll}/{R}: ratio {p/m:5.2f}")
