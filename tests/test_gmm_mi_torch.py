@@ -2636,3 +2636,56 @@ def test_streamed_path_holds_no_full_weight_copies():
         torch.cuda.synchronize()
         peak = torch.cuda.max_memory_allocated() - base
         assert peak < 2.0 * model, peak / model
+
+
+def test_val_ll_streams_rerouted_replicates():
+    # 2026-10-23 review F4: val_ll scored rerouted (collapsed) replicates in
+    # one broadcast legacy pass over N while em_fit streamed them at the
+    # model-derived sample chunk — 3.1x the em budget at d=2 K=20, 9.1x at
+    # d=8 K=20 on the GB10, OOM-retry chains on 'auto'. Pins: the shared
+    # chunk helper, values at reduction order against the unchunked
+    # evaluation (CPU), and the peak under the em budget (CUDA).
+    E = gmm_mi_torch.estimator
+    if E._EM_KERNEL != 'gemm':
+        pytest.skip('the reroute partition exists only under the GEMM kernels')
+    assert E._legacy_sample_chunk(20000, 5, 4, torch.float32) \
+        == E._legacy_sample_chunk(20000, 5, 4, torch.float64)
+    g = torch.Generator().manual_seed(0)
+    X = torch.randn(6000, 2, generator=g, dtype=torch.float32)
+    X = (X - X.mean(0)) / X.std(0)
+    w, mu, cov = E._init_params(X, 3, 8, 1e-6, generator=g, init_type='minmax')
+    mu[::2, 0] = 4.0
+    cov[::2, 0] = 1e-6 * torch.eye(2)
+    s = torch.rand(8, 6000, generator=g) + 0.5
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        got = E.val_ll(X, s, w, mu, cov, em_chunk=8)
+        chol, _ = E._chol(cov)
+        ref = (E.gmm_score(X.expand(8, 6000, 2), w, mu, chol) * s).sum(1) \
+            / s.sum(1)
+        assert torch.allclose(got, ref, rtol=1e-5, atol=1e-6)
+        per = torch.cat([E.val_ll(X, s[r:r + 1], w[r:r + 1], mu[r:r + 1],
+                                  cov[r:r + 1]) for r in range(8)])
+        assert torch.equal(got, per)              # em_chunk-invariant
+    if torch.cuda.is_available():
+        N, R, K, d = 20000, 16, 20, 8
+        Xc = torch.randn(N, d, device='cuda', dtype=torch.float32)
+        gc = torch.Generator(device='cuda').manual_seed(0)
+        w, mu, cov = E._init_params(Xc, K, R, 1e-6, generator=gc,
+                                    init_type='minmax', em_chunk=R)
+        mu[:, 0] = 4.0
+        cov[:, 0] = 1e-6 * torch.eye(d, device='cuda')
+        ones = torch.ones(R, N, device='cuda')
+        model = (R * E._em_bytes_per_replicate(N, K, d, torch.float32)
+                 + E._em_fixed_bytes(N, d, torch.float32))
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            E.val_ll(Xc, ones, w, mu, cov, em_chunk=R)
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            base = torch.cuda.memory_allocated()
+            E.val_ll(Xc, ones, w, mu, cov, em_chunk=R)
+            torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - base
+        assert peak < 1.0 * model, peak / model     # v0.5.0: 9.13x
