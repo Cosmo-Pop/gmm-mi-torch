@@ -65,3 +65,27 @@ for d, q in ((2, 'MI'), (3, 'cMI'), (4, 'TC'), (8, 'TC')):
                 return E._INTEGRANDS[q](pts, w, mu, cov, chol).mean(1)
             mc(); p = peak(mc)
             print(f"  d={d} {q:3s} K={K:2d} b={b}: ratio {p/(b*E._mc_bytes_per_replicate(100_000, K, d, dt)):5.2f}")
+
+print("streamed path with expand-view CV masks and converging replicates (2026-10-23 review F6), N=4e5, R=32, d=2")
+N, d, R = 400000, 2, 32
+X = torch.randn(N, d, device=dev, dtype=dt)
+train, val = E._cv_masks(N, 2, 16, dt, device=dev)
+for nc in (4096, 65536):
+    for K in (1, 3, 20):
+        w, mu, cov = params(X, K, R, dt)
+        m = R * E._em_bytes_per_replicate(N, K, d, dt, nc) + E._em_fixed_bytes(N, d, dt, nc)
+        E.em_fit(X, train, w, mu, cov, em_chunk=R, max_iter=2, n_chunk=nc)
+        pe = peak(lambda: E.em_fit(X, train, w, mu, cov, em_chunk=R, max_iter=6, n_chunk=nc))
+        pv = peak(lambda: E.val_ll(X, val, w, mu, cov, em_chunk=R, n_chunk=nc))
+        print(f"  n_chunk={nc:5d} K={K:2d}: em_fit ratio {pe/m:5.2f}  val_ll ratio {pv/m:5.2f}  (model {m/2**20:.0f} MiB; at K=20, n_chunk=4096 the fixed cuBLAS workspace shows against a 23 MiB model)")
+print("single pass with expand-view CV masks and converging replicates, N=20000, R=64, d=2")
+N, R = 20000, 64
+X = torch.randn(N, 2, device=dev, dtype=dt)
+train, val = E._cv_masks(N, 2, 32, dt, device=dev)
+for K in (1, 3, 20):
+    w, mu, cov = params(X, K, R, dt)
+    m = R * E._em_bytes_per_replicate(N, K, 2, dt) + E._em_fixed_bytes(N, 2, dt)
+    E.em_fit(X, train, w, mu, cov, em_chunk=R, max_iter=2)
+    pe = peak(lambda: E.em_fit(X, train, w, mu, cov, em_chunk=R, max_iter=30))
+    pv = peak(lambda: E.val_ll(X, val, w, mu, cov, em_chunk=R))
+    print(f"  K={K:2d}: em_fit ratio {pe/m:5.2f}  val_ll ratio {pv/m:5.2f}")
