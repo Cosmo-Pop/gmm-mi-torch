@@ -91,8 +91,8 @@ results at init-noise level, and for the new entry errors.
   from its own model, over the full N, instead of the 3x GEMM model
   (it was 3.4-11x over budget and retried before any EM ran).
 - Memory, CV masks: select_batched held the masks repeated
-  max_components times (2(K+1)*I*F*N*itemsize: 960 B/sample at float64
-  defaults, 40 GiB of the README's 77.5 GiB N=1e8 run). em_fit and
+  max_components times (2(K+1)*I*F*N*itemsize: ~2 kB/sample at float64
+  defaults, 1 kB at float32; 40 GiB of the README's 77.5 GiB N=1e8 run). em_fit and
   val_ll now take weights with the replicate axis split over leading
   dims and gather each chunk's rows from an expand() view: 183 MiB ->
   3 MiB per mask at N=2e5.
