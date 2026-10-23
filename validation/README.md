@@ -34,9 +34,18 @@ of the versions stated there.
 Scripts behind the "parallelise MI over pairs" scoping and the `em_chunk='auto'`
 default (v0.1.1), all run on the same GB10 with `PYTHONPATH=<repo> python <script>`:
 
+- `bench_mem_models.py` — the memory-model tooling since v0.5.0 (hardening pass,
+  2026-10-21): measured peak / model for every auto-sized stage (single-pass and
+  streamed GEMM EM, rerouted EM, val_ll with and without rerouted replicates, the
+  init stage single-pass and streamed, the MC stage) at fp32 and fp64; source of
+  the per-replicate models in `estimator.py` (GEMM EM max(K+6, 2K+3) + 3Kq/512
+  units of N_eff × itemsize, legacy (4d+4)K + 4, init (4d+3)K + 12, MC
+  max((3d+2)K + d + 7, d² + 4d + 6), all × 1.03). Every row must stay at or
+  below 1.0.
 - `bench_mem.py` — peak CUDA memory per replicate for one EM iteration and one
-  MC chunk; source of the memory model in `estimator.py` (EM: N×K×itemsize×(4d+3),
-  MC: mc_samples×K×itemsize×(3d+1), measured to within 2% for d=1..8, K=5..20, fp32/fp64).
+  MC chunk; source of the ORIGINAL v0.1.1 auto-chunk models (EM: N×K×itemsize×(4d+3),
+  MC: mc_samples×K×itemsize×(3d+1), measured to within 2% for d=1..8, K=5..20,
+  fp32/fp64), superseded by the models above.
 - `bench_single.py` — one N=20k pair at the beta tester's settings: phase breakdown
   (selection / bootstrap / MC) and wall time vs `em_chunk`.
 - `bench_iters.py` — per-iteration trace of the active replicate count (straggler
