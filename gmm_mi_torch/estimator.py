@@ -176,6 +176,16 @@ _MULTINOMIAL_MAX_CATEGORIES = 1 << 24
 _MC_SEED_OFFSET = 50_000
 _MC_CAT_STRIDE = 1 << 20
 
+# The default initialisation draws each replicate's responsibilities in
+# fixed sample blocks of this many rows, sequentially from the replicate's
+# own generator, on the single-pass and the streamed (n_chunk) path alike:
+# the draw is then invariant to em_chunk AND n_chunk by construction on
+# every device (CUDA's Philox streams are not sequential across calls, so
+# any other chunking of the draw would depend on the chunk size). 2^14
+# measured on the GB10: 1.3 ms per replicate at N=1e6 (one-shot 0.6 ms),
+# ~0.1 s per replicate and pass at N=1e8.
+_INIT_DRAW_BLOCK = 1 << 14
+
 # gaussianise's random tie-breaking draws its permutations from
 # seed + _TIE_SEED_OFFSET (one CPU generator, advanced per column so the
 # per-column permutations are independent).
@@ -193,8 +203,9 @@ _TIE_SEED_OFFSET = 40_000
 #   legacy EM step    (4d+4)K + ~2                (broadcast (R,N,K,d)
 #                     operands; the rerouted replicates stream their
 #                     samples so they fit the GEMM budget — _em_fit_core)
-#   init stage        (4d+2)K + ~3 for the default and k-means inits,
-#                     over the FULL N (it ignores n_chunk); ~0 for minmax
+#   init stage        (4d+3)K + 12 for the default and k-means inits over
+#                     N, or over the n_chunk-rounded sample chunk when
+#                     streamed; ~0 for minmax
 #   MC stage          max((3d+1)K + d + 3, d^2 + 4d + 2) per mc_sample, +4
 #                     (integrand with its analytic marginals; gmm_sample's
 #                     (S,d,d) Cholesky gather dominates at small K)
@@ -338,13 +349,28 @@ def _em_fixed_bytes(N, d, dtype, n_chunk=None):
     return 2 * n_eff * (d + d * (d + 1) // 2) * dtype.itemsize
 
 
-def _init_bytes_per_replicate(N, K, d, dtype, init_type):
+def _init_sample_chunk(N, n_chunk=None):
+    """Sample chunk of the streamed initialisation: n_chunk rounded down to
+    a whole number of draw blocks (at least one block), capped at N; None
+    (single pass) is the full N."""
+    if n_chunk is None:
+        return N
+    return min(N, _INIT_DRAW_BLOCK * max(1, int(n_chunk) // _INIT_DRAW_BLOCK))
+
+
+def _init_bytes_per_replicate(N, K, d, dtype, init_type, n_chunk=None):
     """Peak memory per replicate of the initialisation stage: the default
     and k-means inits run the broadcast M-step / assignment statistics over
-    the full N (n_chunk does not apply); minmax allocates nothing of note."""
+    the full N without n_chunk, and over sample chunks of
+    _init_sample_chunk(N, n_chunk) with it; minmax allocates nothing of
+    note."""
     if init_type == 'minmax':
-        return _em_bytes_per_replicate(N, K, d, dtype)
-    return int(N * dtype.itemsize * ((4 * d + 3) * K + 4))
+        return _em_bytes_per_replicate(N, K, d, dtype, n_chunk)
+    n_eff = _init_sample_chunk(N, n_chunk)
+    # +12: the k-means pass holds the (c,n) int64 labels and the (c,n,K)
+    # distance matrix beside the one-hot — measured 1.7x an 11 MiB model at
+    # K=1, d=1 with the old +4 (validation/bench_mem_models.py)
+    return int(n_eff * dtype.itemsize * ((4 * d + 3) * K + 12))
 
 
 def _mc_bytes_per_replicate(mc_samples, K, d, dtype):
@@ -863,8 +889,15 @@ def _em_step_gemm_nchunked(X, wc, w, mu, cov, reg_covar, n_chunk, rows=None):
 # weighted batched EM
 # ----------------------------------------------------------------------
 
+def _init_draw_block(out, generator):
+    """One block of the default init's responsibility draw (a seam the
+    tests spy on to check the draw is identical across chunkings)."""
+    out.uniform_(generator=generator)
+
+
 def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
-                 init_type='random_responsibilities', scale=None, em_chunk=8):
+                 init_type='random_responsibilities', scale=None, em_chunk=8,
+                 n_chunk=None):
     """Batched GMM parameter initialisation (torch ports of GMM-MI's inits).
 
     init_type:
@@ -880,8 +913,14 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
     (for the batched-over-k protocol); components >= active_k[r] are dead.
     The responsibility draw and the initial M-step / assignment stats run
     in replicate chunks of `em_chunk`, under the same halve-and-retry CUDA
-    out-of-memory guard as `em_fit`; results are chunk-invariant (the
-    default init seeds one generator per replicate from `generator`).
+    out-of-memory guard as `em_fit`, and — with `n_chunk` — streamed over
+    sample chunks of _init_sample_chunk(N, n_chunk) in two passes (means,
+    then centred second moments: the same algebra as the single-pass
+    M-step, with float64 accumulators). Results are chunk-invariant: the
+    default init seeds one generator per replicate from `generator` and
+    draws in fixed blocks of _INIT_DRAW_BLOCK samples, so the draw is the
+    same for every em_chunk and n_chunk on every device; the streamed
+    moments agree with the single pass at reduction order.
     """
     N, d = X.shape
     dev, dt = X.device, X.dtype
@@ -903,20 +942,68 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
         seeds = torch.randint(0, 1 << 62, (R,), generator=generator,
                               device=dev).tolist()
         comp = torch.arange(K, device=dev).view(1, 1, K)
-        ones = torch.ones(1, N, dtype=dt, device=dev)
+        B0 = _INIT_DRAW_BLOCK
+        nc = _init_sample_chunk(N, n_chunk)
+
+        def _draw(r, gens, i):
+            # samples [i, i + r.shape[1]) of each replicate, block by block
+            # from that replicate's generator; i and the chunk are whole
+            # blocks, so the block sequence is the single pass's
+            for b in range(0, r.shape[1], B0):
+                for j, g in enumerate(gens):
+                    _init_draw_block(r[j, b:b + B0], g)
+
+        def _resp(r, lo, hi):
+            if active_k is not None:
+                r.mul_(comp < ak[lo:hi].view(hi - lo, 1, 1))
+            r.div_(r.sum(-1, keepdim=True).clamp_min(1e-30))
+            return r
 
         def _init_mstep(sl):
             lo, hi = sl.start, min(sl.stop, R)
             c = hi - lo
-            r = torch.empty(c, N, K, dtype=dt, device=dev)
-            for j in range(c):
-                r[j].uniform_(generator=torch.Generator(device=dev)
-                              .manual_seed(seeds[lo + j]))
-            if active_k is not None:
-                r.mul_(comp < ak[lo:hi].view(c, 1, 1))
-            r.div_(r.sum(-1, keepdim=True).clamp_min(1e-30))
-            return _m_step(X.expand(c, N, d), r, ones.expand(c, N),
-                           reg_covar)
+            if n_chunk is None:
+                r = torch.empty(c, N, K, dtype=dt, device=dev)
+                _draw(r, [torch.Generator(device=dev).manual_seed(seeds[lo + j])
+                          for j in range(c)], 0)
+                return _m_step(X.expand(c, N, d), _resp(r, lo, hi),
+                               torch.ones(1, N, dtype=dt, device=dev)
+                               .expand(c, N), reg_covar)
+            # streamed, two passes (the M-step centres on the NEW mean, so
+            # one pass would have to use origin moments — beyond reduction
+            # order on offset data); the draw is regenerated for pass 2
+            Nk = torch.zeros(c, K, dtype=torch.float64, device=dev)
+            S1 = torch.zeros(c, K, d, dtype=torch.float64, device=dev)
+            for p in range(2):
+                gens = [torch.Generator(device=dev).manual_seed(seeds[lo + j])
+                        for j in range(c)]
+                if p == 1:
+                    mu = S1 / Nk.clamp_min(1e-10).unsqueeze(-1)       # (c,K,d)
+                    S2 = torch.zeros(c, K, d, d, dtype=torch.float64,
+                                     device=dev)
+                for i in range(0, N, nc):
+                    Xc = X[i:i + nc]
+                    n = Xc.shape[0]
+                    r = torch.empty(c, n, K, dtype=dt, device=dev)
+                    _draw(r, gens, i)
+                    r = _resp(r, lo, hi)
+                    if p == 0:
+                        Nk += r.sum(1).double()
+                        S1 += torch.einsum('rnk,nd->rkd', r, Xc).double()
+                    else:
+                        diff = Xc.view(1, n, 1, d) - mu.to(dt).unsqueeze(1)
+                        S2 += torch.einsum('rnk,rnki,rnkj->rkij', r, diff,
+                                           diff).double()
+                    del r
+            dead = Nk < 1e-10
+            Nks = Nk.clamp_min(1e-10)
+            cov = S2 / Nks[..., None, None] + reg_covar * eye.double()
+            w = torch.where(dead, torch.zeros_like(Nk), Nk / N)
+            w = w / w.sum(-1, keepdim=True).clamp_min(1e-30)
+            mu = torch.where(dead[..., None], torch.zeros_like(mu), mu)
+            cov = torch.where(dead[..., None, None], eye.double().expand_as(cov),
+                              cov)
+            return w.to(dt), mu.to(dt), cov.to(dt)
         outs = _run_chunked(R, em_chunk, _init_mstep)
         return tuple(torch.cat([o[j] for o in outs]) for j in range(3))
 
@@ -962,30 +1049,56 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
             C = torch.where((cnt > 0)[..., None], Cn, C)
         # hard-assignment statistics on the full dataset, chunked over R
         x2 = (X ** 2).sum(-1)                                         # (N,)
+        nc = _init_sample_chunk(N, n_chunk)
 
-        def _assign_stats(sl):
-            Cc, al = C[sl], alive[sl]
-            c = Cc.shape[0]
-            d2 = (x2.view(1, N, 1) + (Cc ** 2).sum(-1).unsqueeze(1)
-                  - 2.0 * torch.einsum('nd,rkd->rnk', X, Cc))
+        def _onehot(Xc, x2c, Cc, al):
+            d2 = (x2c.view(1, -1, 1) + (Cc ** 2).sum(-1).unsqueeze(1)
+                  - 2.0 * torch.einsum('nd,rkd->rnk', Xc, Cc))
             d2 = torch.where(al.unsqueeze(1), d2, torch.full_like(d2, big))
             lab = d2.argmin(-1)
-            oh = torch.zeros(c, N, K, dtype=dt, device=dev).scatter_(
+            return torch.zeros(*lab.shape, K, dtype=dt, device=dev).scatter_(
                 2, lab.unsqueeze(-1), 1.0)
-            Nk = oh.sum(1)
-            w = Nk / N
-            mu = torch.einsum('rnk,nd->rkd', oh, X) \
-                / Nk.clamp_min(1.0)[..., None]
-            diff = X.view(1, N, 1, d) - mu.unsqueeze(1)
-            # GMM-MI normalises the k-means covariances by N, not by Nk
-            cov = torch.einsum('rnk,rnki,rnkj->rkij', oh, diff, diff) / N \
-                + reg_covar * eye
+
+        def _finish(w, mu, cov, Nk, al):
             dead = (Nk < 1.0) | ~al
             w = torch.where(dead, torch.zeros_like(w), w)
             w = w / w.sum(-1, keepdim=True).clamp_min(1e-30)
             mu = torch.where(dead[..., None], torch.zeros_like(mu), mu)
             cov = torch.where(dead[..., None, None], eye.expand_as(cov), cov)
             return w, mu, cov
+
+        def _assign_stats(sl):
+            Cc, al = C[sl], alive[sl]
+            c = Cc.shape[0]
+            if n_chunk is None:
+                oh = _onehot(X, x2, Cc, al)
+                Nk = oh.sum(1)
+                w = Nk / N
+                mu = torch.einsum('rnk,nd->rkd', oh, X) \
+                    / Nk.clamp_min(1.0)[..., None]
+                diff = X.view(1, N, 1, d) - mu.unsqueeze(1)
+                # GMM-MI normalises the k-means covariances by N, not by Nk
+                cov = torch.einsum('rnk,rnki,rnkj->rkij', oh, diff, diff) / N \
+                    + reg_covar * eye
+                return _finish(w, mu, cov, Nk, al)
+            # streamed: labels depend only on the centres, so the two
+            # passes see identical assignments
+            Nk = torch.zeros(c, K, dtype=torch.float64, device=dev)
+            Sx = torch.zeros(c, K, d, dtype=torch.float64, device=dev)
+            for i in range(0, N, nc):
+                oh = _onehot(X[i:i + nc], x2[i:i + nc], Cc, al)
+                Nk += oh.sum(1).double()
+                Sx += torch.einsum('rnk,nd->rkd', oh, X[i:i + nc]).double()
+            mu = (Sx / Nk.clamp_min(1.0)[..., None]).to(dt)
+            Sdd = torch.zeros(c, K, d, d, dtype=torch.float64, device=dev)
+            for i in range(0, N, nc):
+                Xc = X[i:i + nc]
+                oh = _onehot(Xc, x2[i:i + nc], Cc, al)
+                diff = Xc.view(1, -1, 1, d) - mu.unsqueeze(1)
+                Sdd += torch.einsum('rnk,rnki,rnkj->rkij', oh, diff,
+                                    diff).double()
+            cov = (Sdd / N).to(dt) + reg_covar * eye
+            return _finish((Nk / N).to(dt), mu, cov, Nk.to(dt), al)
         outs = _run_chunked(R, em_chunk, _assign_stats)
         w, mu, cov = (torch.cat([o[j] for o in outs]) for j in range(3))
         if init_type == 'randomized_kmeans':
@@ -1567,7 +1680,7 @@ def _cv_fit_for_k(X, K, n_folds, n_inits, reg_covar, threshold_fit, max_iter, se
     w0, mu0, cov0 = _init_params(X, K, R, reg_covar, generator=g,
                                  init_type=init_type, scale=scale,
                                  em_chunk=em_chunk if init_chunk is None
-                                 else init_chunk)
+                                 else init_chunk, n_chunk=n_chunk)
     w, mu, cov, _ = em_fit(X, train, w0, mu0, cov0, reg_covar, threshold_fit, max_iter,
                            em_chunk=em_chunk, n_chunk=n_chunk)
     v = val_ll(X, val, w, mu, cov, n_chunk=n_chunk,
@@ -1706,7 +1819,7 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
                                  active_k=active_k, init_type=init_type,
                                  scale=scale,
                                  em_chunk=em_chunk if init_chunk is None
-                                 else init_chunk)
+                                 else init_chunk, n_chunk=n_chunk)
     w, mu, cov, _ = em_fit(X, train_r, w0, mu0, cov0, reg_covar, threshold_fit, max_iter,
                            em_chunk=em_chunk, n_chunk=n_chunk)
     v = val_ll(X, val_r, w, mu, cov, n_chunk=n_chunk,
@@ -1940,11 +2053,23 @@ def _select_and_fit(X, protocol, fixed_components_number, max_components,
     em_chunk_sel = _resolve_chunk(
         em_chunk, r_sel, _em_bytes_per_replicate(N, k_sel, d, X.dtype, n_chunk),
         X.device, fixed_bytes=_em_fixed_bytes(N, d, X.dtype, n_chunk))
-    # the init stage has its own (larger, n_chunk-blind) model: an
+    # the init stage has its own (larger) model, streamed with n_chunk: an
     # integer em_chunk is honoured as given, 'auto' sizes the two apart
-    init_chunk_sel = _resolve_chunk(
-        em_chunk, r_sel,
-        _init_bytes_per_replicate(N, k_sel, d, X.dtype, init_type), X.device)
+    init_bytes = _init_bytes_per_replicate(N, k_sel, d, X.dtype, init_type,
+                                           n_chunk)
+    if X.device.type == 'cuda' and isinstance(em_chunk, str):
+        free, _ = torch.cuda.mem_get_info(X.device)
+        free += (torch.cuda.memory_reserved(X.device)
+                 - torch.cuda.memory_allocated(X.device))
+        if init_bytes > free:
+            raise RuntimeError(
+                f"the initialisation stage of init_type='{init_type}' needs "
+                f"{init_bytes / 2**30:.1f} GiB per replicate at N={N}, "
+                f"k={k_sel}, d={d} — more than the {free / 2**30:.1f} GiB "
+                f"free on {X.device}, so not even one replicate fits. Set "
+                f"n_chunk (the init then streams over sample chunks) or use "
+                f"init_type='minmax', which allocates nothing of this size")
+    init_chunk_sel = _resolve_chunk(em_chunk, r_sel, init_bytes, X.device)
     if fixed_components_number is not None:
         k_best = int(fixed_components_number)
         _, params = _cv_fit_for_k(X, k_best, n_folds, n_inits, reg_covar,
@@ -2244,8 +2369,12 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         GMM initialisation scheme (torch ports of GMM-MI's initialisations).
         'random_responsibilities' is cheap and adequate for easy fits; the
         k-means variants are more robust on well-separated multimodal data.
-        The default's responsibility draw is made per replicate chunk
-        (`em_chunk`), so it no longer binds on memory before the EM stage.
+        The default and the k-means inits run their statistics over the
+        full N per replicate unless `n_chunk` is set, in which case they
+        stream over sample chunks like the EM stage; without n_chunk at
+        very large N they bind on memory before EM (a readable error on
+        CUDA) — set n_chunk or use 'minmax', which allocates nothing of
+        that size.
     scale : float, optional
         Mean-perturbation scale for 'randomized_kmeans' (GMM-MI's default 1
         when None).
@@ -2268,7 +2397,9 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     n_chunk : int, optional
         If set, each EM iteration and validation-LL evaluation streams over
         the sample dimension in chunks of this size, accumulating sufficient
-        statistics. Bounds the EM and validation-LL kernels' peak memory
+        statistics, and the default/k-means initialisation over chunks of
+        n_chunk rounded down to a whole number of its 2^14-sample draw
+        blocks. Bounds the EM and validation-LL kernels' peak memory
         by em_chunk * n_chunk rather than N; the per-replicate weights
         are read one sample chunk at a time, so the only N-sized tensors
         are the caller's own (the (n_bootstrap, N) resample counts are
