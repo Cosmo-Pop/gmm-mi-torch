@@ -1588,7 +1588,8 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
     elif metric_method in ('aic', 'bic'):
         # best (init, fold) per k, refit on the full data from those params
         best_i_k = v.mean(-1).argmax(-1)                  # (max_components,)
-        best_f_k = v[torch.arange(max_components), best_i_k].argmax(-1)
+        best_f_k = v[torch.arange(max_components, device=v.device),
+                     best_i_k].argmax(-1)
         rk = torch.arange(max_components, device=X.device) * IF \
             + best_i_k * n_folds + best_f_k
         ones = torch.ones(1, N, dtype=X.dtype, device=X.device) \

@@ -1620,6 +1620,15 @@ def test_cv_masks_survive_default_device():
                               max_components=2, n_bootstrap=2,
                               mc_samples=1000, device='cuda',
                               dtype=torch.float32)
+        # 2026-10-23 review F8: the AIC/BIC branch held the one unpinned
+        # factory left in the module; with a CUDA default device and a
+        # CPU fit it indexed a CPU tensor with a CUDA arange, after the
+        # whole CV EM had been spent
+        for mm in ('aic', 'bic'):
+            m3, s3 = estimate(X, 'MI', max_components=2, n_bootstrap=2,
+                              mc_samples=1000, device='cpu',
+                              metric_method=mm)
+            assert np.isfinite(m3)
     finally:
         torch.set_default_device(None)
     assert np.isfinite(m) and np.isfinite(m2)
