@@ -111,3 +111,33 @@ for init in ('random_responsibilities', 'kmeans'):
                 g = torch.Generator(device=dev).manual_seed(0)
                 p = peak(lambda: E._init_params(X, K, R, 1e-6, generator=g, init_type=init, em_chunk=R, n_chunk=nc))
                 print(f"  {init[:6]} d={d} K={K:2d} n_chunk={nc:5d}: ratio {p/(R*E._init_bytes_per_replicate(N, K, d, dt, init, nc)):5.2f}")
+
+print("val_ll plain (no rerouting), ratio to the em budget, N=20000 R=32")
+N, R = 20000, 32
+for d in (1, 2, 8):
+    for K in (1, 3, 20):
+        for nc in (None, 4096):
+            X = torch.randn(N, d, device=dev, dtype=dt); s = torch.ones(R, N, device=dev, dtype=dt)
+            w, mu, cov = params(X, K, R, dt)
+            E.val_ll(X, s, w, mu, cov, n_chunk=nc, em_chunk=R)
+            p = peak(lambda: E.val_ll(X, s, w, mu, cov, n_chunk=nc, em_chunk=R))
+            m = R * E._em_bytes_per_replicate(N, K, d, dt, nc) + E._em_fixed_bytes(N, d, dt, nc)
+            print(f"  d={d} K={K:2d} n_chunk={nc}: ratio {p/m:5.2f}")
+print("MC stage d=1 (estimate_categorical's dimensionality), ratio to the model, b=8, S=1e5")
+for K in (1, 2, 5, 10, 20, 40):
+    X = torch.randn(2000, 1, device=dev, dtype=dt)
+    w, mu, cov = params(X, K, 8, dt); chol, cov = E._chol(cov)
+    def mc():
+        pts = torch.cat([E.gmm_sample(w[r:r+1], mu[r:r+1], chol[r:r+1], 100_000, generator=torch.Generator(device=dev).manual_seed(r)) for r in range(8)])
+        return E.gmm_score(pts, w, mu, chol).mean(1)
+    mc(); p = peak(mc)
+    print(f"  d=1 K={K:2d}: ratio {p/(8*E._mc_bytes_per_replicate(100_000, K, 1, dt)):5.2f}")
+print("streamed GEMM EM at small R (AIC refit / return_fit regime), d=8, n_chunk=4096, ratio to R*model + fixed")
+for R in (1, 4, 16):
+    for K in (1, 3):
+        X = torch.randn(200000, 8, device=dev, dtype=dt); s = torch.ones(R, X.shape[0], device=dev, dtype=dt)
+        w, mu, cov = params(X, K, R, dt)
+        E._em_fit_core(X, s, w, mu, cov, max_iter=1, n_chunk=4096)
+        p = peak(lambda: E._em_fit_core(X, s, w, mu, cov, max_iter=3, n_chunk=4096))
+        m = R * E._em_bytes_per_replicate(X.shape[0], K, 8, dt, 4096) + E._em_fixed_bytes(X.shape[0], 8, dt, 4096)
+        print(f"  R={R:2d} K={K}: ratio {p/m:5.2f}")
