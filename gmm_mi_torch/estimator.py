@@ -217,6 +217,13 @@ _AUTO_CHUNK_MIN = 32
 _AUTO_CHUNK_CPU_DEFAULT = 8
 
 
+def _cuda_free_bytes(dev):
+    """Bytes this process can still allocate on `dev`: the driver's free
+    memory plus torch's cached-but-unallocated blocks (ours to reuse)."""
+    free, _ = torch.cuda.mem_get_info(dev)
+    return free + torch.cuda.memory_reserved(dev) - torch.cuda.memory_allocated(dev)
+
+
 def _auto_chunk(n_items, bytes_per_item, device, default=_AUTO_CHUNK_CPU_DEFAULT,
                 fixed_bytes=0):
     """Chunk size for `n_items` replicates costing `bytes_per_item` each,
@@ -228,13 +235,12 @@ def _auto_chunk(n_items, bytes_per_item, device, default=_AUTO_CHUNK_CPU_DEFAULT
     dev = torch.device(device)
     if dev.type != 'cuda':
         return max(1, min(int(n_items), int(default)))
-    free, _ = torch.cuda.mem_get_info(dev)
     # the driver counts torch's cached-but-unallocated blocks as used;
     # they are ours to reuse, so every stage after the first (and every
     # later call in the process) would otherwise be sized against
     # free - cache, about half the intended batch in the memory-bound
     # regime, and never recover
-    free += torch.cuda.memory_reserved(dev) - torch.cuda.memory_allocated(dev)
+    free = _cuda_free_bytes(dev)
     bytes_per_item = max(int(bytes_per_item), 1)
     n = int((free * _AUTO_CHUNK_MEM_FRACTION - fixed_bytes) // bytes_per_item)
     # the throughput floor may never exceed what fits in the free memory:
@@ -245,17 +251,18 @@ def _auto_chunk(n_items, bytes_per_item, device, default=_AUTO_CHUNK_CPU_DEFAULT
     return max(1, min(int(n_items), max(floor, n)))
 
 
-def _resolve_chunk(value, n_items, bytes_per_item, device, fixed_bytes=0):
-    """Turn an `em_chunk` / `mc_chunk` argument ('auto' or int) into an int."""
+def _resolve_chunk(value, n_items, bytes_per_item, device, fixed_bytes=0,
+                   name='em_chunk'):
+    """Turn an `em_chunk` / `mc_chunk` argument ('auto' or int) into an int.
+    A float (2.7) fails under the argument's name like every other count
+    (it used to be truncated silently)."""
     if isinstance(value, str):
         if value != 'auto':
-            raise ValueError(f"chunk must be a positive int or 'auto'; found '{value}'")
+            raise ValueError(f"{name} must be a positive int or 'auto'; "
+                             f"found '{value}'")
         return _auto_chunk(n_items, bytes_per_item, device,
                            fixed_bytes=fixed_bytes)
-    value = int(value)
-    if value < 1:
-        raise ValueError(f"chunk must be a positive int or 'auto'; found {value}")
-    return value
+    return _index_arg(value, name, 1)
 
 
 def _index_arg(value, name, minimum=None):
@@ -292,7 +299,8 @@ def _as_array(X):
 def _validate_entry_args(seed, n_bootstrap, mc_samples, max_components,
                          n_folds, n_inits, max_iter,
                          fixed_components_number, reg_covar,
-                         threshold_components):
+                         threshold_components, threshold_fit=1e-5,
+                         patience=1, n_chunk=None):
     """Entry validation shared by estimate and estimate_categorical, so the
     two cannot drift apart. Returns the integer arguments coerced to plain
     Python ints (torch.Generator.manual_seed and torch factory sizes reject
@@ -323,8 +331,23 @@ def _validate_entry_args(seed, n_bootstrap, mc_samples, max_components,
     if not threshold_components >= 0:
         raise ValueError(f"threshold_components must be >= 0; found "
                          f"{threshold_components}")
+    # threshold_fit <= 0 (or NaN) can never satisfy the EM stop test, so
+    # every replicate of every stage would run max_iter; a non-number
+    # used to die in the stop test after the init stage had run
+    try:
+        ok = threshold_fit > 0
+    except TypeError:
+        raise TypeError(f"threshold_fit must be a positive number; found "
+                        f"{threshold_fit!r} of type "
+                        f"{type(threshold_fit).__name__}") from None
+    if not ok:
+        raise ValueError(f"threshold_fit must be > 0 (the EM convergence "
+                         f"threshold); found {threshold_fit}")
+    patience = _index_arg(patience, 'patience', 1)
+    if n_chunk is not None:
+        n_chunk = _index_arg(n_chunk, 'n_chunk', 1)
     return (seed, n_bootstrap, mc_samples, max_components, n_folds, n_inits,
-            max_iter, fixed_components_number)
+            max_iter, fixed_components_number, patience, n_chunk)
 
 
 def _em_bytes_per_replicate(N, K, d, dtype, n_chunk=None):
@@ -1180,6 +1203,7 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
     returned.
     """
     R = _n_rows(s)
+    n_chunk = None if n_chunk is None else int(n_chunk)
     # the streamed path reads the weights one sample block at a time
     # (never an (R,N) copy); the single-pass path takes its (chunk, N)
     # gather, one responsibility-buffer-over-K, as before
@@ -1482,6 +1506,7 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None, em_chunk=None):
         fold scores worse than any real fit, instead of a spurious 0).
     """
     R = _n_rows(s_val)
+    n_chunk = None if n_chunk is None else int(n_chunk)
     outs = _run_chunked(R, R if em_chunk is None else em_chunk,
                         lambda sl: _val_ll_core(
                             X, _rows(s_val, sl) if n_chunk is None
@@ -1633,6 +1658,11 @@ def _validate_device(device):
         raise ValueError(f"device must be a torch.device or a device "
                          f"string such as 'cpu', 'cuda' or 'cuda:1'; found "
                          f"{device!r} ({e})") from None
+    if dev.type not in ('cpu', 'cuda'):
+        raise ValueError(f"device={device!r}: only 'cpu' and 'cuda[:i]' "
+                         f"devices are supported (the estimator has not been "
+                         f"run on other backends, and torch would fail on an "
+                         f"absent one only deep inside the fit)")
     if dev.type == 'cuda':
         if not torch.cuda.is_available():
             raise ValueError(f"device={device!r} requested but CUDA is not "
@@ -1746,6 +1776,14 @@ def select_sequential(X, max_components=20, n_folds=2, n_inits=3,
                                        init_type=init_type, scale=scale,
                                        n_chunk=n_chunk, init_chunk=init_chunk)
         history[K] = (metric, params)
+        if not math.isfinite(metric):
+            # a diverged fit at this k: skip it without consuming patience
+            # (it used to count as a non-improvement and could end the
+            # search with higher k untried)
+            warnings.warn(f"sequential selection: the validation metric at "
+                          f"k={K} is not finite; k={K} skipped without "
+                          f"consuming patience", RuntimeWarning, stacklevel=2)
+            continue
         if metric - best_metric > threshold_components:
             best_metric, best_k, pat = metric, K, 0
         else:
@@ -1831,13 +1869,23 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
         raise RuntimeError(
             "batched selection found no finite validation metric at any "
             "k; NaN metrics usually mean degenerate CV folds or data")
+    # a non-finite metric at ONE k (a replicate that diverged) must not
+    # poison the rule: torch.max/argmax/argmin propagate NaN, which used to
+    # end in the parsimony mask's IndexError or a silently selected NaN k
+    finite_k = torch.isfinite(metric_k)
     if metric_method == 'valid':
-        # parsimony rule: smallest k within `threshold_components` of the best metric
-        k_best = int((metric_k >= metric_k.max() - threshold_components)
+        # parsimony rule: smallest FINITE k within `threshold_components`
+        # of the best finite metric
+        best = metric_k[finite_k].max()
+        k_best = int((finite_k & (metric_k >= best - threshold_components))
                      .nonzero()[0].item()) + 1
     elif metric_method in ('aic', 'bic'):
-        # best (init, fold) per k, refit on the full data from those params
-        best_i_k = v.mean(-1).argmax(-1)                  # (max_components,)
+        # best FINITE (init, fold) per k, refit on the full data from those
+        # params (a k whose every init failed keeps a NaN metric and is
+        # masked out of the criterion below)
+        vm = v.mean(-1)
+        best_i_k = torch.where(torch.isfinite(vm), vm,
+                               torch.full_like(vm, -torch.inf)).argmax(-1)
         best_f_k = v[torch.arange(max_components, device=v.device),
                      best_i_k].argmax(-1)
         rk = torch.arange(max_components, device=X.device) * IF \
@@ -1855,6 +1903,12 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
         n_par = (ks - 1) + ks * d + ks * d * (d + 1) / 2
         pen = 2.0 if metric_method == 'aic' else math.log(N)
         crit = -2.0 * llf * N + pen * n_par
+        ok = finite_k & torch.isfinite(crit)
+        if not bool(ok.any()):
+            raise RuntimeError(
+                f"{metric_method} selection found no finite criterion at "
+                f"any k; NaN metrics usually mean degenerate CV folds or data")
+        crit = torch.where(ok, crit, torch.full_like(crit, torch.inf))
         k_best = int(crit.argmin().item()) + 1
     else:
         raise ValueError(f"metric_method must be one of 'valid', 'aic', "
@@ -2052,24 +2106,33 @@ def _select_and_fit(X, protocol, fixed_components_number, max_components,
         k_sel, r_sel = max_components, max_components * IF
     em_chunk_sel = _resolve_chunk(
         em_chunk, r_sel, _em_bytes_per_replicate(N, k_sel, d, X.dtype, n_chunk),
-        X.device, fixed_bytes=_em_fixed_bytes(N, d, X.dtype, n_chunk))
+        X.device, fixed_bytes=_em_fixed_bytes(N, d, X.dtype, n_chunk),
+        name='em_chunk')
     # the init stage has its own (larger) model, streamed with n_chunk: an
     # integer em_chunk is honoured as given, 'auto' sizes the two apart
     init_bytes = _init_bytes_per_replicate(N, k_sel, d, X.dtype, init_type,
                                            n_chunk)
-    if X.device.type == 'cuda' and isinstance(em_chunk, str):
-        free, _ = torch.cuda.mem_get_info(X.device)
-        free += (torch.cuda.memory_reserved(X.device)
-                 - torch.cuda.memory_allocated(X.device))
+    if X.device.type == 'cuda':
+        # a per-replicate feasibility test, whatever the replicate batching
+        # (the model's estimate; it is a conservative envelope)
+        free = _cuda_free_bytes(X.device)
         if init_bytes > free:
+            stage = ("EM stage" if init_type == 'minmax'
+                     else f"initialisation stage of init_type='{init_type}'")
+            remedy = ("set n_chunk, which streams the samples (reduction-order "
+                      "cost only), or use float32"
+                      if init_type == 'minmax' else
+                      "set n_chunk, which streams the initialisation over "
+                      "sample chunks (reduction-order cost only), or use "
+                      "init_type='minmax', which allocates nothing of this size")
             raise RuntimeError(
-                f"the initialisation stage of init_type='{init_type}' needs "
+                f"by the memory model, the {stage} needs "
                 f"{init_bytes / 2**30:.1f} GiB per replicate at N={N}, "
                 f"k={k_sel}, d={d} — more than the {free / 2**30:.1f} GiB "
-                f"free on {X.device}, so not even one replicate fits. Set "
-                f"n_chunk (the init then streams over sample chunks) or use "
-                f"init_type='minmax', which allocates nothing of this size")
-    init_chunk_sel = _resolve_chunk(em_chunk, r_sel, init_bytes, X.device)
+                f"this process can allocate on {X.device}, so not even one "
+                f"replicate fits: {remedy}")
+    init_chunk_sel = _resolve_chunk(em_chunk, r_sel, init_bytes, X.device,
+                                    name='em_chunk')
     if fixed_components_number is not None:
         k_best = int(fixed_components_number)
         _, params = _cv_fit_for_k(X, k_best, n_folds, n_inits, reg_covar,
@@ -2210,13 +2273,16 @@ class FittedGMM:
         array. A 1-D X is n points of a 1-D model, or one point of a d-D
         model (sklearn rejects 1-D input; here it used to produce a wrong
         shape error from deep inside the kernel)."""
-        Xt = torch.as_tensor(X, dtype=self._mu.dtype, device=self._mu.device)
+        Xt = torch.as_tensor(_as_array(X), dtype=self._mu.dtype,
+                             device=self._mu.device)
         d = self._mu.shape[-1]
+        given = tuple(Xt.shape)
         if Xt.dim() == 1:
             Xt = Xt.view(-1, 1) if d == 1 else Xt.view(1, -1)
         if Xt.dim() != 2 or Xt.shape[1] != d:
             raise ValueError(f"X must have shape (n, {d}) for this "
-                             f"{d}-D model; found {tuple(Xt.shape)}")
+                             f"{d}-D model (a 1-D input is read as one "
+                             f"{d}-D point); found {given}")
         ll = gmm_score(Xt.unsqueeze(0), self._w.unsqueeze(0),
                        self._mu.unsqueeze(0), self._chol.unsqueeze(0))
         return ll[0].cpu().numpy()
@@ -2318,8 +2384,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         With preprocess='gaussianise' the returned model describes the
         rank-probit-transformed data, not the original units (the rank
         transform has no parametric inverse); a RuntimeWarning says so.
-    device : str, default='cpu'
-        Torch device on which to fit and integrate (e.g. 'cuda').
+    device : str or torch.device, default='cpu'
+        Torch device on which to fit and integrate: 'cpu', or 'cuda' /
+        'cuda:i' / a torch.device of those types (other backends are
+        rejected at entry).
     dtype : torch.dtype, default=torch.float64
         Working precision. float32 is validated and much faster on GPUs with
         limited fp64 throughput; float64 is the reference precision.
@@ -2398,8 +2466,9 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         If set, each EM iteration and validation-LL evaluation streams over
         the sample dimension in chunks of this size, accumulating sufficient
         statistics, and the default/k-means initialisation over chunks of
-        n_chunk rounded down to a whole number of its 2^14-sample draw
-        blocks. Bounds the EM and validation-LL kernels' peak memory
+        n_chunk rounded to whole 2^14-sample draw blocks, at least one
+        (so with n_chunk < 2^14 the init chunk exceeds n_chunk by less
+        than one block). Bounds the EM and validation-LL kernels' peak memory
         by em_chunk * n_chunk rather than N; the per-replicate weights
         are read one sample chunk at a time, so the only N-sized tensors
         are the caller's own (the (n_bootstrap, N) resample counts are
@@ -2464,9 +2533,11 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         raise ValueError(f"protocol must be 'batched' or 'sequential'; "
                          f"found '{protocol}'")
     (seed, n_bootstrap, mc_samples, max_components, n_folds, n_inits,
-     max_iter, fixed_components_number) = _validate_entry_args(
+     max_iter, fixed_components_number, patience,
+     n_chunk) = _validate_entry_args(
         seed, n_bootstrap, mc_samples, max_components, n_folds, n_inits,
-        max_iter, fixed_components_number, reg_covar, threshold_components)
+        max_iter, fixed_components_number, reg_covar, threshold_components,
+        threshold_fit, patience, n_chunk)
     if X.dim() != 2:
         raise ValueError(f"X must be 2-D (n_samples, n_variables); "
                          f"found shape {tuple(X.shape)}")
@@ -2484,9 +2555,6 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
             "path propagates them into every replicate — remove or impute "
             "them first")
     _validate_folds(X.shape[0], n_folds, d=X.shape[1])
-    if n_chunk is not None and int(n_chunk) < 1:
-        raise ValueError(f"n_chunk must be a positive int or None; "
-                         f"found {n_chunk}")
     if tie_rank not in ('random', 'average'):
         raise ValueError(f"tie_rank must be 'random' or 'average'; "
                          f"found '{tie_rank}'")
@@ -2543,9 +2611,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     K = w1.shape[0]
     em_chunk_boot = _resolve_chunk(
         em_chunk, B, _em_bytes_per_replicate(N, K, d, dtype, n_chunk), device,
-        fixed_bytes=_em_fixed_bytes(N, d, dtype, n_chunk))
+        fixed_bytes=_em_fixed_bytes(N, d, dtype, n_chunk), name='em_chunk')
     mc_chunk = _resolve_chunk(
-        mc_chunk, B, _mc_bytes_per_replicate(mc_samples, K, d, dtype), device)
+        mc_chunk, B, _mc_bytes_per_replicate(mc_samples, K, d, dtype), device,
+        name='mc_chunk')
     if return_fit:
         s1 = torch.ones(1, N, dtype=X.dtype, device=X.device)
         wf, muf, covf, _ = em_fit(X, s1, w1.unsqueeze(0), mu1.unsqueeze(0),
@@ -2692,7 +2761,22 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         if arr.ndim != 1:
             raise ValueError(f"Y must be 1-D; found shape "
                              f"{arr.shape}") from None
-        cats_np, inv = np.unique(arr, return_inverse=True)
+        # pandas hands out object arrays with None/NaN for missing labels;
+        # np.unique would die comparing str with float — reject them as
+        # the numeric path rejects non-finite labels
+        missing = [v is None or (isinstance(v, float) and v != v)
+                   or type(v).__name__ in ('NAType', 'NaTType') for v in arr]
+        if any(missing):
+            raise ValueError(
+                f"Y contains {sum(missing)} missing label(s) (None/NaN); "
+                f"remove those samples or encode missingness as an explicit "
+                f"category")
+        try:
+            cats_np, inv = np.unique(arr, return_inverse=True)
+        except TypeError as e:
+            raise ValueError(f"Y mixes label types that cannot be ordered "
+                             f"together ({e}); use one type per column") \
+                from None
         cat_labels = [str(v) for v in cats_np]
         Y = torch.as_tensor(inv.reshape(-1), device=device)
     if Y.dim() > 2 or (Y.dim() == 2 and Y.shape[1] != 1):
@@ -2710,12 +2794,11 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         raise ValueError(f"protocol must be 'batched' or 'sequential'; "
                          f"found '{protocol}'")
     (seed, n_bootstrap, mc_samples, max_components, n_folds, n_inits,
-     max_iter, fixed_components_number) = _validate_entry_args(
+     max_iter, fixed_components_number, patience,
+     n_chunk) = _validate_entry_args(
         seed, n_bootstrap, mc_samples, max_components, n_folds, n_inits,
-        max_iter, fixed_components_number, reg_covar, threshold_components)
-    if n_chunk is not None and int(n_chunk) < 1:
-        raise ValueError(f"n_chunk must be a positive int or None; "
-                         f"found {n_chunk}")
+        max_iter, fixed_components_number, reg_covar, threshold_components,
+        threshold_fit, patience, n_chunk)
     # shared affine standardisation of the continuous variable: MI with a
     # categorical variable is invariant, and reg_covar becomes scale-free
     x_std = X.std()
@@ -2766,7 +2849,7 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         K = w1.shape[0]
         em_chunk_b = _resolve_chunk(
             em_chunk, B, _em_bytes_per_replicate(Nc, K, 1, dtype, n_chunk), device,
-            fixed_bytes=_em_fixed_bytes(Nc, 1, dtype, n_chunk))
+            fixed_bytes=_em_fixed_bytes(Nc, 1, dtype, n_chunk), name='em_chunk')
         w0, mu0, cov0 = _warm_start(w1, mu1, cov1, B)
         w, mu, cov, _ = em_fit(Xc, s, w0, mu0, cov0, reg_covar, threshold_fit, max_iter,
                                em_chunk=em_chunk_b, n_chunk=n_chunk)
@@ -2778,7 +2861,7 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     # d=1 integrand (running logaddexp over categories, no (C,b,S) stack)
     mc_chunk = _resolve_chunk(
         mc_chunk, B, _mc_bytes_per_replicate(mc_samples, K_max, 1, dtype)
-        + 4 * mc_samples * dtype.itemsize, device)
+        + 4 * mc_samples * dtype.itemsize, device, name='mc_chunk')
     vals = torch.zeros(B, dtype=X.dtype, device=X.device)
     for ci in range(C):
         w, mu, cov, chol = fits[ci]
