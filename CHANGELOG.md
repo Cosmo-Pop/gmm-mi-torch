@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.5.0 (2026-10-21)
+
+The hardening round that follows the v0.4.0 design pass: the deferred
+memory pass (item 6 of the 2026-10-20 ruling, in the reviewer's order),
+the rulings' loose ends, a re-executed walkthrough and a closing
+adversarial review (scoping/, dated 2026-10-21). Statistics are
+unchanged: every kernel-level result, the minmax/k-means selections, the
+bootstrap resample and the MC stage are bitwise those of v0.4.0 on CPU
+(a 36-entry reference comparison on both kernels). The minor-version
+bump is for the two random-stream changes below, which shift fixed-seed
+results at init-noise level, and for the new entry errors.
+
+- Memory, selection stage: the default initialisation draws its (R,N,K)
+  responsibilities per replicate chunk inside the out-of-memory guard,
+  in place, each replicate from its own generator seeded off the
+  caller's stream (chunk- and retry-invariant by construction on CPU and
+  CUDA; chunked draws from one CUDA generator are not). Behaviour
+  change: the default init's stream differs from v0.4.0, so fixed-seed
+  results with init_type='random_responsibilities' move at init-noise
+  level ('minmax' and the k-means inits are bitwise). The two full-size
+  transients of the old draw are gone (GB10, R=120, N=20,000, K=20:
+  2.1x -> 1.3x the draw at em_chunk=15), and the init stage is sized
+  from its own model, over the full N, instead of the 3x GEMM model
+  (it was 3.4-11x over budget and retried before any EM ran).
+- Memory, CV masks: select_batched held the masks repeated
+  max_components times (2(K+1)*I*F*N*itemsize: 960 B/sample at float64
+  defaults, 40 GiB of the README's 77.5 GiB N=1e8 run). em_fit and
+  val_ll now take weights with the replicate axis split over leading
+  dims and gather each chunk's rows from an expand() view: 183 MiB ->
+  3 MiB per mask at N=2e5.
+- Memory, M-step: the blocked float32 moment GEMM broadcast the feature
+  matrix once per replicate (q/K responsibility buffers: 23x at d=8,
+  K=2; 44x at K=1). It is batched over blocks with (k, r) folded into
+  the GEMM rows — one transient copy of the responsibilities, F read in
+  place: 23 -> 1.3 buffers and 5.1 -> 0.3 ms at d=8, K=2; the README's
+  flagship shape (K=20, d=8, N=2e5) 3.3 -> 1.3 buffers and 39 -> 12 ms
+  per M-step. CPU results bitwise; CUDA at float32 reduction order
+  (ruled on before the code landed; scoping/design-review-batch3-*).
+- Memory models re-derived on the GB10 over K=1..20, d=1..8 (117 rows,
+  all now at or below 98% of budget; validation/bench_mem_models.py):
+  GEMM EM max(K+6, 2K+3) + 3Kq/512 units of N_eff x itemsize per
+  replicate after the consumed responsibilities are released before the
+  next E-step (the old 3K under-sized K=1 2x), legacy (4d+4)K+4, init
+  (4d+3)K+4 over N, MC max((3d+1)K+d+7, d^2+4d+6) (gmm_sample's (S,d,d)
+  gather was missing), a per-stage fixed term for the features, and the
+  rerouted replicates' legacy sample chunk derived from the model with
+  the partition's weights gathered per sample chunk (no more (R,N)
+  copies per iteration). End to end at a mocked 1 GiB budget: peak
+  1744 -> 498 MiB, same answer.
+- Memory, bootstrap counts: the validated multinomial draw stays one
+  call but reads an expanded probability row and scatters an expanded
+  ones row (6.0 -> 5.1x the weights at float32; torch.multinomial's own
+  index matrix is what remains); the N > 2^24 randint path draws one
+  replicate at a time from per-replicate generators (4.0x -> 1.1-1.5x;
+  at N=1e8, B=50 the 74.5 GiB transient becomes 0.8 GiB) — its stream
+  changes (second behaviour change; it was never the validated one).
+- Auto-chunking counts torch's cached-but-free blocks as free (every
+  stage after the first was sized against free minus cache), never lets
+  the 32-replicate floor exceed what fits, and releases the failed
+  attempt's memory after the exception is cleared rather than inside
+  the handler (where it was a no-op). estimate_categorical's MC stage
+  accumulates a running logaddexp instead of a (C,b,S) stack (GB10:
+  18 / 60 / 191 MiB at C=3/12/40 -> 14 MiB flat).
+- Entry guards: a training fold with fewer than d+1 samples is a
+  ValueError (N=2-3 used to return MI ~5-6 nats silently); below 100
+  samples per dataset or category a RuntimeWarning names the
+  finite-sample bias. `device` accepts 'cuda:1', torch.device objects
+  and integers and rejects unparseable or absent devices at entry.
+  FittedGMM.score_samples takes 1-D input (n points of a 1-D model, or
+  one d-D point) and names the expected shape otherwise.
+- plotting: repeated mass levels and coarse grids no longer crash
+  contouring, a constant column fails with a readable error, list input
+  works for the histogram helpers, the ellipse weight marker is drawn
+  once (upstream drew it once per level).
+- Notebook re-executed end to end on CPU float64 with this release.
+
 ## 0.4.0 (2026-10-20)
 
 The design pass for the remaining 2026-10-20 review findings, built under
