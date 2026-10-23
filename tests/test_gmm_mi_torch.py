@@ -1,6 +1,7 @@
 """Tests for the torch GMM-MI port, following the conventions of
 gmm_mi/tests/test_sample.py (analytic targets, sigma-band assertions)."""
 
+import math
 import os
 import warnings
 
@@ -2813,3 +2814,133 @@ def test_streamed_init_peak_under_model():
         model = R * E._init_bytes_per_replicate(N, K, d, torch.float32, init, nc)
         # v0.5.0 ran this over the full N: 24x this model's sample chunk
         assert peak <= model, (init, peak / model)
+
+
+def test_entry_coercions_count_like_arguments():
+    # 2026-10-23 review L13/X3 (group A1): n_chunk, threshold_fit, patience,
+    # em_chunk and mc_chunk fail at entry under their own names; a float
+    # n_chunk used to die inside the first streamed EM step after the init
+    # stage, em_chunk=2.7 ran as 2, threshold_fit='x' died in the stop test
+    E = gmm_mi_torch.estimator
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(300, 2))
+    common = dict(max_components=2, n_bootstrap=0, mc_samples=100)
+    with pytest.raises(TypeError, match='n_chunk'):
+        estimate(X, 'MI', n_chunk=2.5e2, **common)
+    with pytest.raises(ValueError, match='n_chunk'):
+        estimate(X, 'MI', n_chunk=0, **common)
+    with pytest.raises(TypeError, match='em_chunk'):
+        estimate(X, 'MI', em_chunk=2.7, **common)
+    with pytest.raises(TypeError, match='mc_chunk'):
+        estimate(X, 'MI', mc_chunk=1.5, **common)
+    with pytest.raises(ValueError, match="em_chunk must be"):
+        estimate(X, 'MI', em_chunk='big', **common)
+    with pytest.raises(TypeError, match='threshold_fit'):
+        estimate(X, 'MI', threshold_fit='x', **common)
+    for bad in (0.0, -1e-5, float('nan')):
+        with pytest.raises(ValueError, match='threshold_fit'):
+            estimate(X, 'MI', threshold_fit=bad, **common)
+    with pytest.raises(TypeError, match='patience'):
+        estimate(X, 'MI', protocol='sequential', patience=1.5, **common)
+    with pytest.raises(ValueError, match='patience'):
+        estimate(X, 'MI', protocol='sequential', patience=0, **common)
+    with pytest.raises(TypeError, match='n_chunk'):
+        estimate_categorical(X[:, 0], (X[:, 1] > 0).astype(int), n_chunk=1e2,
+                             max_components=1, n_bootstrap=0, mc_samples=100)
+    # bool is an int (operator.index(True) == 1), as for every other count
+    assert E._resolve_chunk(True, 10, 1, 'cpu', name='mc_chunk') == 1
+    assert E._resolve_chunk(np.int64(3), 10, 1, 'cpu') == 3
+
+
+def test_selection_masks_single_nonfinite_metric(monkeypatch):
+    # 2026-10-23 review L12 (A2): one non-finite replicate metric used to
+    # give an IndexError ('valid'), a silently selected NaN k (aic/bic) or
+    # a consumed patience step (sequential). Inject it through val_ll.
+    E = gmm_mi_torch.estimator
+    rng = np.random.default_rng(1)
+    X = torch.as_tensor(rng.multivariate_normal([0, 0], [[1, .6], [.6, 1]], 1500))
+    orig = E.val_ll
+
+    def poison(k_bad, only_once):
+        state = {'n': 0}
+
+        def spy(Xs, s, w, mu, cov, n_chunk=None, em_chunk=None):
+            out = orig(Xs, s, w, mu, cov, n_chunk=n_chunk, em_chunk=em_chunk)
+            state['n'] += 1
+            if only_once and state['n'] != 1:
+                return out
+            out = out.clone()
+            R = out.shape[0]
+            if R >= 6:            # batched: rows of k_bad (IF = 6 at I=3, F=2)
+                out[(k_bad - 1) * 6] = float('nan')
+            return out
+        return spy
+    ref = E.select_batched(X, max_components=4, init_type='minmax', seed=3)
+    monkeypatch.setattr(E, 'val_ll', poison(2, only_once=True))
+    k, params, hist = E.select_batched(X, max_components=4, init_type='minmax',
+                                       seed=3)
+    assert k == ref[0] and math.isnan(hist[2][0])     # k=2 masked, same answer
+    for mm in ('aic', 'bic'):
+        monkeypatch.setattr(E, 'val_ll', poison(2, only_once=True))
+        k2, _, _ = E.select_batched(X, max_components=4, init_type='minmax',
+                                    seed=3, metric_method=mm)
+        assert k2 != 2 and 1 <= k2 <= 4
+    monkeypatch.setattr(E, 'val_ll', orig)
+    # sequential: a NaN at k=1 is skipped without consuming patience
+    calls = {'n': 0}
+
+    def spy_seq(Xs, s, w, mu, cov, n_chunk=None, em_chunk=None):
+        out = orig(Xs, s, w, mu, cov, n_chunk=n_chunk, em_chunk=em_chunk)
+        calls['n'] += 1
+        if calls['n'] == 1:
+            out = out.clone()
+            out[0] = float('nan')
+        return out
+    monkeypatch.setattr(E, 'val_ll', spy_seq)
+    with pytest.warns(RuntimeWarning, match='k=1 skipped'):
+        k3, _, hist3 = E.select_sequential(X, max_components=3, patience=1,
+                                           init_type='minmax', seed=3)
+    assert k3 >= 2 and math.isnan(hist3[1][0]) and 3 in hist3
+    # finite data: the masked rules are the old rules (pinned by the
+    # reference comparison; here the k equality above)
+
+
+def test_device_types_other_than_cpu_cuda_rejected():
+    # L17 (A3)
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(300, 2))
+    for dev in ('mps', 'meta', 'xpu'):
+        with pytest.raises(ValueError, match="only 'cpu' and 'cuda"):
+            estimate(X, 'MI', device=dev, max_components=2, n_bootstrap=0,
+                     mc_samples=100)
+
+
+def test_categorical_missing_string_labels_rejected():
+    # L19 (A4): None / NaN among string labels used to raise np.unique's
+    # TypeError about str vs float
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=12)
+    for Y in (np.array(['a', 'b', None, 'a', 'b', 'a'] * 2, dtype=object),
+              np.array(['a', 'b', float('nan'), 'a', 'b', 'a'] * 2, dtype=object)):
+        with pytest.raises(ValueError, match='missing label'):
+            estimate_categorical(X, Y, max_components=1, n_bootstrap=0,
+                                 mc_samples=100)
+    with pytest.raises(ValueError, match='label types'):
+        estimate_categorical(X, np.array(['a', 1, 'a', 1, 'a', 1] * 2,
+                                         dtype=object), max_components=1,
+                             n_bootstrap=0, mc_samples=100)
+
+
+def test_score_samples_dataframe_and_shape_message():
+    # L20/L21 (A5)
+    pd = pytest.importorskip('pandas')
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame(rng.multivariate_normal([0, 0], [[1, .5], [.5, 1]], 400),
+                      columns=['a', 'b'])
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        m, s, fit = estimate(df, 'MI', max_components=2, n_bootstrap=2,
+                             mc_samples=500, return_fit=True)
+    assert np.allclose(fit.score_samples(df), fit.score_samples(df.to_numpy()))
+    with pytest.raises(ValueError, match=r'found \(3,\)'):
+        fit.score_samples(np.zeros(3))
