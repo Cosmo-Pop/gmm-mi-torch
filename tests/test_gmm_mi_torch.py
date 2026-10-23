@@ -2540,3 +2540,99 @@ def test_precision_pin_preserves_knob_inheritance():
     finally:
         for lv, v in zip(levels, saved):
             C._set_fp32_precision_setter(*lv, v)
+
+
+def test_weight_chunks_accessor():
+    # 2026-10-23 review F6: the streamed path reads weights through
+    # _WeightChunks instead of materialising (R,N) copies. Pins: rows()
+    # equals dense slicing for 2-D, 3-D and 4-D weights with and without a
+    # row subset, is a view for 2-D weights, and totals() is the exact row
+    # sum for the module's own (integer-valued) weights.
+    E = gmm_mi_torch.estimator
+    N = 1000
+    base = (torch.rand(2, 3, N) > 0.5).double()            # (I=2, F=3, N)
+    s4 = base.unsqueeze(0).expand(5, 2, 3, N)             # (K, I, F, N)
+    dense = s4.reshape(-1, N)
+    for s, R_all in ((s4, 30), (base, 6), (dense, 30)):
+        for sl in (slice(0, R_all), slice(1, R_all - 1),
+                   slice(R_all - 3, R_all + 5)):       # past the end: clipped
+            wc = E._WeightChunks(s, sl, n_chunk=128)
+            ref = s.reshape(-1, N)[sl]
+            assert wc.shape == tuple(ref.shape)
+            for i, n in ((0, 128), (128, 128), (896, 128), (0, N)):
+                assert torch.equal(wc.rows(i, n), ref[:, i:i + n])
+                rows = torch.tensor([0, wc.R - 1, 1][:wc.R])
+                assert torch.equal(wc.rows(i, n, rows), ref[rows, i:i + n])
+            assert torch.equal(wc.totals(), ref.sum(1).double())
+            if s.dim() == 2:
+                blk = wc.rows(128, 64)
+                assert blk.data_ptr() == s[sl.start, 128:].data_ptr()  # a view
+    # a dense tensor passed where an accessor is expected is wrapped
+    wc = E._as_weight_chunks(dense[:4], 100)
+    assert wc.shape == (4, N) and torch.equal(wc.rows(0, N), dense[:4])
+
+
+def test_streamed_compaction_bitwise_with_nd_weights():
+    # the streamed driver no longer compacts an (Ra,N) weight copy when
+    # replicates converge; it indexes the accessor. With expand()-view CV
+    # masks, replicates converging at different iterations, half the
+    # replicates rerouted, em_fit and val_ll must be bitwise the same at
+    # em_chunk=R, 3 and 1 and bitwise the dense-weight answer (CPU; both
+    # kernels run this test on their legs)
+    E = gmm_mi_torch.estimator
+    g = torch.Generator().manual_seed(0)
+    N = 2400
+    X = torch.randn(N, 2, generator=g, dtype=torch.float64)
+    X = (X - X.mean(0)) / X.std(0)
+    train, val = E._cv_masks(N, 2, 3, torch.float64)        # (3, 2, N)
+    R = 6
+    w0, mu0, cov0 = E._init_params(X, 2, R, 1e-6, generator=g,
+                                   init_type='minmax')
+    mu0[::2, 0] = 4.0
+    cov0[::2, 0] = 1e-6 * torch.eye(2, dtype=torch.float64)
+    dense_t, dense_v = train.reshape(R, N), val.reshape(R, N)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        for n_chunk in (500, 2400):
+            ref = E.em_fit(X, dense_t, w0, mu0, cov0, em_chunk=1,
+                           threshold_fit=1e-3, max_iter=40, n_chunk=n_chunk)
+            vref = E.val_ll(X, dense_v, *ref[:3], em_chunk=1, n_chunk=n_chunk)
+            for em_chunk in (R, 3, 1):
+                out = E.em_fit(X, train, w0, mu0, cov0, em_chunk=em_chunk,
+                               threshold_fit=1e-3, max_iter=40,
+                               n_chunk=n_chunk)
+                for a, b in zip(ref, out):
+                    assert torch.equal(a, b), (n_chunk, em_chunk)
+                assert torch.equal(
+                    vref, E.val_ll(X, val, *out[:3], em_chunk=em_chunk,
+                                   n_chunk=n_chunk))
+
+
+def test_streamed_path_holds_no_full_weight_copies():
+    # finding 4 of the 2026-10-23 review: with n_chunk << N the streamed
+    # em_fit/val_ll held N-sized per-replicate weight copies (the mask
+    # gather, the convergence compaction, val_ll's s_val[gi]) and peaked
+    # 18-21x the model at N=4e5, n_chunk=4096, K=3 on the GB10
+    if not torch.cuda.is_available():
+        pytest.skip('peak-memory measurement needs a CUDA device')
+    E = gmm_mi_torch.estimator
+    N, R, K, nc = 400_000, 32, 3, 4096
+    X = torch.randn(N, 2, device='cuda', dtype=torch.float32)
+    train, val = E._cv_masks(N, 2, 16, torch.float32, device='cuda')
+    g = torch.Generator(device='cuda').manual_seed(0)
+    w, mu, cov = E._init_params(X, K, R, 1e-6, generator=g,
+                                init_type='minmax', em_chunk=R)
+    model = (R * E._em_bytes_per_replicate(N, K, 2, torch.float32, nc)
+             + E._em_fixed_bytes(N, 2, torch.float32, nc))
+    E.em_fit(X, train, w, mu, cov, em_chunk=R, max_iter=2, n_chunk=nc)
+    for fn in (lambda: E.em_fit(X, train, w, mu, cov, em_chunk=R, max_iter=6,
+                                n_chunk=nc),
+               lambda: E.val_ll(X, val, w, mu, cov, em_chunk=R, n_chunk=nc)):
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        fn()
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - base
+        assert peak < 2.0 * model, peak / model
