@@ -3081,8 +3081,14 @@ def test_collapsed_component_offdiagonal_bound():
                           mc_samples=2000, dtype=torch.float32,
                           reg_covar=1e-10)
     assert np.isfinite(m3)
-    # the 2-D case repaired at least one factorisation (v0.6.0 aborted)
-    assert any('regularisation' in str(w.message) for w in rec)
+    # the 2-D case repaired at least one factorisation (v0.6.0 aborted) —
+    # under the GEMM kernel only: its M-step's cancellation residue is what
+    # leaves the collapsed component's off-diagonals above the floor; the
+    # legacy centred kernel completes the same case with nothing to repair
+    # (no warning at all, on CPU and CUDA), so the completion assertions
+    # above are the whole test there (v0.6.1's legacy legs failed here).
+    if E._EM_KERNEL == 'gemm':
+        assert any('regularisation' in str(w.message) for w in rec)
     # d=3 at the helper level: with residue signs (+,+,-) the pairwise bound
     # leaves lambda_min ~ -reg, but the matrix is then within the
     # escalation's reach — one warning — where the raw matrix aborts
