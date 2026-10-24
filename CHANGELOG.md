@@ -34,21 +34,28 @@ the tag.
   component selection (after every category's selection and bootstrap
   in `estimate_categorical`), not at entry; and every chunk-invariance
   claim (`em_fit`, `val_ll`, the initialisation, the out-of-memory
-  retry, `mc_chunk`) now reads "bitwise on CPU, reduction order on
-  CUDA": on CUDA float64 is not bitwise chunk-invariant either (fitted
+  retry, `mc_chunk`) now reads "bitwise on CPU at float64 (at float32
+  also bitwise except em_chunk=1 with a one-component model, where the
+  M-step's single-row tail product takes a different BLAS path: 3e-8 in
+  a measured MI), reduction order on CUDA": on CUDA float64 is not
+  bitwise chunk-invariant either (fitted
   means moved by 1e-14 to 1e-12 between em_chunk values in two measured
   cases; float32 by up to 7e-3), so CPU, not "float64 or CPU", is the
   bit-reproducible setting, and only the Monte-Carlo samples, not the
-  results, are independent of mc_chunk on CUDA.
+  results, are independent of mc_chunk on CUDA. Also: README's legacy
+  kernels are no longer said to be available "for one release" (they
+  still are), and `estimate_categorical` documents that its reg_covar
+  floor is relative to the variance of X over all categories.
 - README: the CUDA batching paragraph became a subsection of short
   bullets, a Known limitations section points to the design notes, and
   the kernel, large-N, multi-GPU and test paragraphs are split; every
   number is kept.
 
-Test matrix at the docstring commit d081acb, re-run at the release
-commit: 122 passed / 2 skipped (CPU fp64), 123 / 1 (CUDA fp32), 120 / 4
-(CPU fp64 legacy), 121 / 3 (CUDA fp32 legacy). Reference sets
-ref_v070 / ref_v070_legacy: 0 mismatches.
+Test matrix at the docstring commit d081acb and at the first release
+commit df6628f (the docs-only fix-first commit after it changes no code:
+its estimator.py syntax tree is v0.7.0's): 122 passed / 2 skipped (CPU
+fp64), 123 / 1 (CUDA fp32), 120 / 4 (CPU fp64 legacy), 121 / 3 (CUDA
+fp32 legacy). Reference sets ref_v070 / ref_v070_legacy: 0 mismatches.
 
 ## 0.7.0 (2026-10-24)
 

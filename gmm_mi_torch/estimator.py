@@ -494,8 +494,9 @@ def _legacy_sample_chunk(N, K, d, dtype, n_chunk=None):
 def _run_chunked(n, chunk, fn):
     """Apply fn(slice) over [0, n) in chunks of `chunk`, halving the chunk
     and retrying on a CUDA out-of-memory error. Results do not depend on
-    the chunk on CPU (bitwise), so there the retry changes only peak
-    memory; on CUDA they move at reduction order."""
+    the chunk on CPU (bitwise, with one float32 exception: see `estimate`,
+    Notes), so there the retry changes only peak memory; on CUDA they move
+    at reduction order."""
     outs, i = [], 0
     chunk = max(1, min(int(chunk), int(n)))
     while i < n:
@@ -1205,7 +1206,8 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
 
     Replicates (CV fits, bootstrap realisations) are independent, so they are
     processed in chunks of `em_chunk` purely to bound peak memory; results do
-    not depend on the chunk on CPU (bitwise); on CUDA see `em_chunk`.
+    not depend on the chunk on CPU (bitwise, with one float32 exception);
+    on CUDA see `em_chunk`.
 
     Parameters
     ----------
@@ -1224,8 +1226,9 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
         As in `estimate`.
     em_chunk : int, default=8
         Replicates per batch; a CUDA out-of-memory error halves it and
-        retries (with a RuntimeWarning). Bitwise chunk-invariant on CPU; on
-        CUDA see `estimate`, Notes, "Reproducibility".
+        retries (with a RuntimeWarning). Bitwise chunk-invariant on CPU
+        except em_chunk=1 with a one-component model at float32; on CUDA
+        see `estimate`, Notes, "Reproducibility".
     n_chunk : int, optional
         As in `estimate`.
 
@@ -1255,7 +1258,10 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
         Once per call for replicates that exhausted `max_iter` without
         meeting `threshold_fit` (their last iterates are returned), and once
         for replicates finished on the centred legacy kernels because a
-        component collapsed beyond the GEMM kernels' precision.
+        component collapsed beyond the GEMM kernels' precision. Covariance
+        factorisation also warns when a component needed extra diagonal
+        regularisation, or when an all-zero or non-finite covariance was
+        replaced by the identity.
     """
     R = _n_rows(s)
     n_chunk = None if n_chunk is None else int(n_chunk)
@@ -1569,7 +1575,10 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None, em_chunk=None):
     -----
     RuntimeWarning
         Once per call for replicates scored with the centred legacy kernels
-        because a component collapsed beyond the GEMM kernels' precision.
+        because a component collapsed beyond the GEMM kernels' precision;
+        and, as in `em_fit`, from covariance factorisation (extra diagonal
+        regularisation; all-zero or non-finite covariance replaced by the
+        identity).
     """
     R = _n_rows(s_val)
     n_chunk = None if n_chunk is None else int(n_chunk)
@@ -2530,8 +2539,9 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         A non-integer count, seed, em_chunk or mc_chunk (numpy integers are
         accepted; mc_chunk only after component selection), or a
         non-numeric threshold_fit. A non-numeric reg_covar or
-        threshold_components fails with Python's own comparison TypeError,
-        and a non-numeric `scale` in float() inside the initialisation.
+        threshold_components fails with Python's own comparison TypeError.
+        A non-numeric `scale` fails inside the initialisation with float()'s
+        own error (ValueError for a string, TypeError otherwise).
     RuntimeError
         On CUDA, when by the memory model not even one replicate of the
         first (initialisation or EM) stage fits (set `n_chunk`); when no
@@ -2627,7 +2637,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     float64, not bitwise).
 
     *Reproducibility.* Fixed-seed results are bitwise reproducible on CPU,
-    including with 'auto' chunk sizing: no chunk size changes them there.
+    including with 'auto' chunk sizing: at float64 no chunk size changes
+    them; at float32 they are also bitwise except em_chunk=1 with a
+    one-component model, where the M-step's single-row tail product takes
+    a different BLAS path (3e-8 in a measured MI).
     Each bootstrap replicate draws its MC samples from its own seeded
     stream, so the samples are independent of `mc_chunk` and of the
     out-of-memory retry on every device. On CUDA, `em_chunk` and `mc_chunk`
@@ -2640,7 +2653,8 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     replicates into one GEMM whose summation order follows the batch size,
     and on knife-edge data that can move the selected k (measured: k=5 vs
     6, MI 0.4741 vs 0.4745 against an errorbar of 0.008). A CPU run is the
-    bit-reproducible setting; on CUDA, float64 is far less sensitive.
+    bit-reproducible setting (with the float32 exception above); on CUDA,
+    float64 is far less sensitive.
     """
     X = torch.as_tensor(_as_array(X)).detach()
     if dtype not in (torch.float32, torch.float64):

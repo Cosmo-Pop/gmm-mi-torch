@@ -82,7 +82,8 @@ The table is the module comment's. The code's functions
 (`_em_bytes_per_replicate` and siblings) use the init and MC rows exactly
 and larger EM terms — GEMM max(K+6, 2K+3) + 3Kq/512, legacy (4d+4)K + 4;
 the EM and MC functions multiply by 1.03 for allocator rounding (the init
-function does not); the GEMM path adds a per-stage fixed term of 2q units
+function does not; that is, for the default and k-means inits — 'minmax'
+uses the EM model); the GEMM path adds a per-stage fixed term of 2q units
 for the quadratic features; and `estimate_categorical`'s MC stage adds 4
 units per mc_sample for its running logaddexp over categories.
 
@@ -195,8 +196,11 @@ under the validated init/bootstrap offsets.
 
 ## Reproducibility on CUDA
 
-Fixed-seed results are bitwise reproducible on CPU whatever the chunking. On
-CUDA the replicate chunk `em_chunk` changes the matmul reduction order:
+Fixed-seed results are bitwise reproducible on CPU at float64 whatever the
+chunking; at float32 on CPU also bitwise except em_chunk=1 with a
+one-component model, where the M-step's single-row tail product takes a
+different BLAS path (3e-8 in a measured MI; details below). On CUDA the
+replicate chunk `em_chunk` changes the matmul reduction order:
 
 - At float32 the blocked M-step folds the batch's replicates into one GEMM,
   whose summation order follows the batch size, so the chunk — including an
@@ -211,7 +215,7 @@ CUDA the replicate chunk `em_chunk` changes the matmul reduction order:
   6.8e-3 at float32; the design reviewer's em_fit (N=20,000, 12 replicates,
   K=4, 40 iterations) gave 1.2e-14 for em_chunk 5 vs 12 and 1.0e-12 for 1
   vs 12 (float32: 2.6e-6 and 3.1e-3). CPU was bitwise for every chunk at
-  both dtypes.
+  both dtypes in these two probes (K=6 and K=4).
 - The same holds for the other chunked stages on CUDA (reviewer's probes):
   val_ll with em_chunk 1 vs 12 differed by 4.4e-16 at float64 and 2.4e-7 at
   float32; the default initialisation's statistics by 3.6e-15 and 9.0e-6
@@ -219,7 +223,22 @@ CUDA the replicate chunk `em_chunk` changes the matmul reduction order:
   pinned at 4 and mc_chunk 10, 3 or 1 gave standard deviations differing by
   5e-18 to 2e-17 at float64 and means by 3.0e-8 at float32 — the MC
   samples are identical, the integrand's reduction order is not. CPU was
-  bitwise throughout.
+  bitwise throughout in these probes.
+- The CPU float32 exception (landed-read reviewer's probes, 2026-10-24,
+  v0.7.1 candidate): with a one-component model and em_chunk=1,
+  `_moment_gemm`'s tail term (the N % 512 samples after the last full
+  block) is a (1, 1, tail) @ (1, tail, q) product, which CPU float32 BLAS
+  evaluates on a different path (a different summation order) from the
+  same row inside a multi-row batch; the blocked part is bitwise. An
+  estimate at N=3000 (bivariate Gaussian, max_components=3, 8 bootstrap
+  replicates, mc_samples=5000, seed=3) gave MI means differing by 3.0e-8
+  between em_chunk=1 and 8 (the same with OMP_NUM_THREADS=1); em_chunk 2,
+  4 and 16 were bitwise equal to 8; only em_fit calls with K=1 differ; a
+  direct em_fit at K=1, R=8 differed by 3.7e-9 in the fitted means, K=2 and
+  K=3 bitwise; N=3072 (no tail), float64, the legacy kernels, val_ll and
+  the initialisation were bitwise. The executor's re-run (8 replicates
+  converging at different iterations, N=3000) reproduced 3.7e-9 at
+  em_chunk=1 and bitwise results at em_chunk 2 and 4, and at N=3072.
 
 ## Precision pin and threads
 
