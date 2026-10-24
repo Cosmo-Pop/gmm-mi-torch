@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.7.1 (2026-10-24)
+
+Documentation only, no behaviour change: `gmm_mi_torch/estimator.py`
+parses to the same syntax tree as at 0.7.0 once docstrings are removed,
+the v0.7.0 reference sets compare clean on both kernels, and the test
+matrix is unchanged. Built under report-before-code
+(scoping/design-report-v0.7.1-docs-2026-10-24.md, ruled in
+design-review-v0.7.1-docs-2026-10-24.md) and read as a landed diff before
+the tag.
+
+- `estimate`: each parameter entry is two to four lines; the longer
+  explanations moved, every fact kept, into its Notes under short
+  headings (selection; standardisation and regularisation;
+  preprocessing; initialisation; chunking and memory; reproducibility).
+- Raises sections on `estimate`, `estimate_categorical`, `em_fit` and
+  `val_ll`, listing the conditions the code raises; Warns sections on
+  `em_fit` and `val_ll`.
+- `estimate_categorical`, `em_fit`, `select_batched`, `select_sequential`
+  and `FittedGMM` document every parameter in a form numpydoc parses
+  (grouped "As in `estimate`" entries replace a free paragraph and
+  line-wrapped group headers).
+- Private helpers state purpose, contract and invariants only: dated
+  sentences, review references and "until vX.Y" history moved to the new
+  docs/design_notes.md (mechanisms and measurements: architecture, kernel
+  reroute, memory models, bootstrap resample bounds, random streams, CUDA
+  reproducibility, the precision pin) or were already recorded in this
+  changelog.
+- Corrections to the documentation: 'TC' needs at least two columns (the
+  docstring said any number); `scale` also sets the 'minmax'
+  initialisation's standard deviation; `n_bootstrap` replicates are
+  batched per em_chunk; a malformed `mc_chunk` is rejected after
+  component selection (after every category's selection and bootstrap
+  in `estimate_categorical`), not at entry; and every chunk-invariance
+  claim (`em_fit`, `val_ll`, the initialisation, the out-of-memory
+  retry, `mc_chunk`) now reads "bitwise on CPU, reduction order on
+  CUDA": on CUDA float64 is not bitwise chunk-invariant either (fitted
+  means moved by 1e-14 to 1e-12 between em_chunk values in two measured
+  cases; float32 by up to 7e-3), so CPU, not "float64 or CPU", is the
+  bit-reproducible setting, and only the Monte-Carlo samples, not the
+  results, are independent of mc_chunk on CUDA.
+- README: the CUDA batching paragraph became a subsection of short
+  bullets, a Known limitations section points to the design notes, and
+  the kernel, large-N, multi-GPU and test paragraphs are split; every
+  number is kept.
+
+Test matrix at the docstring commit d081acb, re-run at the release
+commit: 122 passed / 2 skipped (CPU fp64), 123 / 1 (CUDA fp32), 120 / 4
+(CPU fp64 legacy), 121 / 3 (CUDA fp32 legacy). Reference sets
+ref_v070 / ref_v070_legacy: 0 mismatches.
+
 ## 0.7.0 (2026-10-24)
 
 One change, on one path: above torch.multinomial's 2^24-category cap the
