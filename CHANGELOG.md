@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.7.0 (2026-10-24)
+
+One change, on one path: above torch.multinomial's 2^24-category cap the
+bootstrap resample draws its indices as floor(u N) from float64 uniforms
+instead of a torch.randint whose 32-bit draw, reduced modulo N, drew the
+first 2^32 mod N indices ceil(2^32/N)/floor(2^32/N) times as often as
+the rest (+2.4% on the first 95% of rows at N=1e8; +0.233% on the first
+49.7% at N=1e7, 9-12 sigma at eight replicates). Built under
+report-before-code (scoping/design-report-v0.7.0-2026-10-24.md, ruled in
+design-review-v0.7.0-2026-10-24.md with ten amendments, all adopted) and
+read as a landed diff before the tag. The minor-version bump follows the
+project's precedent for random-stream changes: the N > 2^24 resample
+stream moves on both devices (same seed derivation); results are
+bitwise v0.6.1 on CPU everywhere else, and the N <= 2^24 multinomial
+stream, CPU and CUDA, is unchanged.
+
+- The new draw is uniform to <= N/2^53 on CPU (uniforms on the 2^-53
+  grid) and <= N/2^52 on CUDA (the kernel's half-step values above 0.5
+  round to even onto the 2^-52 grid, measured at torch 2.11): 2.2e-8 at
+  N=1e8, no regional structure; the first-region/rest count ratio at
+  N=1e7 sits within 2.2 sigma of 1 over three seeds on both devices.
+  The clamp to N-1 guards only a kernel returning u = 1.0: for every
+  float64 u < 1 and N <= 2^53, floor(fl(u N)) <= N-1 (the deficit
+  N 2^-53 is at least half an ulp of N, equal only at powers of two,
+  where the product is exact).
+- Transient 16 B/sample per replicate at a time, measured, the same as
+  the randint form's (whose docstring counted one of its two live index
+  vectors); the draw is written as one expression so the uniforms and
+  the indices are released before the next replicate (binding them
+  measures 24 B/sample). At N=1e8 that is 1.6 GB, 8% of the float32
+  counts at 50 replicates.
+- Cost ~1.6x the randint draw on both devices (draw + scatter at N=3e6,
+  ten replicates, best of three: CPU 0.14 -> 0.22 s, CUDA 12 -> 19 ms);
+  at N=1e8 with 50 replicates about 50 s on CPU, against tens of minutes
+  of bootstrap EM. The 0.6.1 design report's sentence that the float64
+  draw was faster was wrong.
+- Tests: the stream-and-transients test spies torch.rand (one float64
+  row per replicate, whatever the working dtype) and torch.randint (the
+  seeds only); a uniformity test at N=1e7 (4-sigma gate; the randint
+  draw fails it at 9-12 sigma) and a mechanism test with torch.rand
+  replaced by fixed vectors (u = 1.0 clamped; nextafter(1, 0) and
+  1 - 2^-52 floor to N-1 at N=16 and at the non-power-of-two N=12) are
+  new; 124 tests. Matrix at the draw commit (passed/skipped): cpu64
+  122/2, cuda32 123/1, cpu64_legacy 119/4 and cuda32_legacy 120/3, each
+  legacy leg with one failure, test_collapsed_component_offdiagonal_bound,
+  which is pre-existing (it fails identically on v0.6.1's code: its
+  repair-warning assertion, added in the v0.6.1 fix-first commit, was
+  verified on the default leg only, and the legacy centred kernel
+  completes that case with nothing to repair). A test-only commit gates
+  that assertion on the GEMM kernel; the test then passes on all four
+  legs.
+- Decided and not adopted, by the owner (2026-10-24): the CUDA
+  multinomial keeps its beta-validated float64 stream for N <= 2^24 (the
+  documented float32-resolution weight scatter, sd 0.02 at N=1e6 to
+  ~0.24 near 1.1e7, stands; a device-dependent category cap was not
+  adopted); the streamed CV-mask em_fit memory model does not carry the
+  fixed cuBLAS-workspace term (the bench's caption on those rows stands).
+  The items listed at 0.6.1 for a later pass are unchanged.
+- Docs: README's reproducibility paragraph, docs/make_validation_summary.py
+  and the regenerated docs/validation_summary.pdf describe the new draw.
+
 ## 0.6.1 (2026-10-23)
 
 The pass for the 19 low findings and 3 sweep extras of the v0.5.0
