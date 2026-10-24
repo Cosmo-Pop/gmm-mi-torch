@@ -161,9 +161,10 @@ def _entry_precision(fn):
 LOG2PI = math.log(2.0 * math.pi)
 
 # torch.multinomial caps the number of categories at 2**24; above this the
-# uniform bootstrap resample falls back to a randint histogram (identically
-# distributed for uniform probabilities).  Hoisted to a module constant so the
-# fallback branch can be exercised at small N by monkeypatching it down.
+# uniform bootstrap resample falls back to a per-replicate histogram of
+# float64-uniform index draws (identically distributed; bias <= N/2^52).
+# Hoisted to a module constant so the fallback branch can be exercised at
+# small N by monkeypatching it down.
 _MULTINOMIAL_MAX_CATEGORIES = 1 << 24
 
 # Per-replicate Monte-Carlo streams: bootstrap replicate r draws its MC
@@ -2247,9 +2248,10 @@ def _bootstrap_counts(N, B, dtype, device, generator):
     """Uniform multinomial bootstrap resample counts, shape (B, N).
 
     Identical in distribution to index resampling. torch.multinomial caps
-    its category count at 2^24; above that the counts are accumulated from
-    randint draws instead (identically distributed for uniform
-    probabilities). This helper is the fallback's only home.
+    its category count at 2^24; above that the counts are histogrammed
+    from float64-uniform index draws, floor(u N), one replicate at a time
+    (identically distributed for uniform probabilities; bias <= N/2^52,
+    see (ii) below). This helper is the fallback's only home.
 
     Memory: the multinomial path's draw is the validated resample stream,
     so it stays ONE call on the whole (B, N) index matrix — but its
@@ -2258,12 +2260,16 @@ def _bootstrap_counts(N, B, dtype, device, generator):
     scatter source an expanded ones row, so the only full-size transient
     is torch.multinomial's own (B, N) int64 index matrix plus its internal
     prefix sums (CUDA, float64 row: ~4x the float64 weights, i.e. ~8x
-    float32 weights; outside the OOM guard by design). The randint path
+    float32 weights; outside the OOM guard by design). The large-N path
     (N > 2^24, where the weights alone are GiB) draws and histograms one
     replicate at a time from per-replicate generators seeded off
-    `generator`, so its transient is one (N,) index vector; that path's
-    stream is therefore chunk- and retry-invariant by construction, and
-    differs from the (B, N) draw of earlier versions.
+    `generator`: its transient is one (N,) float64 uniform vector and the
+    (N,) int64 index vector it becomes, 16 B/sample measured — the same
+    as the randint form it replaced (whose two live index vectors an
+    earlier docstring counted as one) — written as one expression so
+    both are released before the next replicate's draw (binding them
+    across iterations measures 24 B/sample). That path's stream is
+    chunk- and retry-invariant by construction.
 
     Precision: the probability row is built at float64 whatever the
     working dtype. torch's CPU multinomial accumulates the row's CDF
@@ -2275,8 +2281,9 @@ def _bootstrap_counts(N, B, dtype, device, generator):
     float32 and float64 resamples are uniform and bitwise identical to
     each other, on CPU and CUDA.
 
-    Known limitations, kept because this draw is the validated resample
-    stream (documented 2026-10-23, quantified by the independent review):
+    Known limitations and the large-N draw's bound (documented
+    2026-10-23/24, quantified by the independent reviews; (i) is kept
+    because that draw is the validated resample stream):
     (i) on CUDA, torch.multinomial's kernel draws float32 uniforms even
     for a float64 row, so each sample's inclusion weight carries a fixed,
     replicate-independent factor set by how many 2^-24 grid points its
@@ -2287,17 +2294,25 @@ def _bootstrap_counts(N, B, dtype, device, generator):
     m_k = 2^(24+k)/N grid points per interval, variance 2^-(k+1)
     frac(m_k)(1 - frac(m_k))/m_k^2), i.e. a fixed shift of the bootstrap
     mean of order sd(w) x one standard error; the CPU path has none
-    (excess variance -1e-5 at N=1e6). (ii) The N > 2^24 fallback's
-    torch.randint reduces a 32-bit draw modulo N, so the first 2^32 mod N
-    indices are drawn ceil(2^32/N)/floor(2^32/N) times as often as the
-    rest (+2.4% for the first 95% of rows at N=1e8; +0.07% at N=3e6) — a
-    regional tilt on that path only; the 2^53-resolution replacement is
-    held for a release that may move streams. (iii) The per-replicate
-    seeds are drawn from [0, 2^62), but CPU torch.Generator.manual_seed
-    keeps 32 bits (CUDA keeps 64), so the CPU per-replicate seed space is
-    2^32: two replicates of one call share a stream with probability
-    R(R-1)/2^33 (1.7e-6 at the default 120 replicates); the same holds
-    for the default init's per-replicate seeds.
+    (excess variance -1e-5 at N=1e6). (ii) The N > 2^24 path's index
+    draw floor(u N) from float64 uniforms (v0.7.0; until v0.6.1 a
+    torch.randint whose 32-bit draw, reduced modulo N, drew the first
+    2^32 mod N indices ceil(2^32/N)/floor(2^32/N) times as often as the
+    rest: +2.4% on the first 95% of rows at N=1e8) is uniform to
+    <= N/2^53 on CPU, whose uniforms lie on the 2^-53 grid, and to
+    <= N/2^52 on CUDA, where the kernel's half-step values above 0.5
+    round to even onto the 2^-52 grid (measured at torch 2.11): 2.2e-8 at
+    N=1e8, with no regional structure. The clamp to N - 1 guards only a
+    kernel returning u = 1.0 (torch reflects it to 0.0 today), which
+    would otherwise raise in scatter_add_: for every float64 u < 1 and
+    N <= 2^53, floor(fl(u N)) <= N - 1, since the deficit N 2^-53 is at
+    least half an ulp of N, with equality only at powers of two, where
+    the product is exact. (iii) The per-replicate seeds — of this
+    large-N draw and of the default init — are drawn from [0, 2^62), but
+    CPU torch.Generator.manual_seed keeps 32 bits (CUDA keeps 64), so the
+    CPU per-replicate seed space is 2^32: two replicates of one call
+    share a stream with probability R(R-1)/2^33 (1.7e-6 at the default
+    120 replicates).
     """
     if N <= _MULTINOMIAL_MAX_CATEGORIES:
         idx = torch.multinomial(
@@ -2312,10 +2327,16 @@ def _bootstrap_counts(N, B, dtype, device, generator):
                           device=device).tolist()
     one = torch.ones((), dtype=dtype, device=device).expand(N)
     for b in range(B):
-        idx = torch.randint(0, N, (N,), device=device,
-                            generator=torch.Generator(device=device)
-                            .manual_seed(seeds[b]))
-        s[b].scatter_add_(0, idx, one)
+        gen = torch.Generator(device=device).manual_seed(seeds[b])
+        # floor(u N) from float64 uniforms: uniform to <= N/2^52 (the
+        # 32-bit randint it replaced tilted the first 2^32 mod N indices);
+        # the clamp guards only u == 1.0 (no float64 u < 1 reaches N).
+        # Temporaries, not bound: binding them across iterations keeps
+        # two extra (N,) vectors live (24 B/sample instead of 16).
+        s[b].scatter_add_(
+            0, torch.rand(N, dtype=torch.float64, device=device,
+                          generator=gen).mul_(N).long().clamp_(max=N - 1),
+            one)
     return s
 
 

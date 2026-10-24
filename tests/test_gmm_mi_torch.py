@@ -383,9 +383,10 @@ def test_invalid_argument_paths():
                              max_components=2)
 
 
-def test_bootstrap_randint_fallback(monkeypatch):
+def test_bootstrap_large_n_fallback(monkeypatch):
     # for N above torch.multinomial's 2**24 category cap the uniform bootstrap
-    # falls back to a randint histogram. Monkeypatch the cap down to exercise
+    # falls back to a per-replicate histogram of float64-uniform index draws
+    # (v0.7.0; a 32-bit randint before). Monkeypatch the cap down to exercise
     # the fallback at small N, and check it is distributionally consistent with
     # the multinomial path: both cover the analytic MI, and their means agree
     # within the combined bootstrap error.
@@ -1060,10 +1061,10 @@ def test_single_bootstrap_std_is_none():
     assert np.isfinite(m) and s is None
 
 
-def test_categorical_bootstrap_randint_fallback(monkeypatch):
+def test_categorical_bootstrap_large_n_fallback(monkeypatch):
     # the categorical bootstrap used to lack the >2^24 multinomial fallback
     # estimate has (it now lives in the shared _bootstrap_counts); as in
-    # test_bootstrap_randint_fallback, the two paths must agree within the
+    # test_bootstrap_large_n_fallback, the two paths must agree within the
     # combined bootstrap error
     rng = np.random.default_rng(8)
     N = 4000
@@ -2264,8 +2265,9 @@ def test_bootstrap_counts_stream_and_transients(monkeypatch):
     # hardening batch 5: the multinomial path's draw is the validated
     # resample stream and must be bitwise the (B,N)-matrix draw it replaces
     # (the probability row is expanded, the scatter source is a view); the
-    # randint path (N > 2^24) draws one replicate at a time from
-    # per-replicate generators — one (N,) index vector live, no (B,N) int64
+    # large-N path (N > 2^24) draws one replicate at a time from
+    # per-replicate generators as float64 uniforms, floor(u N) (v0.7.0): no
+    # (B,N) int64, and no (N,) randint — that was the 32-bit modulo draw
     E = gmm_mi_torch.estimator
     N, B = 3000, 5
     outs = {}
@@ -2286,20 +2288,82 @@ def test_bootstrap_counts_stream_and_transients(monkeypatch):
         assert torch.equal(got.sum(1), torch.full((B,), float(N), dtype=dt))
         outs[dt] = got
     assert torch.equal(outs[torch.float32].double(), outs[torch.float64])
-    shapes = []
-    orig = torch.randint
+    ri_shapes, rand_calls = [], []
+    orig_ri, orig_rand = torch.randint, torch.rand
 
-    def spy(*a, **k):
-        out = orig(*a, **k)
-        shapes.append(tuple(out.shape))
+    def spy_ri(*a, **k):
+        out = orig_ri(*a, **k)
+        ri_shapes.append(tuple(out.shape))
         return out
-    monkeypatch.setattr(torch, 'randint', spy)
+
+    def spy_rand(*a, **k):
+        out = orig_rand(*a, **k)
+        rand_calls.append((tuple(out.shape), out.dtype, out.device.type))
+        return out
+    monkeypatch.setattr(torch, 'randint', spy_ri)
+    monkeypatch.setattr(torch, 'rand', spy_rand)
     monkeypatch.setattr(E, '_MULTINOMIAL_MAX_CATEGORIES', 8)
     g = torch.Generator().manual_seed(7)
     got = E._bootstrap_counts(N, B, torch.float32, 'cpu', g)
     assert torch.equal(got.sum(1), torch.full((B,), float(N)))
-    assert shapes == [(B,)] + [(N,)] * B          # seeds, then one row at a time
+    assert ri_shapes == [(B,)]                    # the seeds, and nothing else
+    # one float64 row of uniforms per replicate, whatever the working dtype
+    assert rand_calls == [((N,), torch.float64, 'cpu')] * B
     assert (got >= 0).all() and got.dtype == torch.float32
+
+
+def test_large_n_bootstrap_draw_is_uniform(monkeypatch):
+    # v0.7.0: the N > 2^24 path draws floor(u N) from float64 uniforms. The
+    # torch.randint it replaced reduced a 32-bit draw modulo N, so the first
+    # 2^32 mod N indices were drawn ceil(2^32/N)/floor(2^32/N) times as often
+    # as the rest: at N=1e7 that is +0.233% on the first 49.7% of rows, 9-12
+    # sigma at B=8 (measured on v0.6.1 over three seeds on both devices,
+    # while the new draw sits within 2.2 sigma). At N=3e6 the old tilt is
+    # 2.7 sigma and the two draws cannot be told apart, hence 1e7 (~1 s and
+    # ~0.5 GB per device). One function, not parametrised, so the test
+    # counts hold on CPU-only hosts.
+    E = gmm_mi_torch.estimator
+    monkeypatch.setattr(E, '_MULTINOMIAL_MAX_CATEGORIES', 8)
+    N, B = 10_000_000, 8
+    m = (1 << 32) % N
+    se = math.sqrt(1 / (B * m) + 1 / (B * (N - m)))     # Poisson(1) counts
+    for dev in ['cpu'] + (['cuda'] if torch.cuda.is_available() else []):
+        g = torch.Generator(device=dev).manual_seed(7)
+        s = E._bootstrap_counts(N, B, torch.float32, dev, g)
+        assert torch.equal(s.sum(1), torch.full((B,), float(N), device=dev))
+        assert (s >= 0).all()
+        ratio = s[:, :m].double().mean().item() / s[:, m:].double().mean().item()
+        assert abs(ratio - 1) <= 4 * se, (dev, (ratio - 1) / se)
+        del s
+
+
+def test_large_n_bootstrap_draw_mechanism(monkeypatch):
+    # pins the map u -> floor(u N), clamped to N-1, independently of torch's
+    # RNG: torch.rand is replaced by a fixed float64 vector. For every float64
+    # u < 1 and N <= 2^53, floor(fl(u N)) <= N-1 (the deficit N 2^-53 is at
+    # least half an ulp of N, with equality only at powers of two, where the
+    # product is exact), so the clamp acts only on u == 1.0: a guard against
+    # a kernel returning 1.0 (torch reflects it to 0.0 today), which would
+    # otherwise raise in scatter_add_. CPU only: an out-of-range index on
+    # CUDA is a device assert, not an exception. A .round() or .ceil() form
+    # fails at u = 0.5 and at nextafter(1, 0); N=12 is the non-power-of-two
+    # case, the only one where the product rounds at all (downwards).
+    E = gmm_mi_torch.estimator
+    monkeypatch.setattr(E, '_MULTINOMIAL_MAX_CATEGORIES', 8)
+    top = math.nextafter(1.0, 0.0)                      # 1 - 2^-53
+    cases = {
+        16: [0.0, 1.0, top, 0.5, 15 / 16, 1 / 16, 1 / 16 - 2.0 ** -56, 0.999],
+        12: [top, 1 - 2.0 ** -52, 1.0, 0.5, 11 / 12, 0.0, 1 / 12, 0.25],
+    }
+    for N, us in cases.items():
+        us = (us + [0.5 * (i + 1) / N for i in range(N)])[:N]   # pad to N
+        u = torch.tensor(us, dtype=torch.float64)
+        monkeypatch.setattr(torch, 'rand', lambda *a, u=u, **k: u.clone())
+        got = E._bootstrap_counts(N, 1, torch.float32, 'cpu',
+                                  torch.Generator().manual_seed(1))
+        exp = torch.tensor([min(math.floor(x * N), N - 1) for x in us])
+        assert exp[:3].tolist() == ([0, 15, 15] if N == 16 else [11, 11, 11])
+        assert torch.equal(got[0], torch.bincount(exp, minlength=N).float())
 
 
 def test_oom_retry_releases_after_handler(monkeypatch):
