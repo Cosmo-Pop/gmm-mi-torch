@@ -1,26 +1,16 @@
 """Pure-torch port of GMM-MI with vectorised bootstrap and TC.
 
-Design notes
-------------
-- No sklearn. EM is implemented as *weighted* EM over a leading replicate
-  dimension R. Per-sample weights unify everything that GMM-MI does with
-  loops and index resampling:
-    * CV folds  -> 0/1 masks over the full dataset (train mask; complement
-      scores validation LL), so unequal fold sizes are free;
-    * bootstrap -> multinomial(N, 1/N) counts as weights (identical in
-      distribution to index resampling);
-    * inits     -> just more replicates.
-  One EM loop therefore fits (n_inits x n_folds), or B bootstrap
-  realisations, or (K_max x n_inits x n_folds), as a single batched
-  tensor computation.
-- Marginalisation is analytic index masking of the joint GMM, as in
-  GMM-MI, so MI / conditional MI / total correlation all come from one
-  joint fit and the marginals are exactly consistent with the joint.
-- Two component-selection protocols:
-    'sequential' : GMM-MI's protocol (increment k, validation-LL metric,
-                   improvement threshold_components + patience early stop).
-    'batched'    : fit k = 1..K_max simultaneously (dead-component
-                   padding to a common tensor shape), argmax validation LL.
+One weighted EM, batched over a leading replicate dimension, fits every
+initialisation x CV fold, every candidate k and every bootstrap
+realisation: per-sample weights stand in for GMM-MI's loops and index
+resampling, and every marginal is obtained analytically from the joint
+fit. `estimate`, `estimate_categorical` and `FittedGMM` are the public
+entry points; `em_fit`, `val_ll`, `select_batched`, `select_sequential`
+and the Gaussian helpers are the kernels they are built from. The
+environment variable GMM_MI_TORCH_EM_KERNEL ('gemm', the default, or
+'legacy') selects the EM kernels at import; any other value raises
+ValueError. Design notes, memory models and the measurements behind the
+constants: docs/design_notes.md.
 """
 
 import functools
@@ -47,11 +37,10 @@ if _EM_KERNEL not in ('gemm', 'legacy'):
 
 # torch >= 2.9 replaces get/set_float32_matmul_precision with per-backend
 # fp32_precision settings; once user code has set any of those, the legacy
-# getter RAISES ("mix of the legacy and new APIs"), which used to kill every
-# public entry point here even on CPU. The per-backend settings are also what
-# make an exact restore possible: the legacy setter rewrites every backend at
-# once, so restoring through it handed a caller who had only enabled CUDA
-# TF32 a changed mkldnn (CPU) setting.
+# getter RAISES ("mix of the legacy and new APIs"). The per-backend settings
+# are also what make an exact restore possible: the legacy setter rewrites
+# every backend at once, so restoring through it would hand a caller who had
+# only enabled CUDA TF32 a changed mkldnn (CPU) setting.
 try:
     _FP32_KNOBS = (torch.backends, torch.backends.cuda.matmul,
                    torch.backends.mkldnn.matmul)
@@ -73,11 +62,10 @@ class _pinned_precision:
     exposes no raw getter, so a child knob is restored to 'none' whenever
     'none' reproduces the effective value recorded at entry, and to that
     value explicitly otherwise. A knob that inherited from the generic
-    setting therefore keeps following it after the pin (the v0.5.0 pin
-    wrote the resolved value back and silently severed that link). The
-    one case the rule cannot tell apart: a child set EXPLICITLY to the
-    same value as its parent comes back inherited — the same precision
-    now, and a later change of the parent then moves it too."""
+    setting therefore keeps following it after the pin. The one case the
+    rule cannot tell apart: a child set EXPLICITLY to the same value as
+    its parent comes back inherited — the same precision now, and a later
+    change of the parent then moves it too."""
 
     def __enter__(self):
         if _FP32_KNOBS is not None:
@@ -160,11 +148,9 @@ def _entry_precision(fn):
 
 LOG2PI = math.log(2.0 * math.pi)
 
-# torch.multinomial caps the number of categories at 2**24; above this the
-# uniform bootstrap resample falls back to a per-replicate histogram of
-# float64-uniform index draws (identically distributed; bias <= N/2^52).
-# Hoisted to a module constant so the fallback branch can be exercised at
-# small N by monkeypatching it down.
+# torch.multinomial's category cap: above it _bootstrap_counts histograms
+# float64-uniform index draws instead. A module constant so tests can reach
+# that path at small N by lowering it.
 _MULTINOMIAL_MAX_CATEGORIES = 1 << 24
 
 # Per-replicate Monte-Carlo streams: bootstrap replicate r draws its MC
@@ -182,9 +168,8 @@ _MC_CAT_STRIDE = 1 << 20
 # own generator, on the single-pass and the streamed (n_chunk) path alike:
 # the draw is then invariant to em_chunk AND n_chunk by construction on
 # every device (CUDA's Philox streams are not sequential across calls, so
-# any other chunking of the draw would depend on the chunk size). 2^14
-# measured on the GB10: 1.3 ms per replicate at N=1e6 (one-shot 0.6 ms),
-# ~0.1 s per replicate and pass at N=1e8.
+# any other chunking of the draw would depend on the chunk size). Timings
+# of the 2^14 block: docs/design_notes.md.
 _INIT_DRAW_BLOCK = 1 << 14
 
 # gaussianise's random tie-breaking draws its permutations from
@@ -193,16 +178,11 @@ _INIT_DRAW_BLOCK = 1 << 14
 _TIE_SEED_OFFSET = 40_000
 
 # Auto-sizing of the replicate chunks (em_chunk / mc_chunk = 'auto'). The
-# per-replicate peak-memory models below were re-derived on the GB10 over
-# K = 1..20 and d = 1..8 (validation/bench_mem_models.py: 207 measured rows
-# per dtype, run at fp32 and with --fp64 as of 2026-10-23, every stage incl.
-# val_ll, the streamed paths with expand-view masks, the init stage and the
-# d=1 MC stage; every row at or below its model except the streamed
-# CV-mask em_fit rows at N=4e5, d=2, where a fixed ~10-19 MiB cuBLAS
-# workspace shows against 5-45 MiB models: 1.06 at K=3 fp32, 1.42 at K=20
-# with n_chunk=4096 at both dtypes — an absolute term, irrelevant at real
-# budgets), in units of N_eff x itemsize per replicate, with one to two
-# units of slack over the measured peaks:
+# per-replicate peak-memory models below are measured on the GB10 over
+# K = 1..20 and d = 1..8 by validation/bench_mem_models.py (the bench and
+# its one known exception: docs/design_notes.md, "Memory models"), in
+# units of N_eff x itemsize per replicate, with one to two units of slack
+# over the measured peaks:
 #   GEMM EM step      max(K+4, 2K) + 3Kq/block   (E-step: one (R,N,K)
 #                     buffer plus four (R,N) temporaries; M-step: the
 #                     buffer plus its one blocked copy and the block
@@ -217,10 +197,8 @@ _TIE_SEED_OFFSET = 40_000
 #                     (integrand with its analytic marginals; gmm_sample's
 #                     (S,d,d) Cholesky gather dominates at small K)
 # On CUDA a stage's batch is whatever fits the budget fraction of the
-# memory this process can still allocate; there is no replicate floor (the
-# 32-replicate floor of v0.1.1-v0.6.0 only ever bound when memory was
-# tight, i.e. exactly where it over-requested — retired 2026-10-23). CPU
-# keeps the historical default.
+# memory this process can still allocate; there is no replicate floor. CPU
+# keeps the default of 8.
 _AUTO_CHUNK_MEM_FRACTION = 0.5      # of the allocatable device memory at call time
 _AUTO_CHUNK_CPU_DEFAULT = 8
 
@@ -270,8 +248,7 @@ def _auto_chunk(n_items, bytes_per_item, device, default=_AUTO_CHUNK_CPU_DEFAULT
 def _resolve_chunk(value, n_items, bytes_per_item, device, fixed_bytes=0,
                    name='em_chunk'):
     """Turn an `em_chunk` / `mc_chunk` argument ('auto' or int) into an int.
-    A float (2.7) fails under the argument's name like every other count
-    (it used to be truncated silently)."""
+    A float (2.7) fails under the argument's name like every other count."""
     if isinstance(value, str):
         if value != 'auto':
             raise ValueError(f"{name} must be a positive int or 'auto'; "
@@ -349,7 +326,7 @@ def _validate_entry_args(seed, n_bootstrap, mc_samples, max_components,
                          f"{threshold_components}")
     # threshold_fit <= 0 (or NaN) can never satisfy the EM stop test, so
     # every replicate of every stage would run max_iter; a non-number
-    # used to die in the stop test after the init stage had run
+    # would die in the stop test only after the init stage had run
     try:
         ok = threshold_fit > 0
     except TypeError:
@@ -385,7 +362,7 @@ def _em_fixed_bytes(N, d, dtype, n_chunk=None):
         return 0
     n_eff = N if n_chunk is None else min(N, int(n_chunk))
     # the features at 2q units: the in-place assembly peaks at q + d(d+1)/2,
-    # the rest is slack kept on the reviewer's ruling
+    # the rest is slack
     return 2 * n_eff * (d + d * (d + 1) // 2) * dtype.itemsize
 
 
@@ -408,8 +385,7 @@ def _init_bytes_per_replicate(N, K, d, dtype, init_type, n_chunk=None):
         return _em_bytes_per_replicate(N, K, d, dtype, n_chunk)
     n_eff = _init_sample_chunk(N, n_chunk)
     # +12: the k-means pass holds the (c,n) int64 labels and the (c,n,K)
-    # distance matrix beside the one-hot — measured 1.7x an 11 MiB model at
-    # K=1, d=1 with the old +4 (validation/bench_mem_models.py)
+    # distance matrix beside the one-hot (docs/design_notes.md)
     return int(n_eff * dtype.itemsize * ((4 * d + 3) * K + 12))
 
 
@@ -517,8 +493,9 @@ def _legacy_sample_chunk(N, K, d, dtype, n_chunk=None):
 
 def _run_chunked(n, chunk, fn):
     """Apply fn(slice) over [0, n) in chunks of `chunk`, halving the chunk
-    and retrying on a CUDA out-of-memory error.  Results are chunk-invariant,
-    so the retry changes only peak memory."""
+    and retrying on a CUDA out-of-memory error. Results do not depend on
+    the chunk on CPU (bitwise), so there the retry changes only peak
+    memory; on CUDA they move at reduction order."""
     outs, i = [], 0
     chunk = max(1, min(int(chunk), int(n)))
     while i < n:
@@ -533,7 +510,7 @@ def _run_chunked(n, chunk, fn):
         if retry:
             # outside the handler: inside it the in-flight exception's
             # traceback still references the failed attempt's frame and
-            # tensors, so an empty_cache there released nothing of its own
+            # tensors, so an empty_cache there would release nothing
             torch.cuda.empty_cache()
             warnings.warn(f"CUDA out of memory; retrying with chunk={chunk}",
                           RuntimeWarning, stacklevel=3)
@@ -742,9 +719,10 @@ def marginal_score(X_full, w, mu, cov, idx):
 # M2 - m1 m1^T covariance (u = unit roundoff), so a component at the
 # reg_covar floor away from the origin is beyond these kernels' precision
 # at float32 (and below reg_covar ~1e-13 at float64). Replicates in that
-# regime are detected and finished on the centred legacy kernels (see
-# _reroute_trips, which also documents the detector's deliberate blind
-# spot for rho->1 components). Direct em_fit/val_ll calls on unstandardised
+# regime are detected and finished on the centred legacy kernels (see the
+# kernel-reroute comment above _REROUTE_TOL_NATS, which also states the
+# detector's deliberate blind spot for rho->1 components). Direct
+# em_fit/val_ll calls on unstandardised
 # float32 data fall in the detected regime too: they run correctly, via
 # the slower legacy path.
 
@@ -754,9 +732,8 @@ def _features(X):
 
     Assembled in place — the output, one gathered operand copied into it,
     the second gathered operand multiplied in — so the transient is
-    q + d(d+1)/2 units of n x itemsize (the cat of the product held both
-    gathers and the product beside the output: 108 vs 80 units at d=8,
-    measured); the products are bitwise the same."""
+    q + d(d+1)/2 units of n x itemsize; the products are bitwise those of
+    a concatenated assembly."""
     d = X.shape[-1]
     iu = torch.triu_indices(d, d, device=X.device)
     F = torch.empty(*X.shape[:-1], d + iu.shape[1], dtype=X.dtype,
@@ -836,15 +813,14 @@ def _restore_floor(cov, reg_covar):
     the components WHOSE DIAGONAL WAS CLAMPED the off-diagonal roundoff
     residue (~u x O(1), i.e. ~1e-6 at float32) can then exceed the floor
     and leave [[reg, e], [e, reg]] indefinite beyond the reach of _chol's
-    escalation (scaled to the diagonal, capped at ~1e3 x): the estimate
-    aborted at float32 for reg_covar <= ~1e-9 on duplicated-point data.
-    Those components' off-diagonals are bounded to the PSD-consistent
+    escalation (scaled to the diagonal, capped at ~1e3 x) — at float32 for
+    reg_covar <= ~1e-9 on duplicated-point data. Those components'
+    off-diagonals are bounded to the PSD-consistent
     |c_ij| <= sqrt(c_ii c_jj) (1 - 1e-6); every other component is copied
-    verbatim, so results on data that never clamps are bitwise unchanged.
-    At d >= 3 the pairwise bound is necessary, not sufficient — the
-    residue's signs can leave lambda_min ~ -reg_covar — but the matrix is
-    then inside the escalation's reach (one warning), where the raw one
-    aborted."""
+    verbatim, so data that never clamps is bitwise unaffected. At d >= 3
+    the pairwise bound is necessary, not sufficient — the residue's signs
+    can leave lambda_min ~ -reg_covar — but the matrix is then inside the
+    escalation's reach (one warning), where the unbounded one is not."""
     diag = torch.diagonal(cov, dim1=-2, dim2=-1)
     clamped = (diag < reg_covar).any(-1)                        # (R,K)
     diag.clamp_(min=reg_covar)
@@ -892,12 +868,9 @@ def _moment_gemm(wr, F):
 
     The float32 blocks are batched over BLOCKS only, with (k, r) folded
     into the GEMM's row dimension: one transient copy of wr[:, :N0] (a
-    view at K = 1), and F is never broadcast. The previous form batched
-    torch.matmul over (R, nb) against a (1, nb, b, q) F, which expanded
-    and copied F R times (q/K responsibility buffers every M-step, 23x at
-    d=8, K=2) and copied wr too whenever N % block != 0. Per block the
-    dot products are the same 512 float32 terms, the cross-block sum the
-    same float64 terms; CPU results are bitwise those of the old form.
+    view at K = 1), and F is never broadcast (why: docs/design_notes.md).
+    Per block the dot products are 512 float32 terms, the cross-block sum
+    float64 terms.
     """
     R, N, K = wr.shape
     q = F.shape[-1]
@@ -913,9 +886,9 @@ def _moment_gemm(wr, F):
         S += (torch.bmm(A, F[:N0].reshape(nb, _MSTEP_BLOCK, q))  # (nb,K*R,q)
               .double().sum(0).view(K, R, q).transpose(0, 1))
     if N % _MSTEP_BLOCK:
-        # the tail is a 3-D broadcast matmul that copies nothing (kept
-        # verbatim on the reviewer's ruling: a folded-row tail would add
-        # a copy of its own and move the tail-only regime off bitwise)
+        # the tail is a 3-D broadcast matmul that copies nothing (a
+        # folded-row tail would add a copy of its own and change the
+        # tail-only regime's summation order)
         N0 = nb * _MSTEP_BLOCK
         S += torch.matmul(wr[:, N0:].transpose(1, 2), F[N0:].unsqueeze(0)).double()
     return S
@@ -961,8 +934,8 @@ def _em_step_gemm_nchunked(X, wc, w, mu, cov, reg_covar, n_chunk, rows=None):
         S += _moment_gemm(wr, Fc)
         ll_sum += (sc * ll_n).sum(1).double()
         # not carried into the next chunk's allocation: the next chunk's
-        # features are assembled while these would still be bound (two
-        # feature blocks at once — 1.3x the model at R=1, measured)
+        # features would otherwise be assembled while these are still
+        # bound (two feature blocks at once)
         del lj, wr, Fc
     tot = wc.totals() if rows is None else wc.totals()[rows]   # float64
     ll = (ll_sum / tot).to(dt)
@@ -1001,11 +974,13 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
     out-of-memory guard as `em_fit`, and — with `n_chunk` — streamed over
     sample chunks of _init_sample_chunk(N, n_chunk) in two passes (means,
     then centred second moments: the same algebra as the single-pass
-    M-step, with float64 accumulators). Results are chunk-invariant: the
+    M-step, with float64 accumulators). The draw is chunk-invariant: the
     default init seeds one generator per replicate from `generator` and
     draws in fixed blocks of _INIT_DRAW_BLOCK samples, so the draw is the
-    same for every em_chunk and n_chunk on every device; the streamed
-    moments agree with the single pass at reduction order.
+    same for every em_chunk and n_chunk on every device. The statistics
+    computed from it are bitwise chunk-invariant on CPU and move at
+    reduction order on CUDA, and the streamed moments agree with the
+    single pass at reduction order.
     """
     N, d = X.shape
     dev, dt = X.device, X.dtype
@@ -1229,8 +1204,8 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
     """Weighted EM over a leading replicate dimension, in replicate chunks.
 
     Replicates (CV fits, bootstrap realisations) are independent, so they are
-    processed in chunks of `em_chunk` purely to bound peak memory; results
-    are identical to a single batch.
+    processed in chunks of `em_chunk` purely to bound peak memory; results do
+    not depend on the chunk on CPU (bitwise); on CUDA see `em_chunk`.
 
     Parameters
     ----------
@@ -1245,19 +1220,14 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
         only its own (chunk, n_samples) rows.
     w, mu, cov : torch.Tensor
         Initial mixture parameters, shapes (R, K), (R, K, d), (R, K, d, d).
-    reg_covar, threshold_fit, max_iter, n_chunk
+    reg_covar, threshold_fit, max_iter
         As in `estimate`.
     em_chunk : int, default=8
-        Replicates per batch. A CUDA out-of-memory error halves it and
-        retries (with a RuntimeWarning); results are chunk-invariant
-        bitwise on CPU. On CUDA at float32 the blocked M-step folds the
-        batch's replicates into one GEMM, whose summation order follows
-        the batch size, so the chunk — including an out-of-memory retry,
-        which pinning em_chunk does not prevent — moves results at
-        reduction order, and on knife-edge data that can move the
-        selected k (measured: k=5 vs 6, MI 0.4741 vs 0.4745 against an
-        errorbar of 0.008); float64 or a CPU run is the bit-reproducible
-        setting.
+        Replicates per batch; a CUDA out-of-memory error halves it and
+        retries (with a RuntimeWarning). Bitwise chunk-invariant on CPU; on
+        CUDA see `estimate`, Notes, "Reproducibility".
+    n_chunk : int, optional
+        As in `estimate`.
 
     Returns
     -------
@@ -1270,15 +1240,28 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
         `threshold_fit`). Score the returned parameters with `val_ll` when
         an exact final-state likelihood is needed.
 
-    A RuntimeWarning (one per call) reports replicates that exhausted
-    `max_iter` without meeting `threshold_fit`; their last iterates are
-    returned.
+    Raises
+    ------
+    RuntimeError
+        When a covariance cannot be factorised even after escalating
+        diagonal regularisation (raise reg_covar, or use float64), or when
+        a CUDA out-of-memory error persists at one replicate per batch
+        (torch.cuda.OutOfMemoryError). Arguments are not validated here;
+        `estimate` validates them at entry.
+
+    Warns
+    -----
+    RuntimeWarning
+        Once per call for replicates that exhausted `max_iter` without
+        meeting `threshold_fit` (their last iterates are returned), and once
+        for replicates finished on the centred legacy kernels because a
+        component collapsed beyond the GEMM kernels' precision.
     """
     R = _n_rows(s)
     n_chunk = None if n_chunk is None else int(n_chunk)
     # the streamed path reads the weights one sample block at a time
     # (never an (R,N) copy); the single-pass path takes its (chunk, N)
-    # gather, one responsibility-buffer-over-K, as before
+    # gather, one responsibility-buffer-over-K
     outs = _run_chunked(R, em_chunk, lambda sl: _em_fit_core(
         X, _rows(s, sl) if n_chunk is None else _WeightChunks(s, sl, n_chunk),
         w[sl], mu[sl], cov[sl], reg_covar, threshold_fit, max_iter, n_chunk))
@@ -1371,12 +1354,10 @@ def _em_step_nchunked(X, wc, w, mu, chol, logw, reg_covar, n_chunk,
 # whose parameters make the residue material are finished on them. The
 # detector uses the min diagonal as the precision proxy: it trips on every
 # executed failure case and never on continuous data, but is DELIBERATELY
-# blind to rho->1 components with O(1) diagonals (it understates their P by
-# diag/lambda_min, measured x500 at rho=0.999): there the GEMM float32
-# kernels stay within 1 sigma of float64 (residual +0.016..0.025 nats at
-# |mu|^2 ~ 8-20 with lambda_min = reg_covar) while legacy float32 is
-# measurably WORSE (repair storms — the v0.2.x beta failure mode), so such
-# replicates must NOT be rerouted; tests pin both sides.
+# blind to rho->1 components with O(1) diagonals: there the GEMM float32
+# kernels stay within 1 sigma of float64 while legacy float32 is
+# measurably WORSE, so such replicates must NOT be rerouted; tests pin
+# both sides (measurements: docs/design_notes.md, "Kernel reroute").
 _REROUTE_TOL_NATS = 1e-3
 
 
@@ -1416,7 +1397,7 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
     weights are read one sample block at a time and the compaction of
     converged replicates is index-only — no (R,N) copy is ever made.
     n_chunk: sample-dimension chunk size for the per-iteration E/M
-    accumulation (None = original single-pass path, kept verbatim).
+    accumulation (None = the single-pass path).
     Returns (w, mu, cov, train_ll, n_unconverged, n_rerouted) with train_ll
     the last E-step's weighted mean per-sample log-likelihood, shape (R,),
     n_unconverged the replicates that exhausted max_iter and n_rerouted the
@@ -1472,7 +1453,7 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
                 w, mu, cov = _mstep_gemm(F, resp, sa, reg_covar, X.shape[-1])
                 # release the consumed responsibilities now: left bound,
                 # they would stay allocated through the next E-step and
-                # double the (R,N,K) peak (measured 2K+4 -> K+4 units)
+                # double the (R,N,K) peak
                 del resp
             else:
                 ll, w, mu, cov = _em_step_gemm_nchunked(X, wc, w, mu, cov,
@@ -1567,14 +1548,28 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None, em_chunk=None):
         Stream over samples in chunks of this size (as in `estimate`).
     em_chunk : int, optional
         Replicates scored per batch, under the same halve-and-retry CUDA
-        out-of-memory guard as `em_fit`; results are chunk-invariant.
-        None scores all replicates in one batch.
+        out-of-memory guard as `em_fit`. None scores all replicates in one
+        batch. Results do not depend on it on CPU (bitwise); on CUDA they
+        move at reduction order.
 
     Returns
     -------
     torch.Tensor of shape (n_replicates,)
         -inf for a replicate whose weights are all zero (an empty validation
         fold scores worse than any real fit, instead of a spurious 0).
+
+    Raises
+    ------
+    RuntimeError
+        As in `em_fit`: a covariance that cannot be factorised even after
+        escalating regularisation, or a CUDA out-of-memory error at one
+        replicate per batch. Arguments are not validated here.
+
+    Warns
+    -----
+    RuntimeWarning
+        Once per call for replicates scored with the centred legacy kernels
+        because a component collapsed beyond the GEMM kernels' precision.
     """
     R = _n_rows(s_val)
     n_chunk = None if n_chunk is None else int(n_chunk)
@@ -1652,8 +1647,8 @@ def _val_ll_core(X, s_val, w, mu, cov, n_chunk=None):
         if li.numel():
             # rerouted rows are scored by the centred legacy kernels in
             # the same model-derived sample chunk em_fit streams them with
-            # (2026-10-23 review F4: one broadcast pass over N peaked 3-9x
-            # the budget the replicate chunk was sized with)
+            # (one broadcast pass over N would exceed the budget the
+            # replicate chunk was sized with several times over)
             nl = _legacy_sample_chunk(N, w.shape[-1], X.shape[-1], X.dtype,
                                       n_chunk)
             acc[li] = _legacy_score_sum(X, wc, w[li], mu[li], chol_all[li],
@@ -1692,9 +1687,9 @@ def _validate_folds(N, n_folds, what='X', d=None, stacklevel=4):
 
     With `d` given, also reject sizes whose smallest TRAINING fold holds
     fewer than d+1 samples — a full covariance cannot be estimated from
-    them, every component sits on the reg_covar floor, and the pipeline
-    used to return MI ~ 5-6 nats from N=2-3 points without a word — and
-    warn below _SMALL_SAMPLE_WARN samples."""
+    them, every component sits on the reg_covar floor, and the estimate
+    is meaningless (MI ~ 5-6 nats from N=2-3 points) — and warn below
+    _SMALL_SAMPLE_WARN samples."""
     N, n_folds = int(N), int(n_folds)
     if n_folds < 2:
         raise ValueError(f"n_folds must be >= 2 (each fit needs a held-out "
@@ -1823,8 +1818,9 @@ def select_sequential(X, max_components=20, n_folds=2, n_inits=3,
         Number of consecutive non-improving k values tolerated before
         stopping; the counter resets on every improvement, and the selected
         k is the best-scoring one.
-    n_folds, n_inits, reg_covar, threshold_fit, max_iter, seed, em_chunk,
-    init_type, scale, n_chunk
+    n_folds, n_inits, reg_covar, threshold_fit, max_iter, seed
+        As in `estimate`.
+    em_chunk, init_type, scale, n_chunk
         As in `estimate`.
     init_chunk : int, optional
         Replicates per batch for the initialisation stage (default
@@ -1850,8 +1846,8 @@ def select_sequential(X, max_components=20, n_folds=2, n_inits=3,
         history[K] = (metric, params)
         if not math.isfinite(metric):
             # a diverged fit at this k: skip it without consuming patience
-            # (it used to count as a non-improvement and could end the
-            # search with higher k untried)
+            # (counting it as a non-improvement could end the search with
+            # higher k untried)
             warnings.warn(f"sequential selection: the validation metric at "
                           f"k={K} is not finite; k={K} skipped without "
                           f"consuming patience", RuntimeWarning, stacklevel=2)
@@ -1895,8 +1891,9 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
         'aic'/'bic' follow GMM-MI: each k's best CV parameters are refit on
         the full data, the criterion is computed on it, and the minimising k
         wins; the returned parameters are still the CV-selected ones.
-    n_folds, n_inits, reg_covar, threshold_fit, max_iter, seed, em_chunk,
-    init_type, scale, n_chunk
+    n_folds, n_inits, reg_covar, threshold_fit, max_iter, seed
+        As in `estimate`.
+    em_chunk, init_type, scale, n_chunk
         As in `estimate`.
     init_chunk : int, optional
         Replicates per batch for the initialisation stage (default
@@ -1920,7 +1917,7 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
     R = max_components * IF
     # (K, I, F, N) views of the (F, N) masks: em_fit/val_ll gather one
     # (chunk, N) slice per replicate chunk, so the 2(K+1)*I*F*N*itemsize
-    # of repeated masks (40 GiB of the README's 77.5 GiB N=1e8 peak) is gone
+    # of repeated masks is never materialised
     train_r = train.unsqueeze(0).expand(max_components, n_inits, n_folds, N)
     val_r = val.unsqueeze(0).expand(max_components, n_inits, n_folds, N)
     active_k = torch.arange(1, max_components + 1, device=X.device).repeat_interleave(IF)
@@ -1942,7 +1939,7 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
             "batched selection found no finite validation metric at any "
             "k; NaN metrics usually mean degenerate CV folds or data")
     # a non-finite metric at ONE k (a replicate that diverged) must not
-    # poison the rule: torch.max/argmax/argmin propagate NaN, which used to
+    # poison the rule: torch.max/argmax/argmin propagate NaN, which would
     # end in the parsimony mask's IndexError or a silently selected NaN k
     finite_k = torch.isfinite(metric_k)
     if metric_method == 'valid':
@@ -2247,72 +2244,24 @@ def _select_and_fit(X, protocol, fixed_components_number, max_components,
 def _bootstrap_counts(N, B, dtype, device, generator):
     """Uniform multinomial bootstrap resample counts, shape (B, N).
 
-    Identical in distribution to index resampling. torch.multinomial caps
-    its category count at 2^24; above that the counts are histogrammed
-    from float64-uniform index draws, floor(u N), one replicate at a time
-    (identically distributed for uniform probabilities; bias <= N/2^52,
-    see (ii) below). This helper is the fallback's only home.
+    Identical in distribution to index resampling. Up to
+    _MULTINOMIAL_MAX_CATEGORIES (torch.multinomial's cap, 2^24) the counts
+    come from ONE torch.multinomial call on the whole (B, N) index matrix —
+    the validated resample stream — whose probability input is a float64
+    (1, N) row expanded to (B, N), whatever the working dtype (so float32
+    and float64 resamples are bitwise identical, on CPU and CUDA), and whose
+    scatter source is an expanded ones row: the only full-size transient is
+    torch.multinomial's own (B, N) int64 index matrix plus its internal
+    prefix sums, outside the OOM guard by design. Above the cap each
+    replicate's indices are floor(u N) from float64 uniforms, clamped to
+    N - 1 (which guards only u == 1.0), drawn from a per-replicate generator
+    seeded off `generator` and histogrammed one replicate at a time:
+    chunk- and retry-invariant by construction, with a transient of 16
+    B/sample. This helper is the fallback's only home.
 
-    Memory: the multinomial path's draw is the validated resample stream,
-    so it stays ONE call on the whole (B, N) index matrix — but its
-    probability input is a single (1, N) row expanded to (B, N) (bitwise
-    the same draw as the dense matrix on CPU and CUDA, measured) and the
-    scatter source an expanded ones row, so the only full-size transient
-    is torch.multinomial's own (B, N) int64 index matrix plus its internal
-    prefix sums (CUDA, float64 row: ~4x the float64 weights, i.e. ~8x
-    float32 weights; outside the OOM guard by design). The large-N path
-    (N > 2^24, where the weights alone are GiB) draws and histograms one
-    replicate at a time from per-replicate generators seeded off
-    `generator`: its transient is one (N,) float64 uniform vector and the
-    (N,) int64 index vector it becomes, 16 B/sample measured — the same
-    as the randint form it replaced (whose two live index vectors an
-    earlier docstring counted as one) — written as one expression so
-    both are released before the next replicate's draw (binding them
-    across iterations measures 24 B/sample). That path's stream is
-    chunk- and retry-invariant by construction.
-
-    Precision: the probability row is built at float64 whatever the
-    working dtype. torch's CPU multinomial accumulates the row's CDF
-    sequentially in the row's dtype, and at float32 the step 1/N rounds
-    differently in each binade of the running sum: a fixed, replicate-
-    independent tilt of the sampling weights by index region (16 sigma
-    at N=1e6, up to 33% max/min at N=1e7 — a bias on index-ordered data
-    that the bootstrap errorbar cannot see). With the float64 row the
-    float32 and float64 resamples are uniform and bitwise identical to
-    each other, on CPU and CUDA.
-
-    Known limitations and the large-N draw's bound (documented
-    2026-10-23/24, quantified by the independent reviews; (i) is kept
-    because that draw is the validated resample stream):
-    (i) on CUDA, torch.multinomial's kernel draws float32 uniforms even
-    for a float64 row, so each sample's inclusion weight carries a fixed,
-    replicate-independent factor set by how many 2^-24 grid points its
-    1/N interval holds — no regional tilt (index-band means within 4e-4
-    of 1), but a per-sample weight scatter sd(w) of 0.019 at N=1e6, 0.043
-    at 2e6, 0.073 at 4e6, 0.113 at 8e6, peaking ~0.24 near N ~ 1.1e7 and
-    vanishing at exactly 2^24 (closed form: per float32 binade k with
-    m_k = 2^(24+k)/N grid points per interval, variance 2^-(k+1)
-    frac(m_k)(1 - frac(m_k))/m_k^2), i.e. a fixed shift of the bootstrap
-    mean of order sd(w) x one standard error; the CPU path has none
-    (excess variance -1e-5 at N=1e6). (ii) The N > 2^24 path's index
-    draw floor(u N) from float64 uniforms (v0.7.0; until v0.6.1 a
-    torch.randint whose 32-bit draw, reduced modulo N, drew the first
-    2^32 mod N indices ceil(2^32/N)/floor(2^32/N) times as often as the
-    rest: +2.4% on the first 95% of rows at N=1e8) is uniform to
-    <= N/2^53 on CPU, whose uniforms lie on the 2^-53 grid, and to
-    <= N/2^52 on CUDA, where the kernel's half-step values above 0.5
-    round to even onto the 2^-52 grid (measured at torch 2.11): 2.2e-8 at
-    N=1e8, with no regional structure. The clamp to N - 1 guards only a
-    kernel returning u = 1.0 (torch reflects it to 0.0 today), which
-    would otherwise raise in scatter_add_: for every float64 u < 1 and
-    N <= 2^53, floor(fl(u N)) <= N - 1, since the deficit N 2^-53 is at
-    least half an ulp of N, with equality only at powers of two, where
-    the product is exact. (iii) The per-replicate seeds — of this
-    large-N draw and of the default init — are drawn from [0, 2^62), but
-    CPU torch.Generator.manual_seed keeps 32 bits (CUDA keeps 64), so the
-    CPU per-replicate seed space is 2^32: two replicates of one call
-    share a stream with probability R(R-1)/2^33 (1.7e-6 at the default
-    120 replicates).
+    The uniformity bounds of both paths, the CUDA multinomial's
+    float32-resolution weight scatter, the clamp proof and the CPU
+    per-replicate seed space: docs/design_notes.md, "Bootstrap resample".
     """
     if N <= _MULTINOMIAL_MAX_CATEGORIES:
         idx = torch.multinomial(
@@ -2328,9 +2277,8 @@ def _bootstrap_counts(N, B, dtype, device, generator):
     one = torch.ones((), dtype=dtype, device=device).expand(N)
     for b in range(B):
         gen = torch.Generator(device=device).manual_seed(seeds[b])
-        # floor(u N) from float64 uniforms: uniform to <= N/2^52 (the
-        # 32-bit randint it replaced tilted the first 2^32 mod N indices);
-        # the clamp guards only u == 1.0 (no float64 u < 1 reaches N).
+        # floor(u N) from float64 uniforms: uniform to <= N/2^52; the
+        # clamp guards only u == 1.0 (no float64 u < 1 reaches N).
         # Temporaries, not bound: binding them across iterations keeps
         # two extra (N,) vectors live (24 B/sample instead of 16).
         s[b].scatter_add_(
@@ -2360,6 +2308,14 @@ class FittedGMM:
     where reg_covar and the repair thresholds are meaningful. Direct
     construction without `chol` factorises whatever units the caller
     supplies.
+
+    Parameters
+    ----------
+    w, mu, cov : torch.Tensor
+        Weights (K,), means (K, d) and covariances (K, d, d).
+    chol : torch.Tensor of shape (K, d, d), optional
+        Lower Cholesky factor of `cov`; computed (and repaired if needed)
+        from `cov` when omitted.
     """
 
     def __init__(self, w, mu, cov, chol=None):
@@ -2387,8 +2343,8 @@ class FittedGMM:
     def score_samples(self, X):
         """Mixture log-density at X of shape (n, d); returns a (n,) numpy
         array. A 1-D X is n points of a 1-D model, or one point of a d-D
-        model (sklearn rejects 1-D input; here it used to produce a wrong
-        shape error from deep inside the kernel)."""
+        model (sklearn rejects 1-D input); any other shape raises a
+        ValueError naming the expected one."""
         Xt = torch.as_tensor(_as_array(X), dtype=self._mu.dtype,
                              device=self._mu.device)
         d = self._mu.shape[-1]
@@ -2427,30 +2383,22 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     ----------
     X : array-like of shape (n_samples, n_variables)
         The data. Two columns for 'MI' and the KL quantities; at least three
-        for 'cMI' (variables 0 and 1 are X and Y, the rest condition); any
-        number of columns for 'TC'.
+        for 'cMI' (variables 0 and 1 are X and Y, the rest condition); at
+        least two for 'TC'.
     quantity : {'MI', 'cMI', 'TC', 'KL_forward', 'KL_reverse'}, default='MI'
-        What to estimate. 'MI' is I(X;Y); 'cMI' is I(X;Y|Z) with Z all
-        columns beyond the first two; 'TC' is the total correlation
-        (KL between the joint and the product of all 1D marginals, zero iff
-        the variables are mutually independent); 'KL_forward' is
-        KL[p(x0) || p(x1)] between the two 1D marginals, 'KL_reverse' the
-        opposite order.
+        'MI': I(X;Y); 'cMI': I(X;Y|Z), Z the columns beyond the first two;
+        'TC': total correlation KL[p(x) || prod_i p(x_i)], zero iff the
+        variables are mutually independent; 'KL_forward': KL[p(x0) || p(x1)]
+        between the two 1D marginals; 'KL_reverse': the opposite order.
     protocol : {'batched', 'sequential'}, default='batched'
-        Component-selection protocol. 'batched' fits k = 1..max_components
-        simultaneously and picks the smallest k within `threshold_components`
-        of the best validation metric (robust to initialisation noise, and
-        the fast option on GPU). 'sequential' is GMM-MI's original protocol:
-        increment k and stop early via threshold and patience (cheaper on CPU
-        when it stops early, but a single bad initialisation near a plateau
-        can gate off better models at higher k).
+        Component selection. 'batched' fits k = 1..max_components at once
+        and picks the smallest k within `threshold_components` of the best
+        validation metric; 'sequential' is GMM-MI's original protocol
+        (increment k, stop early via threshold and patience). See Notes.
     n_bootstrap : int, default=50
-        Number of bootstrap realisations used for the errorbar. Higher values
-        give a smoother MI distribution and more reliable errorbars, while
-        being slower; on GPU all realisations are fitted as one batch.
-        Set to 0 to skip the bootstrap (single fit on the full data); the
-        returned standard deviation is None whenever n_bootstrap < 2, since
-        one replicate has no sample deviation.
+        Bootstrap realisations for the errorbar, batched per `em_chunk`; more
+        give a smoother distribution and more reliable errorbars, at higher
+        cost. 0 skips the bootstrap (a single fit on the full data).
     mc_samples : int, default=100_000
         Number of Monte Carlo samples used to integrate the estimator for
         each bootstrap replicate. Higher values reduce the MC contribution to
@@ -2466,18 +2414,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         Number of GMM initialisations per fold. Higher values reduce the
         chance of a local optimum, at proportional cost (batched away on GPU).
     reg_covar : float, default=1e-6
-        Constant added to the diagonal of every covariance matrix to prevent
-        singularities. Smaller values perturb the estimate less but risk
-        failed Cholesky factorisations; 1e-6 is safe at float32, where
-        GMM-MI's 1e-15 would regularise nothing. The data are internally
-        standardised (see Notes), so this floor is relative to each
-        variable's variance — except for the KL quantities, whose two
-        columns must share one map (KL invariance), making the floor
-        relative to their POOLED variance: with strongly mismatched
-        marginal scales, use a smaller reg_covar so the narrow marginal is
-        not over-regularised. A component whose factorisation still fails
-        receives escalating diagonal regularisation automatically (with a
-        RuntimeWarning) instead of aborting the fit.
+        Constant added to every covariance diagonal to prevent singularities,
+        relative to each variable's variance (the data are standardised; see
+        Notes). 1e-6 is safe at float32, where GMM-MI's 1e-15 would
+        regularise nothing.
     threshold_fit : float, default=1e-5
         EM convergence threshold on the change in mean per-sample
         log-likelihood. Smaller values give more converged fits at the cost
@@ -2486,20 +2426,15 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         Maximum EM iterations per fit. Convergence should normally be reached
         via `threshold_fit` well before this.
     seed : int, default=0
-        Seed controlling initialisations, CV splits, bootstrap resampling and
-        MC integration. Fixed-seed results are bitwise reproducible on CPU,
-        including with 'auto' chunk sizing; on CUDA, `em_chunk` changes the
-        matmul reduction order, so same-seed runs agree to floating-point
-        noise unless `em_chunk` is pinned to an integer.
+        Seed controlling initialisations, CV splits, bootstrap resampling, MC
+        integration and gaussianise's tie-breaking. Bitwise reproducible on
+        CPU; on CUDA see Notes, "Reproducibility".
     return_k : bool, default=False
         If True, also return the selected number of components.
     return_fit : bool, default=False
         If True, also return the selected model as a `FittedGMM` (refitted on
-        the full data, warm-started from the CV-selected parameters — the
-        same warm start the bootstrap replicates use), e.g. for plotting.
-        With preprocess='gaussianise' the returned model describes the
-        rank-probit-transformed data, not the original units (the rank
-        transform has no parametric inverse); a RuntimeWarning says so.
+        the full data, warm-started like the bootstrap replicates from the
+        CV-selected parameters), e.g. for plotting; see Notes for its units.
     device : str or torch.device, default='cpu'
         Torch device on which to fit and integrate: 'cpu', or 'cuda' /
         'cuda:i' / a torch.device of those types (other backends are
@@ -2508,61 +2443,32 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         Working precision. float32 is validated and much faster on GPUs with
         limited fp64 throughput; float64 is the reference precision.
     em_chunk : int or 'auto', default='auto'
-        Number of EM replicates (CV fits or bootstrap realisations) processed
-        per batch; the initialisation and validation-LL stages batch the
-        same way. Larger values are faster on GPU at higher peak memory
-        (results are chunk-invariant). 'auto' keeps 8 on CPU; on CUDA it
-        sizes each stage's batch to fill half of the free device memory from
-        the measured peak-memory models (per replicate, in units of N_eff x
-        itemsize with N_eff = min(N, n_chunk): max(K+6, 2K+3) plus a small
-        block term for the default GEMM kernels, (4d+4)K + 4 for the legacy
-        kernels, (4d+3)K + 12 over the full N for the initialisation stage of
-        the default and k-means inits, which gets its own batch), capped at
-        the stage's replicate count, with no replicate floor (and capped by
-        torch.cuda.set_per_process_memory_fraction when one is set).
-        A CUDA out-of-memory error during EM halves the chunk and
-        retries, with a RuntimeWarning.
+        EM replicates (CV fits or bootstrap realisations) per batch; the
+        initialisation and validation-LL stages batch the same way. Larger is
+        faster on GPU at higher peak memory. 'auto' is 8 on CPU and fills half
+        the free device memory on CUDA (see Notes).
     mc_chunk : int or 'auto', default='auto'
-        Number of bootstrap replicates whose MC integration is evaluated per
-        batch; 'auto' as for `em_chunk` (model mc_samples x itemsize x
-        max((3d+2)K + d + 7, d^2 + 4d + 6)). Each replicate draws its MC samples from its own seeded
-        stream, so results are independent of `mc_chunk` and of the
-        out-of-memory retry.
+        Bootstrap replicates whose MC integration is evaluated per batch;
+        'auto' as for `em_chunk`. The MC samples do not depend on it; results
+        are bitwise invariant on CPU and move at reduction order on CUDA.
     preprocess : {'none', 'gaussianise'}, default='none'
         'gaussianise' applies a per-variable rank-probit transform before
-        fitting. MI, cMI and TC are invariant under per-variable
-        diffeomorphisms, so this changes only the difficulty of the density
-        estimation: heavy tails and monotone nonlinearities that would
-        require many components (or defeat the fit entirely) are removed.
-        Tied values are ranked per `tie_rank`; a RuntimeWarning fires when
-        more than 1% of a column's samples sit in tied blocks of three or
-        more, because no tie convention makes the GMM fit of heavily tied
-        data reliable — prefer preprocess='none' there. Rejected
-        (ValueError) for the KL quantities, which are not invariant under
-        marginal transforms.
+        fitting, which leaves MI, cMI and TC unchanged but can make the
+        density much easier to fit. Not for heavily tied data, and rejected
+        for the KL quantities (see Notes).
     tie_rank : {'random', 'average'}, default='random'
-        How gaussianise ranks tied values. 'random' breaks each column's
-        ties with a seeded random ordering (drawn independently per column
-        from seed + 40_000): the MI estimand is exactly unchanged — the
-        original values are recoverable from the tie-broken ones — and the
-        transformed marginals are exactly Gaussian, but the GMM estimate is
-        biased low when ties are shared between columns (joint
-        zero-inflation). 'average' is the deterministic scipy rankdata
-        convention; a tied block becomes a single probit atom, which can
-        fabricate MI between independent heavily tied columns.
+        How gaussianise ranks tied values: 'random' breaks each column's ties
+        with a seeded random ordering; 'average' is the deterministic scipy
+        rankdata convention. See Notes.
     init_type : {'random_responsibilities', 'minmax', 'kmeans', 'randomized_kmeans'}, default='random_responsibilities'
         GMM initialisation scheme (torch ports of GMM-MI's initialisations).
         'random_responsibilities' is cheap and adequate for easy fits; the
         k-means variants are more robust on well-separated multimodal data.
-        The default and the k-means inits run their statistics over the
-        full N per replicate unless `n_chunk` is set, in which case they
-        stream over sample chunks like the EM stage; without n_chunk at
-        very large N they bind on memory before EM (a readable error on
-        CUDA) — set n_chunk or use 'minmax', which allocates nothing of
-        that size.
+        See Notes for their memory at large N.
     scale : float, optional
         Mean-perturbation scale for 'randomized_kmeans' (GMM-MI's default 1
-        when None).
+        when None), or the initial isotropic standard deviation for 'minmax'
+        (GMM-MI's n-ball rule when None); in standardised units.
     fixed_components_number : int, optional
         If set, skip component selection entirely and fit this many
         components (best CV init/fold retained, as GMM-MI's
@@ -2580,19 +2486,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         Sequential protocol only: consecutive non-improving k values
         tolerated before the search stops (as in `select_sequential`).
     n_chunk : int, optional
-        If set, each EM iteration and validation-LL evaluation streams over
-        the sample dimension in chunks of this size, accumulating sufficient
-        statistics, and the default/k-means initialisation over chunks of
-        n_chunk rounded to whole 2^14-sample draw blocks, at least one
-        (so with n_chunk < 2^14 the init chunk exceeds n_chunk by less
-        than one block). Bounds the EM and validation-LL kernels' peak memory
-        by em_chunk * n_chunk rather than N; the per-replicate weights
-        are read one sample chunk at a time, so the only N-sized tensors
-        are the caller's own (the (n_bootstrap, N) resample counts are
-        held once per stage; the CV masks are views of one (n_folds, N)
-        pair). Results agree with the single-pass path to floating-point
-        reduction order (ulp-level at float64, not bitwise). None keeps
-        the single-pass path.
+        If set, the EM and validation-LL kernels stream over sample chunks of
+        this size, bounding their peak memory by em_chunk * n_chunk rather
+        than N, and the default/k-means initialisation streams too. Results
+        agree with the single pass to reduction order. See Notes.
 
     Returns
     -------
@@ -2608,29 +2505,142 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         The selected model refitted on the full data; only if `return_fit`
         is True (appended after `k` when both flags are set).
 
+    Raises
+    ------
+    ValueError
+        Raised before any fitting, except for `mc_chunk`.
+        Unknown options: `quantity`, `protocol`, `preprocess`, `tie_rank`,
+        `metric_method` (or any but 'valid' under protocol='sequential'),
+        `init_type`, or a string `em_chunk` other than 'auto'.
+        Precision and device: a `dtype` other than float32/float64; a
+        `device` that is not 'cpu'/'cuda[:i]', is unavailable or is out of
+        range.
+        Data: `X` not 2-D, with the wrong number of columns, with NaN/inf
+        values, or not representable at `dtype` after standardisation;
+        preprocess='gaussianise' with a KL quantity.
+        Folds: n_folds < 2, more folds than samples, or a smallest training
+        fold of fewer than n_variables + 1 samples.
+        Counts and thresholds: n_bootstrap < 0 or > 2**20; |seed| > 2**62;
+        mc_samples, max_components, n_inits, max_iter,
+        fixed_components_number, patience, n_chunk or em_chunk below 1;
+        reg_covar or threshold_fit not > 0; threshold_components not >= 0.
+        A malformed `mc_chunk` (a string other than 'auto', or below 1) is
+        detected only after component selection.
+    TypeError
+        A non-integer count, seed, em_chunk or mc_chunk (numpy integers are
+        accepted; mc_chunk only after component selection), or a
+        non-numeric threshold_fit. A non-numeric reg_covar or
+        threshold_components fails with Python's own comparison TypeError,
+        and a non-numeric `scale` in float() inside the initialisation.
+    RuntimeError
+        On CUDA, when by the memory model not even one replicate of the
+        first (initialisation or EM) stage fits (set `n_chunk`); when no
+        candidate k yields a finite validation metric (degenerate folds or
+        data); when a covariance cannot be factorised even after escalating
+        regularisation (raise `reg_covar`, or use float64); or when a CUDA
+        out-of-memory error persists at one replicate per batch.
+
     Notes
     -----
-    The data are standardised internally before fitting: each variable is
-    affinely mapped to zero mean and unit variance (the KL quantities use a
-    single map shared by both columns, under which KL is invariant). All
-    estimated quantities are exactly invariant under these maps, and the
-    `return_fit` model is transformed back (only through this affine map:
-    with preprocess='gaussianise' the model stays in rank-probit space),
-    so the standardisation is
-    unobservable except through `reg_covar` (now a scale-free floor), the
-    `scale` argument of the minmax/randomized k-means initialisers (now in
-    standardised units), and the absence of float32 failures on
-    unstandardised data.
+    *Selection.* The batched protocol fits every candidate k at once, so
+    no k's evaluation depends on another's: it is robust to initialisation
+    noise and the fast option on GPU. The sequential protocol is cheaper
+    on CPU when it stops early, but a single bad initialisation near a
+    plateau can gate off better models at higher k.
+
+    *Standardisation and regularisation.* The data are standardised
+    internally before fitting: each variable is affinely mapped to zero
+    mean and unit variance (the KL quantities use a single map shared by
+    both columns, under which KL is invariant). All estimated quantities
+    are exactly invariant under these maps, and the `return_fit` model is
+    transformed back (only through this affine map: with
+    preprocess='gaussianise' the model stays in rank-probit space), so the
+    standardisation is unobservable except through `reg_covar` (a
+    scale-free floor), the `scale` argument of the minmax/randomized
+    k-means initialisers (in standardised units), and the absence of
+    float32 failures on unstandardised data. For the KL quantities the
+    shared map makes the `reg_covar` floor relative to the two columns'
+    POOLED variance: with strongly mismatched marginal scales, use a
+    smaller reg_covar so the narrow marginal is not over-regularised.
+    Smaller values of reg_covar perturb the estimate less but risk failed
+    Cholesky factorisations; a component whose factorisation still fails
+    receives escalating diagonal regularisation automatically (with a
+    RuntimeWarning) instead of aborting the fit.
 
     The standardisation (and the rank transform) run at float64 BEFORE the
     cast to the working dtype, so float32 runs are safe on data with large
     offsets (MJDs, timestamps): the cast sees already-centred values. This
-    costs a one-off float64 copy of X at entry. Input that is itself float32
-    cannot be un-quantised; pass float64 (or raw) data where offsets are
-    large relative to the spread. The entry transient is that float64
-    copy plus the standardisation's reductions and the finiteness mask
-    (about two to three times the float64 size of X, more under
+    costs a one-off float64 copy of X at entry. Input that is itself
+    float32 cannot be un-quantised; pass float64 (or raw) data where
+    offsets are large relative to the spread. The entry transient is that
+    float64 copy plus the standardisation's reductions and the finiteness
+    mask (about two to three times the float64 size of X, more under
     gaussianise), on the input's device for tensor input.
+
+    *Preprocessing.* 'gaussianise' maps each variable to
+    Phi^{-1}(rank / (N + 1)). MI, cMI and TC are invariant under
+    per-variable diffeomorphisms, so this changes only the difficulty of
+    the density estimation: heavy tails and monotone nonlinearities that
+    would require many components (or defeat the fit entirely) are
+    removed. It is rejected (ValueError) for the KL quantities, which are
+    not invariant under marginal transforms. With return_fit=True the
+    returned model describes the rank-probit-transformed data, not the
+    original units (the rank transform has no parametric inverse); a
+    RuntimeWarning says so. tie_rank='random' breaks each column's ties
+    with a seeded random ordering, drawn independently per column from
+    seed + 40_000: the MI estimand is exactly unchanged — the original
+    values are recoverable from the tie-broken ones — and the transformed
+    marginals are exactly Gaussian, but the GMM estimate is biased low when
+    ties are shared between columns (joint zero-inflation).
+    tie_rank='average' gives a tied block a single probit atom, which can
+    fabricate MI between independent heavily tied columns. A RuntimeWarning
+    fires when more than 1% of a column's samples sit in tied blocks of
+    three or more, because no tie convention makes the GMM fit of heavily
+    tied data reliable — prefer preprocess='none' there.
+
+    *Initialisation.* The default and the k-means inits run their
+    statistics over the full N per replicate unless `n_chunk` is set, in
+    which case they stream over sample chunks like the EM stage; without
+    n_chunk at very large N they bind on memory before EM (a readable
+    error on CUDA) — set n_chunk or use 'minmax', which allocates nothing
+    of that size.
+
+    *Chunking and memory.* On CUDA, 'auto' sizes each stage's batch to
+    fill half of the free device memory from the measured peak-memory
+    models (per replicate, in units of N_eff x itemsize with
+    N_eff = min(N, n_chunk): max(K+6, 2K+3) plus a small block term for the
+    default GEMM kernels, (4d+4)K + 4 for the legacy kernels, and
+    (4d+3)K + 12 for the initialisation stage of the default and k-means
+    inits, over the full N or the streamed init chunk, which gets its own
+    batch; mc_samples x itemsize x max((3d+2)K + d + 7, d^2 + 4d + 6) for
+    mc_chunk), capped at the stage's replicate count, with no replicate
+    floor, and capped by torch.cuda.set_per_process_memory_fraction when
+    one is set. A CUDA out-of-memory error during EM halves the chunk and
+    retries, with a RuntimeWarning. With `n_chunk` the per-replicate
+    weights are read one sample chunk at a time, so the only N-sized
+    tensors are the caller's own (the (n_bootstrap, N) resample counts are
+    held once per stage; the CV masks are views of one (n_folds, N) pair).
+    The initialisation streams over n_chunk rounded to whole 2^14-sample
+    draw blocks, at least one (so with n_chunk < 2^14 the init chunk
+    exceeds n_chunk by less than one block). Streamed results agree with
+    the single-pass path to floating-point reduction order (ulp-level at
+    float64, not bitwise).
+
+    *Reproducibility.* Fixed-seed results are bitwise reproducible on CPU,
+    including with 'auto' chunk sizing: no chunk size changes them there.
+    Each bootstrap replicate draws its MC samples from its own seeded
+    stream, so the samples are independent of `mc_chunk` and of the
+    out-of-memory retry on every device. On CUDA, `em_chunk` and `mc_chunk`
+    change the matmul reduction order at either dtype, so same-seed runs
+    agree to floating-point noise unless both are pinned to integers and no
+    out-of-memory retry occurs (the retry halves the batch whatever the
+    pinning; 'auto' tracks the free memory). At float64 the differences
+    stay at reduction-order level (1e-14 to 1e-12 in the fitted means in
+    two measured cases); at float32 the blocked M-step folds the batch's
+    replicates into one GEMM whose summation order follows the batch size,
+    and on knife-edge data that can move the selected k (measured: k=5 vs
+    6, MI 0.4741 vs 0.4745 against an errorbar of 0.008). A CPU run is the
+    bit-reproducible setting; on CUDA, float64 is far less sensitive.
     """
     X = torch.as_tensor(_as_array(X)).detach()
     if dtype not in (torch.float32, torch.float64):
@@ -2824,25 +2834,37 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     X : array-like of shape (n_samples,) or (n_samples, 1)
         The continuous variable.
     Y : array-like of shape (n_samples,)
-        The categorical variable; categories are its unique values.
-        Numeric labels are used as-is; string/object labels are factorised
-        through numpy's unique (categories in sorted label order).
-        Non-finite labels (NaN/inf) are rejected — torch.unique would
-        otherwise make every NaN its own category.
+        The categorical variable; categories are its unique values. Numeric
+        labels are used as-is; string/object labels are factorised through
+        numpy's unique (categories in sorted label order). Non-finite
+        (NaN/inf) and missing (None/NaN) labels are rejected — torch.unique
+        would otherwise make every NaN its own category.
+    protocol, n_bootstrap, mc_samples
+        As in `estimate`, applied per category.
+    max_components : int, default=10
+        Largest number of components considered per category's 1D fit.
+    n_folds, n_inits
+        As in `estimate`, applied per category.
+    reg_covar : float, default=1e-6
+        As in `estimate`; X is standardised once over all categories, so the
+        floor is relative to the variance of X as a whole.
+    threshold_fit, max_iter, seed
+        As in `estimate`.
+    return_k : bool, default=False
+        If True, also return the selected component count per category.
+    device, dtype, em_chunk, mc_chunk
+        As in `estimate`.
+    init_type, scale, fixed_components_number, metric_method
+        As in `estimate`, applied per category.
+    threshold_components, patience
+        As in `estimate`, applied per category.
     category_weights : {'empirical', 'uniform'}, default='empirical'
         'empirical' sets pi_c = N_c / N from the observed category counts —
         the correct weighting for MI of the observed joint (X, Y).
         'uniform' sets pi_c = 1/C, reproducing the reference code, whose
         Appendix B formula assumes equiprobable categories.
-    max_components : int, default=10
-        Largest number of components considered per category's 1D fit.
-
-    All remaining parameters are shared with `estimate` and have the same
-    meaning there (applied per category): protocol, n_bootstrap, mc_samples,
-    n_folds, n_inits, reg_covar, threshold_fit, max_iter, seed, return_k,
-    device, dtype, em_chunk, mc_chunk, init_type, scale,
-    fixed_components_number, metric_method, threshold_components, patience,
-    n_chunk.
+    n_chunk : int, optional
+        As in `estimate`, applied per category.
 
     Returns
     -------
@@ -2853,6 +2875,24 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         one replicate has no sample deviation).
     k : list of int
         Selected component count per category; only if `return_k` is True.
+
+    Raises
+    ------
+    ValueError
+        Before any fitting, for: `X` not 1-D or a single column, with
+        NaN/inf values, or not representable at `dtype` after
+        standardisation; `Y` not 1-D, of a different length from `X`, with
+        NaN/inf or missing (None/NaN) labels, or mixing label types that
+        cannot be ordered; a smallest category too small for `n_folds` (as
+        `estimate` checks X, with d = 1); an unknown `category_weights`; and
+        the argument errors listed for `estimate` that apply to this
+        signature. A malformed `mc_chunk` is detected only after every
+        category has been selected and bootstrapped.
+    TypeError
+        As in `estimate`, except that a non-integer `mc_chunk` is detected
+        only after every category has been selected and bootstrapped.
+    RuntimeError
+        As in `estimate`, for any category's fit.
     """
     X = torch.as_tensor(_as_array(X)).detach()
     if dtype not in (torch.float32, torch.float64):
@@ -2953,7 +2993,7 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     for ci in range(C):
         Xc = X[Y == cats[ci]]
         Nc = Xc.shape[0]
-        # known, low-risk stream coincidence (pre-dating v0.4.0): category
+        # known, low-risk stream coincidence: category
         # ci+10's init stream at K=30 equals category ci's bootstrap stream
         # (997*10 + 30 = 10_000); it needs >= 11 categories AND
         # max_components >= 30 (default 10) and the streams drive different
