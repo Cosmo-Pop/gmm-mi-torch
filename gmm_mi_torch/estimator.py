@@ -245,17 +245,27 @@ def _auto_chunk(n_items, bytes_per_item, device, default=_AUTO_CHUNK_CPU_DEFAULT
     return max(1, min(int(n_items), n))
 
 
-def _resolve_chunk(value, n_items, bytes_per_item, device, fixed_bytes=0,
-                   name='em_chunk'):
-    """Turn an `em_chunk` / `mc_chunk` argument ('auto' or int) into an int.
-    A float (2.7) fails under the argument's name like every other count."""
+def _check_chunk_arg(value, name):
+    """Validate an `em_chunk` / `mc_chunk` argument: 'auto' is returned as
+    is, anything else coerced to an int >= 1. A float (2.7) fails under the
+    argument's name like every other count."""
     if isinstance(value, str):
         if value != 'auto':
             raise ValueError(f"{name} must be a positive int or 'auto'; "
                              f"found '{value}'")
+        return value
+    return _index_arg(value, name, 1)
+
+
+def _resolve_chunk(value, n_items, bytes_per_item, device, fixed_bytes=0,
+                   name='em_chunk'):
+    """Turn an `em_chunk` / `mc_chunk` argument ('auto' or int) into an int,
+    sizing 'auto' from the stage's memory model."""
+    value = _check_chunk_arg(value, name)
+    if isinstance(value, str):
         return _auto_chunk(n_items, bytes_per_item, device,
                            fixed_bytes=fixed_bytes)
-    return _index_arg(value, name, 1)
+    return value
 
 
 def _index_arg(value, name, minimum=None):
@@ -293,11 +303,12 @@ def _validate_entry_args(seed, n_bootstrap, mc_samples, max_components,
                          n_folds, n_inits, max_iter,
                          fixed_components_number, reg_covar,
                          threshold_components, threshold_fit=1e-5,
-                         patience=1, n_chunk=None):
+                         patience=1, n_chunk=None, mc_chunk='auto'):
     """Entry validation shared by estimate and estimate_categorical, so the
     two cannot drift apart. Returns the integer arguments coerced to plain
     Python ints (torch.Generator.manual_seed and torch factory sizes reject
-    numpy integers and floats)."""
+    numpy integers and floats). mc_chunk is only checked here: its 'auto'
+    sizing needs the selected k, so the caller resolves it later."""
     seed = _index_arg(seed, 'seed')
     if abs(seed) > 1 << 62:
         raise ValueError(f"|seed| must be <= 2**62 so the internal stream "
@@ -339,6 +350,7 @@ def _validate_entry_args(seed, n_bootstrap, mc_samples, max_components,
     patience = _index_arg(patience, 'patience', 1)
     if n_chunk is not None:
         n_chunk = _index_arg(n_chunk, 'n_chunk', 1)
+    _check_chunk_arg(mc_chunk, 'mc_chunk')
     return (seed, n_bootstrap, mc_samples, max_components, n_folds, n_inits,
             max_iter, fixed_components_number, patience, n_chunk)
 
@@ -2517,10 +2529,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     Raises
     ------
     ValueError
-        Raised before any fitting, except for `mc_chunk`.
+        Raised before any fitting.
         Unknown options: `quantity`, `protocol`, `preprocess`, `tie_rank`,
         `metric_method` (or any but 'valid' under protocol='sequential'),
-        `init_type`, or a string `em_chunk` other than 'auto'.
+        `init_type`, or a string `em_chunk` or `mc_chunk` other than 'auto'.
         Precision and device: a `dtype` other than float32/float64; a
         `device` that is not 'cpu'/'cuda[:i]', is unavailable or is out of
         range.
@@ -2531,14 +2543,12 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         fold of fewer than n_variables + 1 samples.
         Counts and thresholds: n_bootstrap < 0 or > 2**20; |seed| > 2**62;
         mc_samples, max_components, n_inits, max_iter,
-        fixed_components_number, patience, n_chunk or em_chunk below 1;
-        reg_covar or threshold_fit not > 0; threshold_components not >= 0.
-        A malformed `mc_chunk` (a string other than 'auto', or below 1) is
-        detected only after component selection.
+        fixed_components_number, patience, n_chunk, em_chunk or mc_chunk
+        below 1; reg_covar or threshold_fit not > 0; threshold_components
+        not >= 0.
     TypeError
         A non-integer count, seed, em_chunk or mc_chunk (numpy integers are
-        accepted; mc_chunk only after component selection), or a
-        non-numeric threshold_fit. A non-numeric reg_covar or
+        accepted), or a non-numeric threshold_fit. A non-numeric reg_covar or
         threshold_components fails with Python's own comparison TypeError.
         A non-numeric `scale` fails inside the initialisation with float()'s
         own error (ValueError for a string, TypeError otherwise).
@@ -2684,7 +2694,7 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
      n_chunk) = _validate_entry_args(
         seed, n_bootstrap, mc_samples, max_components, n_folds, n_inits,
         max_iter, fixed_components_number, reg_covar, threshold_components,
-        threshold_fit, patience, n_chunk)
+        threshold_fit, patience, n_chunk, mc_chunk=mc_chunk)
     if X.dim() != 2:
         raise ValueError(f"X must be 2-D (n_samples, n_variables); "
                          f"found shape {tuple(X.shape)}")
@@ -2900,11 +2910,9 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         cannot be ordered; a smallest category too small for `n_folds` (as
         `estimate` checks X, with d = 1); an unknown `category_weights`; and
         the argument errors listed for `estimate` that apply to this
-        signature. A malformed `mc_chunk` is detected only after every
-        category has been selected and bootstrapped.
+        signature.
     TypeError
-        As in `estimate`, except that a non-integer `mc_chunk` is detected
-        only after every category has been selected and bootstrapped.
+        As in `estimate`.
     RuntimeError
         As in `estimate`, for any category's fit.
     """
@@ -2977,7 +2985,7 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
      n_chunk) = _validate_entry_args(
         seed, n_bootstrap, mc_samples, max_components, n_folds, n_inits,
         max_iter, fixed_components_number, reg_covar, threshold_components,
-        threshold_fit, patience, n_chunk)
+        threshold_fit, patience, n_chunk, mc_chunk=mc_chunk)
     # shared affine standardisation of the continuous variable: MI with a
     # categorical variable is invariant, and reg_covar becomes scale-free
     x_std = X.std()
