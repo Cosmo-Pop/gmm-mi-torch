@@ -2939,6 +2939,30 @@ def test_entry_coercions_count_like_arguments():
     assert E._resolve_chunk(np.int64(3), 10, 1, 'cpu') == 3
 
 
+def test_mc_chunk_validated_at_entry(monkeypatch):
+    # v0.7.2: mc_chunk's type/sign check runs at entry in both public
+    # estimators (it used to run only after component selection, and in
+    # estimate_categorical after every category's bootstrap); a spy on
+    # _select_and_fit proves no selection work is spent first
+    E = gmm_mi_torch.estimator
+    calls = []
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        raise AssertionError('_select_and_fit reached')
+    monkeypatch.setattr(E, '_select_and_fit', spy)
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(300, 2))
+    Y = (X[:, 1] > 0).astype(int)
+    common = dict(max_components=2, n_bootstrap=2, mc_samples=100)
+    for bad, exc in ((2.5, TypeError), ('bad', ValueError), (0, ValueError)):
+        with pytest.raises(exc, match='mc_chunk'):
+            estimate(X, 'MI', mc_chunk=bad, **common)
+        with pytest.raises(exc, match='mc_chunk'):
+            estimate_categorical(X[:, 0], Y, mc_chunk=bad, **common)
+    assert calls == []
+
+
 def test_selection_masks_single_nonfinite_metric(monkeypatch):
     # 2026-10-23 review L12 (A2): one non-finite replicate metric used to
     # give an IndexError ('valid'), a silently selected NaN k (aic/bic) or
