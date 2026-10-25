@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.7.2 (2026-10-25)
+
+A small patch under the owner's lightweight process
+(scoping/design-report-v0.7.2-2026-10-25.md; the starting session reads
+the landed diff). No random stream moves: valid input runs bitwise as
+at 0.7.1 (the v0.7.0 reference sets compare clean on both kernels).
+
+- Behaviour change: `mc_chunk` is validated at entry in `estimate` and
+  `estimate_categorical`. Its type/sign check (2.5 -> TypeError; 'bad'
+  or 0 -> ValueError, naming the argument) used to run only after
+  component selection — in `estimate_categorical` after every
+  category's selection and bootstrap EM — so a malformed value cost a
+  full selection before it raised. It now raises from the shared entry
+  validation, before any fitting, which makes the 0.6.1 entry's "fail
+  at entry" claim true. The 'auto' sizing still happens after
+  selection (it needs the selected k) and receives the caller's value
+  unchanged. New test: test_mc_chunk_validated_at_entry (zero
+  _select_and_fit calls on all six bad inputs; it fails on 0.7.1).
+- Docs: `estimate` gains a Warns section listing every RuntimeWarning
+  its path can emit, with its condition and frequency (per call, per
+  skipped k, per em_fit or scoring call, per out-of-memory halving, per
+  covariance factorisation); `estimate_categorical`'s Warns refers to it
+  per category; `select_batched` and `select_sequential` gain Raises.
+  The Raises sections of both estimators list mc_chunk at entry.
+
+Test matrix at the code commit 0069918: 123 passed / 2 skipped (CPU
+fp64), 124 / 1 (CUDA fp32), 121 / 4 (CPU fp64 legacy), 122 / 3 (CUDA
+fp32 legacy); 125 tests.
+
 ## 0.7.1 (2026-10-24)
 
 Documentation only, no behaviour change: `gmm_mi_torch/estimator.py`
