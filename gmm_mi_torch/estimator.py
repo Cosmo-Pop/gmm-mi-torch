@@ -1856,6 +1856,16 @@ def select_sequential(X, max_components=20, n_folds=2, n_inits=3,
         (weights, means, covariances) of the best CV fit at k_best.
     history : dict
         Per-k (metric, params) from the search.
+
+    Raises
+    ------
+    ValueError
+        n_folds < 2 or more folds than samples (before any fit); an
+        unknown `init_type` (at the first initialisation).
+    RuntimeError
+        When no k yields a finite validation metric; and as in `em_fit`
+        (a covariance that cannot be factorised, a CUDA out-of-memory
+        error at one replicate per batch).
     """
     _validate_folds(X.shape[0], n_folds)
     best_metric, best_k, pat, history = -torch.inf, None, 0, {}
@@ -1929,6 +1939,18 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
     history : dict
         Per-k metrics; params entries are None for every k (the selected
         parameters are returned separately).
+
+    Raises
+    ------
+    ValueError
+        n_folds < 2 or more folds than samples (before any fit); an
+        unknown `init_type` (at the initialisation); an unknown
+        `metric_method` (only after the CV fit and scoring).
+    RuntimeError
+        When no k yields a finite validation metric (or, for 'aic'/'bic',
+        a finite criterion); and as in `em_fit` (a covariance that cannot
+        be factorised, a CUDA out-of-memory error at one replicate per
+        batch).
     """
     N, d = X.shape
     _validate_folds(N, n_folds)
@@ -2560,6 +2582,31 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         regularisation (raise `reg_covar`, or use float64); or when a CUDA
         out-of-memory error persists at one replicate per batch.
 
+    Warns
+    -----
+    RuntimeWarning
+        Once per call: fewer than 100 samples (a finite-sample bias the
+        errorbar does not include); under preprocess='gaussianise', columns
+        with more than 1% of their samples in tied blocks of three or more;
+        return_fit=True with preprocess='gaussianise' (the model lives in
+        rank-probit space); components of a requested
+        fixed_components_number that died in the CV fit.
+        Once per skipped k: protocol='sequential' met a non-finite
+        validation metric (k skipped without consuming patience).
+        Once per em_fit call (each CV fit, the aic/bic and return_fit
+        refits, the bootstrap), counting replicates: replicates that
+        exhausted `max_iter`; replicates finished on the centred legacy
+        kernels because a component collapsed beyond the GEMM kernels'
+        precision (expected for surplus components during selection at
+        float32). Once per validation-scoring call, likewise, for
+        replicates scored with the legacy kernels.
+        Once per halving: a CUDA out-of-memory error halved a stage's
+        replicate batch and retried.
+        Once per covariance factorisation that needs it, which can repeat
+        across EM iterations and stages, counting components: extra diagonal
+        regularisation; an all-zero or a non-finite covariance replaced
+        by the identity.
+
     Notes
     -----
     *Selection.* The batched protocol fits every candidate k at once, so
@@ -2915,6 +2962,14 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         As in `estimate`.
     RuntimeError
         As in `estimate`, for any category's fit.
+
+    Warns
+    -----
+    RuntimeWarning
+        As in `estimate`, for each category's selection, bootstrap and
+        Monte-Carlo stages; the small-sample warning checks the smallest
+        category, and the gaussianise and return_fit warnings do not
+        arise.
     """
     X = torch.as_tensor(_as_array(X)).detach()
     if dtype not in (torch.float32, torch.float64):
