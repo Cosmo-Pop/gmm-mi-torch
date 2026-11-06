@@ -18,6 +18,7 @@ import math
 import operator
 import os
 import warnings
+from typing import NamedTuple
 
 import torch
 
@@ -1283,14 +1284,14 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
     outs = _run_chunked(R, em_chunk, lambda sl: _em_fit_core(
         X, _rows(s, sl) if n_chunk is None else _WeightChunks(s, sl, n_chunk),
         w[sl], mu[sl], cov[sl], reg_covar, threshold_fit, max_iter, n_chunk))
-    n_unconverged = sum(o[4] for o in outs)
+    n_unconverged = sum(o.n_unconverged for o in outs)
     if n_unconverged:
         warnings.warn(
             f"{n_unconverged} of {R} EM replicate(s) did not converge "
             f"within max_iter={max_iter} iterations; their last iterates "
             f"are used (raise max_iter or loosen threshold_fit)",
             RuntimeWarning, stacklevel=3)   # em_fit -> _full_precision -> caller
-    n_rerouted = sum(o[5] for o in outs)
+    n_rerouted = sum(o.n_rerouted for o in outs)
     if n_rerouted:
         warnings.warn(
             f"{n_rerouted} of {R} EM replicate(s) carried a component "
@@ -1406,6 +1407,31 @@ def _reroute_trips(w, mu, cov, repaired=None):
     return trips.any(-1)
 
 
+class EMResult(NamedTuple):
+    """
+    Result of `_em_fit_core` for one replicate batch.
+
+    A tuple, so slicing (`res[:4]`) and positional reads still work.
+
+    Attributes
+    ----------
+    w, mu, cov : torch.Tensor
+        Fitted parameters, shapes (R, K), (R, K, d), (R, K, d, d).
+    ll : torch.Tensor
+        Last E-step's weighted mean per-sample log-likelihood, shape (R,).
+    n_unconverged : int
+        Replicates that exhausted `max_iter`.
+    n_rerouted : int
+        Replicates the kernel-reroute detector moved to the legacy kernels.
+    """
+    w: torch.Tensor
+    mu: torch.Tensor
+    cov: torch.Tensor
+    ll: torch.Tensor
+    n_unconverged: int
+    n_rerouted: int
+
+
 def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500,
                  n_chunk=None):
     """Weighted EM, batched over replicates.
@@ -1416,7 +1442,7 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
     converged replicates is index-only — no (R,N) copy is ever made.
     n_chunk: sample-dimension chunk size for the per-iteration E/M
     accumulation (None = the single-pass path).
-    Returns (w, mu, cov, train_ll, n_unconverged, n_rerouted) with train_ll
+    Returns an EMResult (w, mu, cov, ll, n_unconverged, n_rerouted) with ll
     the last E-step's weighted mean per-sample log-likelihood, shape (R,),
     n_unconverged the replicates that exhausted max_iter and n_rerouted the
     replicates the kernel-reroute detector moved to the legacy kernels
@@ -1541,12 +1567,13 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
             w, mu, cov = w[keep], mu[keep], cov[keep]
             leg = leg[keep]
             if ai.shape[0] == 0:
-                return w_out, mu_out, cov_out, ll_out, 0, n_rerouted
+                return EMResult(w_out, mu_out, cov_out, ll_out, 0, n_rerouted)
         else:
             prev = ll
     # unconverged stragglers: write back current state
     w_out[ai], mu_out[ai], cov_out[ai], ll_out[ai] = w, mu, cov, prev
-    return w_out, mu_out, cov_out, ll_out, int(ai.shape[0]), n_rerouted
+    return EMResult(w_out, mu_out, cov_out, ll_out, int(ai.shape[0]),
+                    n_rerouted)
 
 
 @_full_precision
@@ -1599,14 +1626,14 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None, em_chunk=None):
                             X, _rows(s_val, sl) if n_chunk is None
                             else _WeightChunks(s_val, sl, n_chunk),
                             w[sl], mu[sl], cov[sl], n_chunk))
-    n_rerouted = sum(o[1] for o in outs)
+    n_rerouted = sum(o.n_rerouted for o in outs)
     if n_rerouted:
         warnings.warn(
             f"{n_rerouted} of {R} replicate(s) carried a component "
             f"collapsed beyond the GEMM kernels' precision at this dtype "
             f"and were scored with the (slower, centred) legacy kernels",
             RuntimeWarning, stacklevel=3)   # val_ll -> _full_precision -> caller
-    vals = [o[0] for o in outs]
+    vals = [o.values for o in outs]
     return vals[0] if len(vals) == 1 else torch.cat(vals)
 
 
@@ -1628,8 +1655,24 @@ def _legacy_score_sum(X, wc, w, mu, chol, n_chunk, rows=None):
     return acc
 
 
+class ValLLResult(NamedTuple):
+    """
+    Result of `_val_ll_core` for one replicate batch (a tuple).
+
+    Attributes
+    ----------
+    values : torch.Tensor
+        Weighted mean per-sample log-likelihood per replicate, shape (R,).
+    n_rerouted : int
+        Replicates scored with the centred legacy kernels.
+    """
+    values: torch.Tensor
+    n_rerouted: int
+
+
 def _val_ll_core(X, s_val, w, mu, cov, n_chunk=None):
-    """`val_ll` for one replicate batch; returns (values, n_rerouted).
+    """`val_ll` for one replicate batch; returns a ValLLResult
+    (values, n_rerouted).
 
     The cross-chunk accumulator runs at float64, as in the EM kernels: at
     float32 the drift of a working-dtype sum grows as sqrt(#chunks) x ulp
@@ -1682,7 +1725,7 @@ def _val_ll_core(X, s_val, w, mu, cov, n_chunk=None):
     tot = wc.totals()
     vals = torch.where(tot > 0, acc / tot.clamp_min(1e-30),
                        torch.full_like(acc, -torch.inf)).to(X.dtype)
-    return vals, n_rerouted
+    return ValLLResult(vals, n_rerouted)
 
 
 # ----------------------------------------------------------------------
@@ -2875,6 +2918,24 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     return out
 
 
+class CategoryFit(NamedTuple):
+    """
+    Bootstrap fits of one category in `estimate_categorical` (a tuple).
+
+    Attributes
+    ----------
+    w, mu, cov : torch.Tensor
+        Fitted parameters over the B bootstrap replicates, shapes (B, K),
+        (B, K, 1), (B, K, 1, 1); `cov` as repaired by `_chol`.
+    chol : torch.Tensor
+        Cholesky factors of `cov`, shape (B, K, 1, 1).
+    """
+    w: torch.Tensor
+    mu: torch.Tensor
+    cov: torch.Tensor
+    chol: torch.Tensor
+
+
 @_entry_precision
 def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
                          mc_samples=100_000, max_components=10, n_folds=2, n_inits=3,
@@ -3096,9 +3157,9 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         w, mu, cov, _ = em_fit(Xc, s, w0, mu0, cov0, reg_covar, threshold_fit, max_iter,
                                em_chunk=em_chunk_b, n_chunk=n_chunk)
         chol, cov = _chol(cov)
-        fits.append((w, mu, cov, chol))
+        fits.append(CategoryFit(w, mu, cov, chol))
 
-    K_max = max(f[0].shape[1] for f in fits)
+    K_max = max(f.w.shape[1] for f in fits)
     # the per-category MC closure holds three (b,S) tensors beyond the
     # d=1 integrand (running logaddexp over categories, no (C,b,S) stack)
     mc_chunk = _resolve_chunk(
@@ -3125,8 +3186,8 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
             # the stacked logsumexp at floating-point roundoff only
             log_pbar = own = None
             for cj in range(C):
-                sc = gmm_score(pts, fits[cj][0][sl], fits[cj][1][sl],
-                               fits[cj][3][sl])                      # (b,S)
+                sc = gmm_score(pts, fits[cj].w[sl], fits[cj].mu[sl],
+                               fits[cj].chol[sl])                    # (b,S)
                 if cj == ci:
                     own = sc
                 sc = sc + logpi[cj]
