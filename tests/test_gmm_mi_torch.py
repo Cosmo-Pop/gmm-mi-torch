@@ -3140,3 +3140,190 @@ def test_collapsed_component_offdiagonal_bound():
     with pytest.raises(RuntimeError, match='raise reg_covar'):
         E._chol(torch.tensor([[[[1e-12, 1e-3], [1e-3, 1e-12]]]],
                              dtype=torch.float32))
+
+
+# ----------------------------------------------------------------------
+# the hoisted chunk callbacks (v0.8.0, readability item 3.4): each is
+# called directly, at CPU float64
+# ----------------------------------------------------------------------
+
+def _hoist_data(N=600, d=2, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    X = torch.randn(N, d, dtype=torch.float64, generator=g)
+    X[: N // 2] += 3.0
+    return X
+
+
+def test_hoisted_draw_init_blocks():
+    E = gmm_mi_torch.estimator
+    B0 = E._INIT_DRAW_BLOCK
+    c, K, seeds = 2, 2, (11, 12)
+    n = 2 * B0 + 5
+    full = torch.full((c, n, K), -1.0, dtype=torch.float64)
+    assert E._draw_init_blocks(
+        full, [torch.Generator().manual_seed(s) for s in seeds]) is None
+    assert ((full >= 0) & (full < 1)).all()
+    # row j is replicate j's own stream, drawn block by block
+    ref = torch.empty(n, K, dtype=torch.float64)
+    g = torch.Generator().manual_seed(seeds[1])
+    for b in range(0, n, B0):
+        ref[b:b + B0].uniform_(generator=g)
+    assert torch.equal(full[1], ref)
+    # whole-block pieces with the generators carried over give the same draw
+    gens = [torch.Generator().manual_seed(s) for s in seeds]
+    head = torch.empty(c, B0, K, dtype=torch.float64)
+    tail = torch.empty(c, n - B0, K, dtype=torch.float64)
+    E._draw_init_blocks(head, gens)
+    E._draw_init_blocks(tail, gens)
+    assert torch.equal(torch.cat([head, tail], 1), full)
+
+
+def test_hoisted_normalise_responsibilities():
+    E = gmm_mi_torch.estimator
+    r = torch.rand(2, 5, 3, dtype=torch.float64,
+                   generator=torch.Generator().manual_seed(0))
+    out = E._normalise_responsibilities(r.clone(), None)
+    assert out.shape == (2, 5, 3)
+    assert torch.allclose(out.sum(-1), torch.ones(2, 5, dtype=torch.float64))
+    buf = r.clone()
+    out = E._normalise_responsibilities(buf, torch.tensor([3, 2]))
+    assert out is buf                                        # in place
+    assert (out[1, :, 2] == 0).all() and (out[0] > 0).all()
+    assert torch.allclose(out.sum(-1), torch.ones(2, 5, dtype=torch.float64))
+
+
+def test_hoisted_init_mstep_random():
+    E = gmm_mi_torch.estimator
+    X = _hoist_data()
+    R, K, d = 4, 3, X.shape[1]
+    seeds = list(range(100, 100 + R))
+    w, mu, cov = E._init_mstep_random(slice(0, R), X, seeds, None, K, 1e-6,
+                                      None)
+    assert w.shape == (R, K) and mu.shape == (R, K, d)
+    assert cov.shape == (R, K, d, d)
+    assert torch.allclose(w.sum(-1), torch.ones(R, dtype=torch.float64))
+    # a sub-slice is the matching rows of the full call
+    part = E._init_mstep_random(slice(1, 3), X, seeds, None, K, 1e-6, None)
+    for a, b in zip((w, mu, cov), part):
+        assert torch.allclose(a[1:3], b, rtol=0, atol=1e-12)
+    # dead components (active_k) get zero weight; the streamed two-pass
+    # path agrees with the single pass
+    ak = torch.tensor([3, 2, 1, 3])
+    w1, mu1, cov1 = E._init_mstep_random(slice(0, R), X, seeds, ak, K, 1e-6,
+                                         None)
+    assert (w1[1, 2:] == 0).all() and (w1[2, 1:] == 0).all()
+    w2, mu2, cov2 = E._init_mstep_random(slice(0, R), X, seeds, ak, K, 1e-6,
+                                         E._INIT_DRAW_BLOCK)
+    for a, b in ((w1, w2), (mu1, mu2), (cov1, cov2)):
+        assert torch.allclose(a, b, rtol=0, atol=1e-10)
+
+
+def test_hoisted_hard_assignments():
+    E = gmm_mi_torch.estimator
+    Xc = torch.tensor([[0.0, 0.0], [10.0, 0.0], [0.1, 0.0]],
+                      dtype=torch.float64)
+    Cc = torch.tensor([[[0.0, 0.0], [10.0, 0.0], [0.05, 0.0]]],
+                      dtype=torch.float64)                       # (1,3,2)
+    al = torch.tensor([[True, True, False]])
+    big = torch.finfo(torch.float64).max
+    oh = E._hard_assignments(Xc, (Xc ** 2).sum(-1), Cc, al, big)
+    assert oh.shape == (1, 3, 3) and oh.dtype == torch.float64
+    assert torch.equal(oh.sum(-1), torch.ones(1, 3, dtype=torch.float64))
+    # the dead third centre (nearest to the third sample) is never chosen
+    assert oh[0].argmax(-1).tolist() == [0, 1, 0]
+
+
+def test_hoisted_finish_kmeans_params():
+    E = gmm_mi_torch.estimator
+    d = 2
+    eye = torch.eye(d, dtype=torch.float64)
+    w = torch.tensor([[0.5, 0.3, 0.2]], dtype=torch.float64)
+    mu = torch.ones(1, 3, d, dtype=torch.float64)
+    cov = 2.0 * eye.expand(1, 3, d, d).clone()
+    Nk = torch.tensor([[5.0, 0.0, 3.0]], dtype=torch.float64)    # one empty
+    al = torch.tensor([[True, True, False]])                     # one dead
+    w2, mu2, cov2 = E._finish_kmeans_params(w, mu, cov, Nk, al, eye)
+    assert w2.shape == (1, 3) and mu2.shape == (1, 3, d)
+    assert cov2.shape == (1, 3, d, d)
+    assert torch.equal(w2, torch.tensor([[1.0, 0.0, 0.0]],
+                                        dtype=torch.float64))
+    assert (mu2[0, 1:] == 0).all() and torch.equal(cov2[0, 2], eye)
+    assert torch.equal(cov2[0, 0], cov[0, 0])
+
+
+def test_hoisted_kmeans_assign_stats():
+    E = gmm_mi_torch.estimator
+    X = _hoist_data()
+    R, K, d = 3, 2, X.shape[1]
+    g = torch.Generator().manual_seed(1)
+    C = X[torch.randint(0, X.shape[0], (R, K), generator=g)]     # (R,K,d)
+    alive = torch.ones(R, K, dtype=torch.bool)
+    alive[2, 1] = False
+    x2 = (X ** 2).sum(-1)
+    w, mu, cov = E._kmeans_assign_stats(slice(0, R), X, x2, C, alive, 1e-6,
+                                        None)
+    assert w.shape == (R, K) and mu.shape == (R, K, d)
+    assert cov.shape == (R, K, d, d)
+    assert torch.allclose(w.sum(-1), torch.ones(R, dtype=torch.float64))
+    assert w[2, 1] == 0
+    part = E._kmeans_assign_stats(slice(1, 3), X, x2, C, alive, 1e-6, None)
+    for a, b in zip((w, mu, cov), part):
+        assert torch.allclose(a[1:3], b, rtol=0, atol=1e-12)
+    streamed = E._kmeans_assign_stats(slice(0, R), X, x2, C, alive, 1e-6,
+                                      E._INIT_DRAW_BLOCK)
+    for a, b in zip((w, mu, cov), streamed):
+        assert torch.allclose(a, b, rtol=0, atol=1e-10)
+
+
+def _hoist_mixtures(B, K, d, seed):
+    g = torch.Generator().manual_seed(seed)
+    w = torch.rand(B, K, dtype=torch.float64, generator=g) + 0.5
+    w = w / w.sum(-1, keepdim=True)
+    mu = 2.0 * torch.randn(B, K, d, dtype=torch.float64, generator=g)
+    A = 0.3 * torch.randn(B, K, d, d, dtype=torch.float64, generator=g)
+    cov = A @ A.transpose(-1, -2) + torch.eye(d, dtype=torch.float64)
+    return w, mu, cov
+
+
+def test_hoisted_mc_stage():
+    E = gmm_mi_torch.estimator
+    B = 4
+    w, mu, cov = _hoist_mixtures(B, 2, 2, seed=3)
+    chol, cov = E._chol(cov)
+    kw = dict(w=w, mu=mu, cov=cov, chol=chol, quantity='MI',
+              mc_samples=500, seed=7, n_replicates=B)
+    full = E._mc_stage(slice(0, B), **kw)
+    assert full.shape == (B,) and torch.isfinite(full).all()
+    # the same seed gives the same values, bitwise
+    assert torch.equal(E._mc_stage(slice(0, B), **kw), full)
+    # a sub-slice is the matching sub-range (per-replicate streams), and a
+    # slice past the end is clipped to n_replicates
+    assert torch.equal(E._mc_stage(slice(1, 3), **kw), full[1:3])
+    assert torch.equal(E._mc_stage(slice(2, 8), **kw), full[2:])
+    # a different seed moves the values
+    assert not torch.equal(E._mc_stage(slice(0, B), **{**kw, 'seed': 8}),
+                           full)
+
+
+def test_hoisted_mc_stage_categorical():
+    E = gmm_mi_torch.estimator
+    B, C = 3, 2
+    fits = []
+    for ci in range(C):
+        w, mu, cov = _hoist_mixtures(B, 2, 1, seed=10 + ci)
+        mu = mu + 3.0 * ci
+        chol, cov = E._chol(cov)
+        fits.append(E.CategoryFit(w, mu, cov, chol))
+    pi = torch.tensor([0.4, 0.6], dtype=torch.float64)
+    kw = dict(fits=fits, pi=pi, logpi=torch.log(pi), mc_samples=400,
+              seed=5, n_replicates=B)
+    total = torch.zeros(B, dtype=torch.float64)
+    for ci in range(C):
+        full = E._mc_stage_categorical(slice(0, B), ci=ci, **kw)
+        assert full.shape == (B,) and torch.isfinite(full).all()
+        assert torch.equal(E._mc_stage_categorical(slice(0, B), ci=ci, **kw),
+                           full)
+        assert torch.equal(E._mc_stage_categorical(slice(1, 3), ci=ci, **kw),
+                           full[1:3])
+        total += full
+    assert (total > 0).all()                     # well-separated categories
