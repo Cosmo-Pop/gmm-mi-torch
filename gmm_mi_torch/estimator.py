@@ -967,6 +967,284 @@ def _init_draw_block(out, generator):
     out.uniform_(generator=generator)
 
 
+def _draw_init_blocks(r, gens):
+    """
+    Fill a responsibility buffer block by block from per-replicate generators.
+
+    Samples [i, i + r.shape[1]) of each replicate are drawn in blocks of
+    `_INIT_DRAW_BLOCK` from that replicate's own generator; the buffer starts
+    and ends on whole blocks, so the block sequence is the single pass's for
+    every replicate chunk and sample chunk.
+
+    Parameters
+    ----------
+    r : torch.Tensor
+        Output buffer, shape (c, n, K); written in place.
+    gens : list of torch.Generator
+        One generator per replicate in the chunk, already advanced to the
+        first sample of this block range.
+
+    Returns
+    -------
+    None
+        `r` is filled in place.
+    """
+    for b in range(0, r.shape[1], _INIT_DRAW_BLOCK):
+        for j, g in enumerate(gens):
+            _init_draw_block(r[j, b:b + _INIT_DRAW_BLOCK], g)
+
+
+def _normalise_responsibilities(r, active_k_chunk):
+    """
+    Mask dead components and normalise the responsibilities, in place.
+
+    Parameters
+    ----------
+    r : torch.Tensor
+        Raw draws, shape (c, n, K).
+    active_k_chunk : torch.Tensor or None
+        Active component count per replicate in the chunk, shape (c,);
+        components >= active_k_chunk[j] are zeroed. None when every
+        component is live.
+
+    Returns
+    -------
+    r : torch.Tensor
+        The same buffer, masked and normalised over the last axis.
+    """
+    if active_k_chunk is not None:
+        K = r.shape[-1]
+        comp = torch.arange(K, device=r.device).view(1, 1, K)
+        r.mul_(comp < active_k_chunk.view(-1, 1, 1))
+    r.div_(r.sum(-1, keepdim=True).clamp_min(1e-30))
+    return r
+
+
+def _init_mstep_random(sl, X, seeds, active_k, K, reg_covar, n_chunk):
+    """
+    Initial M-step from random responsibilities for one replicate chunk.
+
+    The chunk callback of `_init_params`'s default init. Each replicate draws
+    from its own generator, seeded from `seeds`, so the draw does not depend
+    on the chunking. Single pass over the samples when `n_chunk` is None;
+    otherwise two streamed passes over sample chunks of
+    `_init_sample_chunk(N, n_chunk)` (means, then centred second moments)
+    with float64 accumulators, the same algebra as the single-pass M-step.
+
+    Parameters
+    ----------
+    sl : slice
+        Replicate range handed over by `_run_chunked`.
+    X : torch.Tensor
+        Data, shape (N, d).
+    seeds : list of int
+        One generator seed per replicate, length R.
+    active_k : torch.Tensor or None
+        Active component count per replicate, shape (R,); None when all K
+        components are live in every replicate.
+    K : int
+        Number of components (including dead padding).
+    reg_covar : float
+        Added to the covariance diagonals.
+    n_chunk : int or None
+        Sample chunk size for the streamed path; None for the single pass.
+
+    Returns
+    -------
+    w, mu, cov : torch.Tensor
+        Initial parameters for the chunk, shapes (c, K), (c, K, d),
+        (c, K, d, d).
+    """
+    N, d = X.shape
+    dev, dt = X.device, X.dtype
+    eye = torch.eye(d, dtype=dt, device=dev)
+    nc = _init_sample_chunk(N, n_chunk)
+    R = len(seeds)
+    lo, hi = sl.start, min(sl.stop, R)
+    c = hi - lo
+    active_k_chunk = None if active_k is None else active_k[lo:hi]
+    gens = [torch.Generator(device=dev).manual_seed(seeds[lo + j])
+            for j in range(c)]
+    if n_chunk is None:
+        r = torch.empty(c, N, K, dtype=dt, device=dev)
+        _draw_init_blocks(r, gens)
+        return _m_step(X.expand(c, N, d),
+                       _normalise_responsibilities(r, active_k_chunk),
+                       torch.ones(1, N, dtype=dt, device=dev)
+                       .expand(c, N), reg_covar)
+    # streamed, two passes (the M-step centres on the NEW mean, so
+    # one pass would have to use origin moments — beyond reduction
+    # order on offset data); the draw is regenerated for pass 2
+    Nk = torch.zeros(c, K, dtype=torch.float64, device=dev)
+    S1 = torch.zeros(c, K, d, dtype=torch.float64, device=dev)
+    for p in range(2):
+        gens = [torch.Generator(device=dev).manual_seed(seeds[lo + j])
+                for j in range(c)]
+        if p == 1:
+            mu = S1 / Nk.clamp_min(1e-10).unsqueeze(-1)       # (c,K,d)
+            S2 = torch.zeros(c, K, d, d, dtype=torch.float64,
+                             device=dev)
+        for i in range(0, N, nc):
+            Xc = X[i:i + nc]
+            n = Xc.shape[0]
+            r = torch.empty(c, n, K, dtype=dt, device=dev)
+            _draw_init_blocks(r, gens)
+            r = _normalise_responsibilities(r, active_k_chunk)
+            if p == 0:
+                Nk += r.sum(1).double()
+                S1 += torch.einsum('rnk,nd->rkd', r, Xc).double()
+            else:
+                diff = Xc.view(1, n, 1, d) - mu.to(dt).unsqueeze(1)
+                S2 += torch.einsum('rnk,rnki,rnkj->rkij', r, diff,
+                                   diff).double()
+            del r
+    dead = Nk < 1e-10
+    Nks = Nk.clamp_min(1e-10)
+    cov = S2 / Nks[..., None, None] + reg_covar * eye.double()
+    w = torch.where(dead, torch.zeros_like(Nk), Nk / N)
+    w = w / w.sum(-1, keepdim=True).clamp_min(1e-30)
+    mu = torch.where(dead[..., None], torch.zeros_like(mu), mu)
+    cov = torch.where(dead[..., None, None], eye.double().expand_as(cov),
+                      cov)
+    return w.to(dt), mu.to(dt), cov.to(dt)
+
+
+def _hard_assignments(Xc, x2c, Cc, al, big):
+    """
+    One-hot nearest-centre assignments for a block of samples.
+
+    Parameters
+    ----------
+    Xc : torch.Tensor
+        Samples, shape (n, d).
+    x2c : torch.Tensor
+        Their squared norms, shape (n,).
+    Cc : torch.Tensor
+        Centres per replicate, shape (c, K, d).
+    al : torch.Tensor
+        Live-component mask, shape (c, K); dead centres are never chosen.
+    big : float
+        Distance given to dead centres (the dtype's largest finite value).
+
+    Returns
+    -------
+    onehot : torch.Tensor
+        Assignments, shape (c, n, K), in the dtype of `Xc`.
+    """
+    K = Cc.shape[1]
+    dt, dev = Xc.dtype, Xc.device
+    d2 = (x2c.view(1, -1, 1) + (Cc ** 2).sum(-1).unsqueeze(1)
+          - 2.0 * torch.einsum('nd,rkd->rnk', Xc, Cc))
+    d2 = torch.where(al.unsqueeze(1), d2, torch.full_like(d2, big))
+    lab = d2.argmin(-1)
+    return torch.zeros(*lab.shape, K, dtype=dt, device=dev).scatter_(
+        2, lab.unsqueeze(-1), 1.0)
+
+
+def _finish_kmeans_params(w, mu, cov, Nk, al, eye):
+    """
+    Zero the weights of empty or dead components, renormalise, and give
+    them harmless means and covariances.
+
+    Parameters
+    ----------
+    w, mu, cov : torch.Tensor
+        Hard-assignment parameters, shapes (c, K), (c, K, d), (c, K, d, d).
+    Nk : torch.Tensor
+        Assigned counts per component, shape (c, K).
+    al : torch.Tensor
+        Live-component mask, shape (c, K).
+    eye : torch.Tensor
+        Identity, shape (d, d): the covariance of a dead component.
+
+    Returns
+    -------
+    w, mu, cov : torch.Tensor
+        The finished parameters, same shapes.
+    """
+    dead = (Nk < 1.0) | ~al
+    w = torch.where(dead, torch.zeros_like(w), w)
+    w = w / w.sum(-1, keepdim=True).clamp_min(1e-30)
+    mu = torch.where(dead[..., None], torch.zeros_like(mu), mu)
+    cov = torch.where(dead[..., None, None], eye.expand_as(cov), cov)
+    return w, mu, cov
+
+
+def _kmeans_assign_stats(sl, X, x2, centres, alive, reg_covar, n_chunk):
+    """
+    k-means init: hard-assignment statistics on the full data for one
+    replicate chunk.
+
+    The chunk callback of `_init_params`'s 'kmeans' and 'randomized_kmeans'
+    inits. Covariances are normalised by N, not by the component counts, as
+    in GMM-MI's KmeansInit. Streamed in two passes over sample chunks of
+    `_init_sample_chunk(N, n_chunk)` when `n_chunk` is set, with float64
+    accumulators; the labels depend only on the centres, so both passes see
+    identical assignments.
+
+    Parameters
+    ----------
+    sl : slice
+        Replicate range handed over by `_run_chunked`.
+    X : torch.Tensor
+        Data, shape (N, d).
+    x2 : torch.Tensor
+        Squared norms of the samples, shape (N,).
+    centres : torch.Tensor
+        Lloyd centres per replicate, shape (R, K, d).
+    alive : torch.Tensor
+        Live-component mask, shape (R, K).
+    reg_covar : float
+        Added to the covariance diagonals.
+    n_chunk : int or None
+        Sample chunk size for the streamed path; None for the single pass.
+
+    Returns
+    -------
+    w, mu, cov : torch.Tensor
+        Initial parameters for the chunk, shapes (c, K), (c, K, d),
+        (c, K, d, d).
+    """
+    N, d = X.shape
+    dev, dt = X.device, X.dtype
+    K = centres.shape[1]
+    eye = torch.eye(d, dtype=dt, device=dev)
+    big = torch.finfo(dt).max
+    nc = _init_sample_chunk(N, n_chunk)
+    Cc, al = centres[sl], alive[sl]
+    c = Cc.shape[0]
+    if n_chunk is None:
+        oh = _hard_assignments(X, x2, Cc, al, big)
+        Nk = oh.sum(1)
+        w = Nk / N
+        mu = torch.einsum('rnk,nd->rkd', oh, X) \
+            / Nk.clamp_min(1.0)[..., None]
+        diff = X.view(1, N, 1, d) - mu.unsqueeze(1)
+        # GMM-MI normalises the k-means covariances by N, not by Nk
+        cov = torch.einsum('rnk,rnki,rnkj->rkij', oh, diff, diff) / N \
+            + reg_covar * eye
+        return _finish_kmeans_params(w, mu, cov, Nk, al, eye)
+    # streamed: labels depend only on the centres, so the two
+    # passes see identical assignments
+    Nk = torch.zeros(c, K, dtype=torch.float64, device=dev)
+    Sx = torch.zeros(c, K, d, dtype=torch.float64, device=dev)
+    for i in range(0, N, nc):
+        oh = _hard_assignments(X[i:i + nc], x2[i:i + nc], Cc, al, big)
+        Nk += oh.sum(1).double()
+        Sx += torch.einsum('rnk,nd->rkd', oh, X[i:i + nc]).double()
+    mu = (Sx / Nk.clamp_min(1.0)[..., None]).to(dt)
+    Sdd = torch.zeros(c, K, d, d, dtype=torch.float64, device=dev)
+    for i in range(0, N, nc):
+        Xc = X[i:i + nc]
+        oh = _hard_assignments(Xc, x2[i:i + nc], Cc, al, big)
+        diff = Xc.view(1, -1, 1, d) - mu.unsqueeze(1)
+        Sdd += torch.einsum('rnk,rnki,rnkj->rkij', oh, diff,
+                            diff).double()
+    cov = (Sdd / N).to(dt) + reg_covar * eye
+    return _finish_kmeans_params((Nk / N).to(dt), mu, cov, Nk.to(dt), al,
+                                 eye)
+
+
 def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
                  init_type='random_responsibilities', scale=None, em_chunk=8,
                  n_chunk=None):
@@ -1006,7 +1284,7 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
     if init_type == 'random_responsibilities':
         # The (R,N,K) responsibility draw is the largest allocation of the
         # selection stage (R = max_components x n_inits x n_folds), so it
-        # is drawn per replicate chunk inside the OOM-guarded closure, in
+        # is drawn per replicate chunk inside the OOM-guarded callback, in
         # place (mask, normalise) so no second full-size transient exists.
         # Each replicate draws from its own generator seeded from one
         # value taken off the caller's stream: the draw is then invariant
@@ -1017,70 +1295,10 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
         # per-replicate seed space is 2^32, collision R(R-1)/2^33.
         seeds = torch.randint(0, 1 << 62, (R,), generator=generator,
                               device=dev).tolist()
-        comp = torch.arange(K, device=dev).view(1, 1, K)
-        B0 = _INIT_DRAW_BLOCK
-        nc = _init_sample_chunk(N, n_chunk)
-
-        def _draw(r, gens, i):
-            # samples [i, i + r.shape[1]) of each replicate, block by block
-            # from that replicate's generator; i and the chunk are whole
-            # blocks, so the block sequence is the single pass's
-            for b in range(0, r.shape[1], B0):
-                for j, g in enumerate(gens):
-                    _init_draw_block(r[j, b:b + B0], g)
-
-        def _resp(r, lo, hi):
-            if active_k is not None:
-                r.mul_(comp < ak[lo:hi].view(hi - lo, 1, 1))
-            r.div_(r.sum(-1, keepdim=True).clamp_min(1e-30))
-            return r
-
-        def _init_mstep(sl):
-            lo, hi = sl.start, min(sl.stop, R)
-            c = hi - lo
-            if n_chunk is None:
-                r = torch.empty(c, N, K, dtype=dt, device=dev)
-                _draw(r, [torch.Generator(device=dev).manual_seed(seeds[lo + j])
-                          for j in range(c)], 0)
-                return _m_step(X.expand(c, N, d), _resp(r, lo, hi),
-                               torch.ones(1, N, dtype=dt, device=dev)
-                               .expand(c, N), reg_covar)
-            # streamed, two passes (the M-step centres on the NEW mean, so
-            # one pass would have to use origin moments — beyond reduction
-            # order on offset data); the draw is regenerated for pass 2
-            Nk = torch.zeros(c, K, dtype=torch.float64, device=dev)
-            S1 = torch.zeros(c, K, d, dtype=torch.float64, device=dev)
-            for p in range(2):
-                gens = [torch.Generator(device=dev).manual_seed(seeds[lo + j])
-                        for j in range(c)]
-                if p == 1:
-                    mu = S1 / Nk.clamp_min(1e-10).unsqueeze(-1)       # (c,K,d)
-                    S2 = torch.zeros(c, K, d, d, dtype=torch.float64,
-                                     device=dev)
-                for i in range(0, N, nc):
-                    Xc = X[i:i + nc]
-                    n = Xc.shape[0]
-                    r = torch.empty(c, n, K, dtype=dt, device=dev)
-                    _draw(r, gens, i)
-                    r = _resp(r, lo, hi)
-                    if p == 0:
-                        Nk += r.sum(1).double()
-                        S1 += torch.einsum('rnk,nd->rkd', r, Xc).double()
-                    else:
-                        diff = Xc.view(1, n, 1, d) - mu.to(dt).unsqueeze(1)
-                        S2 += torch.einsum('rnk,rnki,rnkj->rkij', r, diff,
-                                           diff).double()
-                    del r
-            dead = Nk < 1e-10
-            Nks = Nk.clamp_min(1e-10)
-            cov = S2 / Nks[..., None, None] + reg_covar * eye.double()
-            w = torch.where(dead, torch.zeros_like(Nk), Nk / N)
-            w = w / w.sum(-1, keepdim=True).clamp_min(1e-30)
-            mu = torch.where(dead[..., None], torch.zeros_like(mu), mu)
-            cov = torch.where(dead[..., None, None], eye.double().expand_as(cov),
-                              cov)
-            return w.to(dt), mu.to(dt), cov.to(dt)
-        outs = _run_chunked(R, em_chunk, _init_mstep)
+        stage = functools.partial(_init_mstep_random, X=X, seeds=seeds,
+                                  active_k=active_k, K=K,
+                                  reg_covar=reg_covar, n_chunk=n_chunk)
+        outs = _run_chunked(R, em_chunk, stage)
         return tuple(torch.cat([o[j] for o in outs]) for j in range(3))
 
     if init_type == 'minmax':
@@ -1125,57 +1343,10 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
             C = torch.where((cnt > 0)[..., None], Cn, C)
         # hard-assignment statistics on the full dataset, chunked over R
         x2 = (X ** 2).sum(-1)                                         # (N,)
-        nc = _init_sample_chunk(N, n_chunk)
-
-        def _onehot(Xc, x2c, Cc, al):
-            d2 = (x2c.view(1, -1, 1) + (Cc ** 2).sum(-1).unsqueeze(1)
-                  - 2.0 * torch.einsum('nd,rkd->rnk', Xc, Cc))
-            d2 = torch.where(al.unsqueeze(1), d2, torch.full_like(d2, big))
-            lab = d2.argmin(-1)
-            return torch.zeros(*lab.shape, K, dtype=dt, device=dev).scatter_(
-                2, lab.unsqueeze(-1), 1.0)
-
-        def _finish(w, mu, cov, Nk, al):
-            dead = (Nk < 1.0) | ~al
-            w = torch.where(dead, torch.zeros_like(w), w)
-            w = w / w.sum(-1, keepdim=True).clamp_min(1e-30)
-            mu = torch.where(dead[..., None], torch.zeros_like(mu), mu)
-            cov = torch.where(dead[..., None, None], eye.expand_as(cov), cov)
-            return w, mu, cov
-
-        def _assign_stats(sl):
-            Cc, al = C[sl], alive[sl]
-            c = Cc.shape[0]
-            if n_chunk is None:
-                oh = _onehot(X, x2, Cc, al)
-                Nk = oh.sum(1)
-                w = Nk / N
-                mu = torch.einsum('rnk,nd->rkd', oh, X) \
-                    / Nk.clamp_min(1.0)[..., None]
-                diff = X.view(1, N, 1, d) - mu.unsqueeze(1)
-                # GMM-MI normalises the k-means covariances by N, not by Nk
-                cov = torch.einsum('rnk,rnki,rnkj->rkij', oh, diff, diff) / N \
-                    + reg_covar * eye
-                return _finish(w, mu, cov, Nk, al)
-            # streamed: labels depend only on the centres, so the two
-            # passes see identical assignments
-            Nk = torch.zeros(c, K, dtype=torch.float64, device=dev)
-            Sx = torch.zeros(c, K, d, dtype=torch.float64, device=dev)
-            for i in range(0, N, nc):
-                oh = _onehot(X[i:i + nc], x2[i:i + nc], Cc, al)
-                Nk += oh.sum(1).double()
-                Sx += torch.einsum('rnk,nd->rkd', oh, X[i:i + nc]).double()
-            mu = (Sx / Nk.clamp_min(1.0)[..., None]).to(dt)
-            Sdd = torch.zeros(c, K, d, d, dtype=torch.float64, device=dev)
-            for i in range(0, N, nc):
-                Xc = X[i:i + nc]
-                oh = _onehot(Xc, x2[i:i + nc], Cc, al)
-                diff = Xc.view(1, -1, 1, d) - mu.unsqueeze(1)
-                Sdd += torch.einsum('rnk,rnki,rnkj->rkij', oh, diff,
-                                    diff).double()
-            cov = (Sdd / N).to(dt) + reg_covar * eye
-            return _finish((Nk / N).to(dt), mu, cov, Nk.to(dt), al)
-        outs = _run_chunked(R, em_chunk, _assign_stats)
+        stage = functools.partial(_kmeans_assign_stats, X=X, x2=x2,
+                                  centres=C, alive=alive,
+                                  reg_covar=reg_covar, n_chunk=n_chunk)
+        outs = _run_chunked(R, em_chunk, stage)
         w, mu, cov = (torch.cat([o[j] for o in outs]) for j in range(3))
         if init_type == 'randomized_kmeans':
             s = 1.0 if scale is None else float(scale)
@@ -2466,6 +2637,44 @@ class FittedGMM:
         return ll[0].cpu().numpy()
 
 
+def _mc_stage(sl, w, mu, cov, chol, quantity, mc_samples, seed,
+              n_replicates):
+    """
+    Monte Carlo estimate of `quantity` for one chunk of bootstrap replicates.
+
+    The chunk callback of `estimate`'s MC stage. Each replicate draws from
+    its own seeded stream, so the samples are independent of `mc_chunk` and
+    of the out-of-memory halve-and-retry.
+
+    Parameters
+    ----------
+    sl : slice
+        Replicate range handed over by `_run_chunked`.
+    w, mu, cov, chol : torch.Tensor
+        Fitted mixture parameters and Cholesky factors, shapes (B, K),
+        (B, K, d), (B, K, d, d), (B, K, d, d).
+    quantity : str
+        Key into `_INTEGRANDS`.
+    mc_samples : int
+        Monte Carlo samples per replicate.
+    seed : int
+        Base seed; replicate r uses seed + _MC_SEED_OFFSET + r.
+    n_replicates : int
+        Total number of replicates B (the slice is clipped to it).
+
+    Returns
+    -------
+    vals : torch.Tensor
+        Estimate per replicate in the chunk, shape (b,), in nats.
+    """
+    pts = torch.cat([
+        gmm_sample(w[r:r + 1], mu[r:r + 1], chol[r:r + 1], mc_samples,
+                   generator=torch.Generator(device=w.device).manual_seed(
+                       seed + _MC_SEED_OFFSET + r))
+        for r in range(sl.start, min(sl.stop, n_replicates))])
+    return _INTEGRANDS[quantity](pts, w[sl], mu[sl], cov[sl], chol[sl]).mean(1)
+
+
 @_entry_precision
 def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
              mc_samples=100_000, max_components=20, n_folds=2, n_inits=3,
@@ -2917,17 +3126,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     # refactorise cov, so sampling under the repaired factor while scoring
     # marginals from the raw covariance would mix two different mixtures
     chol, cov = _chol(cov)
-
-    def _mc(sl):
-        # each replicate draws from its own seeded stream, so the samples
-        # are independent of mc_chunk and of the OOM halve-and-retry
-        pts = torch.cat([
-            gmm_sample(w[r:r + 1], mu[r:r + 1], chol[r:r + 1], mc_samples,
-                       generator=torch.Generator(device=X.device).manual_seed(
-                           seed + _MC_SEED_OFFSET + r))
-            for r in range(sl.start, min(sl.stop, B))])
-        return _INTEGRANDS[quantity](pts, w[sl], mu[sl], cov[sl], chol[sl]).mean(1)
-    vals = torch.cat(_run_chunked(B, mc_chunk, _mc))              # (B,)
+    mc = functools.partial(_mc_stage, w=w, mu=mu, cov=cov, chol=chol,
+                           quantity=quantity, mc_samples=mc_samples,
+                           seed=seed, n_replicates=B)
+    vals = torch.cat(_run_chunked(B, mc_chunk, mc))               # (B,)
     mean = vals.mean().item()
     std = vals.std(unbiased=True).item() if n_bootstrap >= 2 else None
     out = (mean, std)
@@ -2954,6 +3156,66 @@ class CategoryFit(NamedTuple):
     mu: torch.Tensor
     cov: torch.Tensor
     chol: torch.Tensor
+
+
+def _mc_stage_categorical(sl, ci, fits, pi, logpi, mc_samples, seed,
+                         n_replicates):
+    """
+    Monte Carlo term of category `ci` for one chunk of bootstrap replicates.
+
+    The chunk callback of `estimate_categorical`'s MC stage: samples from
+    category ci's fit and returns pi[ci] * E[log p(x|ci) - log pbar(x)],
+    with pbar(x) = sum_c' pi[c'] p(x|c'). Per-(category, replicate) seeded
+    streams, as in `_mc_stage`; the category stride keeps the streams
+    collision-free for any n_bootstrap the entry validation admits.
+
+    Parameters
+    ----------
+    sl : slice
+        Replicate range handed over by `_run_chunked`.
+    ci : int
+        Index of the category sampled from.
+    fits : list of CategoryFit
+        Bootstrap fits of every category, each over B replicates.
+    pi, logpi : torch.Tensor
+        Category weights and their logarithms, shape (C,).
+    mc_samples : int
+        Monte Carlo samples per replicate.
+    seed : int
+        Base seed; replicate r of category ci uses
+        seed + _MC_SEED_OFFSET + ci * _MC_CAT_STRIDE + r.
+    n_replicates : int
+        Total number of replicates B (the slice is clipped to it).
+
+    Returns
+    -------
+    vals : torch.Tensor
+        Category ci's contribution per replicate in the chunk, shape (b,),
+        in nats.
+    """
+    w, mu, chol = fits[ci].w, fits[ci].mu, fits[ci].chol
+    C = len(fits)
+    pts = torch.cat([
+        gmm_sample(w[r:r + 1], mu[r:r + 1], chol[r:r + 1],
+                   mc_samples,
+                   generator=torch.Generator(device=w.device)
+                   .manual_seed(seed + _MC_SEED_OFFSET
+                                + ci * _MC_CAT_STRIDE + r))
+        for r in range(sl.start, min(sl.stop, n_replicates))])
+    # log sum_c' pi_c' p(x|c') as a running logaddexp over the
+    # categories, so the peak holds three (b,S) tensors instead of
+    # a (C,b,S) stack plus its C-element list; results differ from
+    # the stacked logsumexp at floating-point roundoff only
+    log_pbar = own = None
+    for cj in range(C):
+        sc = gmm_score(pts, fits[cj].w[sl], fits[cj].mu[sl],
+                       fits[cj].chol[sl])                            # (b,S)
+        if cj == ci:
+            own = sc
+        sc = sc + logpi[cj]
+        log_pbar = sc if log_pbar is None \
+            else torch.logaddexp(log_pbar, sc)
+    return pi[ci] * (own - log_pbar).mean(1)
 
 
 @_entry_precision
@@ -3180,41 +3442,17 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         fits.append(CategoryFit(w, mu, cov, chol))
 
     K_max = max(f.w.shape[1] for f in fits)
-    # the per-category MC closure holds three (b,S) tensors beyond the
+    # the per-category MC stage holds three (b,S) tensors beyond the
     # d=1 integrand (running logaddexp over categories, no (C,b,S) stack)
     mc_chunk = _resolve_chunk(
         mc_chunk, B, _mc_bytes_per_replicate(mc_samples, K_max, 1, dtype)
         + 4 * mc_samples * dtype.itemsize, device, name='mc_chunk')
     vals = torch.zeros(B, dtype=X.dtype, device=X.device)
     for ci in range(C):
-        w, mu, cov, chol = fits[ci]
-
-        def _mc(sl, ci=ci, w=w, mu=mu, chol=chol):
-            # per-(category, replicate) seeded streams, as in estimate's MC
-            # stage; the category stride keeps the streams collision-free
-            # for any n_bootstrap the entry validation admits
-            pts = torch.cat([
-                gmm_sample(w[r:r + 1], mu[r:r + 1], chol[r:r + 1],
-                           mc_samples,
-                           generator=torch.Generator(device=X.device)
-                           .manual_seed(seed + _MC_SEED_OFFSET
-                                        + ci * _MC_CAT_STRIDE + r))
-                for r in range(sl.start, min(sl.stop, B))])
-            # log sum_c' pi_c' p(x|c') as a running logaddexp over the
-            # categories, so the peak holds three (b,S) tensors instead of
-            # a (C,b,S) stack plus its C-element list; results differ from
-            # the stacked logsumexp at floating-point roundoff only
-            log_pbar = own = None
-            for cj in range(C):
-                sc = gmm_score(pts, fits[cj].w[sl], fits[cj].mu[sl],
-                               fits[cj].chol[sl])                    # (b,S)
-                if cj == ci:
-                    own = sc
-                sc = sc + logpi[cj]
-                log_pbar = sc if log_pbar is None \
-                    else torch.logaddexp(log_pbar, sc)
-            return pi[ci] * (own - log_pbar).mean(1)
-        vals += torch.cat(_run_chunked(B, mc_chunk, _mc))
+        stage = functools.partial(_mc_stage_categorical, ci=ci, fits=fits,
+                                  pi=pi, logpi=logpi, mc_samples=mc_samples,
+                                  seed=seed, n_replicates=B)
+        vals += torch.cat(_run_chunked(B, mc_chunk, stage))
     mean = vals.mean().item()
     std = vals.std(unbiased=True).item() if n_bootstrap >= 2 else None
     return (mean, std, k_bests) if return_k else (mean, std)
