@@ -1450,36 +1450,39 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
     """
     stream = n_chunk is not None
     if isinstance(s, _WeightChunks):
-        wc = s
+        weight_chunks = s
         if not stream:
-            s = wc.rows(0, wc.N)
+            s = weight_chunks.rows(0, weight_chunks.N)
     else:
-        wc = _WeightChunks(s, slice(0, s.shape[0]), n_chunk) if stream else None
-    R, N = wc.shape if stream else s.shape
+        weight_chunks = (_WeightChunks(s, slice(0, s.shape[0]), n_chunk)
+                         if stream else None)
+    R, N = weight_chunks.shape if stream else s.shape
     dev = X.device
     d = X.shape[-1]
     # compaction: only still-active replicates stay in the working batch;
-    # on the streamed path the weights are addressed through `ai`, on the
-    # single-pass path the dense `sa` is compacted alongside
-    ai = torch.arange(R, device=dev)                      # active indices
+    # on the streamed path the weights are addressed through `active_idx`,
+    # on the single-pass path the dense `weights_active` is compacted
+    # alongside
+    active_idx = torch.arange(R, device=dev)
     w_out, mu_out, cov_out = w.clone(), mu.clone(), cov.clone()
     ll_out = torch.full((R,), -torch.inf, dtype=X.dtype, device=dev)
     prev = torch.full((R,), -torch.inf, dtype=X.dtype, device=dev)
-    sa = None if stream else s
+    weights_active = None if stream else s
     gemm = _EM_KERNEL == 'gemm'
     F = _features(X) if gemm and n_chunk is None else None
     # sticky per-replicate reroute mask over the active set; the legacy step
-    # streams its samples in chunks of nl so its (4d+4)K-per-sample peak
-    # stays inside the GEMM budget the replicate chunk was sized with
-    leg = torch.zeros(R, dtype=torch.bool, device=dev)
+    # streams its samples in chunks of legacy_sample_chunk so its
+    # (4d+4)K-per-sample peak stays inside the GEMM budget the replicate
+    # chunk was sized with
+    legacy_mask = torch.zeros(R, dtype=torch.bool, device=dev)
     n_rerouted = 0
     K = w.shape[-1]
-    nl = _legacy_sample_chunk(N, K, d, X.dtype, n_chunk)
+    legacy_sample_chunk = _legacy_sample_chunk(N, K, d, X.dtype, n_chunk)
     for _ in range(max_iter):
-        Ra = ai.shape[0]
+        n_active = active_idx.shape[0]
         # rows=None (a view for 2-D weights) while nothing has converged:
-        # ai is then the identity
-        act = None if Ra == R else ai
+        # active_idx is then the identity
+        active_rows = None if n_active == R else active_idx
         if gemm:
             # the trip check runs on the parameters entering EVERY E-step,
             # including the first (warm starts can already carry a
@@ -1487,92 +1490,106 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
             # escalation evidence and its repair is written back
             _, cov, rep = _chol(cov, return_repaired=True)
             trips = _reroute_trips(w, mu, cov, repaired=rep)
-            new = trips & ~leg
+            new = trips & ~legacy_mask
             if bool(new.any()):
                 n_rerouted += int(new.sum())
-                leg = leg | trips
-        if gemm and not bool(leg.any()):
+                legacy_mask = legacy_mask | trips
+        if gemm and not bool(legacy_mask.any()):
             if n_chunk is None:
-                resp, ll = _estep_gemm(F, sa, w, mu, cov)
-                w, mu, cov = _mstep_gemm(F, resp, sa, reg_covar, X.shape[-1])
+                resp, ll = _estep_gemm(F, weights_active, w, mu, cov)
+                w, mu, cov = _mstep_gemm(F, resp, weights_active, reg_covar,
+                                         X.shape[-1])
                 # release the consumed responsibilities now: left bound,
                 # they would stay allocated through the next E-step and
                 # double the (R,N,K) peak
                 del resp
             else:
-                ll, w, mu, cov = _em_step_gemm_nchunked(X, wc, w, mu, cov,
-                                                        reg_covar, n_chunk,
-                                                        rows=act)
+                ll, w, mu, cov = _em_step_gemm_nchunked(
+                    X, weight_chunks, w, mu, cov, reg_covar, n_chunk,
+                    rows=active_rows)
         elif gemm:
-            gi = (~leg).nonzero(as_tuple=True)[0]
-            li = leg.nonzero(as_tuple=True)[0]
-            ll = torch.empty(Ra, dtype=X.dtype, device=dev)
-            w_n, mu_n, cov_n = (torch.empty_like(w), torch.empty_like(mu),
-                                torch.empty_like(cov))
-            if gi.numel():
+            gemm_idx = (~legacy_mask).nonzero(as_tuple=True)[0]
+            legacy_idx = legacy_mask.nonzero(as_tuple=True)[0]
+            ll = torch.empty(n_active, dtype=X.dtype, device=dev)
+            w_next, mu_next, cov_next = (torch.empty_like(w),
+                                         torch.empty_like(mu),
+                                         torch.empty_like(cov))
+            if gemm_idx.numel():
                 if n_chunk is None:
-                    resp, llg = _estep_gemm(F, sa[gi], w[gi], mu[gi], cov[gi])
-                    wg, mug, covg = _mstep_gemm(F, resp, sa[gi], reg_covar, d)
+                    resp, llg = _estep_gemm(F, weights_active[gemm_idx],
+                                            w[gemm_idx], mu[gemm_idx],
+                                            cov[gemm_idx])
+                    wg, mug, covg = _mstep_gemm(F, resp,
+                                                weights_active[gemm_idx],
+                                                reg_covar, d)
                     del resp
                 else:
                     llg, wg, mug, covg = _em_step_gemm_nchunked(
-                        X, wc, w[gi], mu[gi], cov[gi], reg_covar, n_chunk,
-                        rows=ai[gi])
-                ll[gi] = llg
-                w_n[gi], mu_n[gi], cov_n[gi] = wg, mug, covg
-            if li.numel():
-                chol_l, cov_l = _chol(cov[li])
+                        X, weight_chunks, w[gemm_idx], mu[gemm_idx],
+                        cov[gemm_idx], reg_covar, n_chunk,
+                        rows=active_idx[gemm_idx])
+                ll[gemm_idx] = llg
+                w_next[gemm_idx], mu_next[gemm_idx], cov_next[gemm_idx] = \
+                    wg, mug, covg
+            if legacy_idx.numel():
+                chol_l, cov_l = _chol(cov[legacy_idx])
                 logw_l = torch.where(
-                    w[li] > 0, torch.log(w[li].clamp_min(1e-300)),
-                    torch.full_like(w[li], -torch.inf))
+                    w[legacy_idx] > 0,
+                    torch.log(w[legacy_idx].clamp_min(1e-300)),
+                    torch.full_like(w[legacy_idx], -torch.inf))
                 if stream:
                     lll, wl, mul, covl = _em_step_nchunked(
-                        X, wc, w[li], mu[li], chol_l, logw_l, reg_covar, nl,
-                        rows=ai[li])
+                        X, weight_chunks, w[legacy_idx], mu[legacy_idx],
+                        chol_l, logw_l, reg_covar, legacy_sample_chunk,
+                        rows=active_idx[legacy_idx])
                 else:
                     # dense compacted weights: a view-only accessor whose
                     # totals are the one-pass sums (bitwise the old code)
                     lll, wl, mul, covl = _em_step_nchunked(
-                        X, _WeightChunks(sa, slice(0, Ra)), w[li], mu[li],
-                        chol_l, logw_l, reg_covar, nl, rows=li)
-                ll[li] = lll
-                w_n[li], mu_n[li], cov_n[li] = wl, mul, covl
-            w, mu, cov = w_n, mu_n, cov_n
+                        X, _WeightChunks(weights_active, slice(0, n_active)),
+                        w[legacy_idx], mu[legacy_idx], chol_l, logw_l,
+                        reg_covar, legacy_sample_chunk, rows=legacy_idx)
+                ll[legacy_idx] = lll
+                w_next[legacy_idx], mu_next[legacy_idx], \
+                    cov_next[legacy_idx] = wl, mul, covl
+            w, mu, cov = w_next, mu_next, cov_next
         elif n_chunk is None:
             chol, cov = _chol(cov)
             logw = torch.where(w > 0, torch.log(w.clamp_min(1e-300)),
                                torch.full_like(w, -torch.inf))
-            Xr = X.expand(Ra, N, X.shape[-1])
-            logjoint = logw.unsqueeze(1) + log_gauss(Xr, mu, chol)  # (Ra,N,K)
-            ll_n = torch.logsumexp(logjoint, dim=-1)                # (Ra,N)
+            Xr = X.expand(n_active, N, X.shape[-1])
+            # shapes (n_active,N,K), then (n_active,N)
+            logjoint = logw.unsqueeze(1) + log_gauss(Xr, mu, chol)
+            ll_n = torch.logsumexp(logjoint, dim=-1)
             resp = torch.exp(logjoint - ll_n.unsqueeze(-1))
-            ll = (sa * ll_n).sum(1) / sa.sum(1)
-            w, mu, cov = _m_step(Xr, resp, sa, reg_covar)
+            ll = (weights_active * ll_n).sum(1) / weights_active.sum(1)
+            w, mu, cov = _m_step(Xr, resp, weights_active, reg_covar)
         else:
             chol, cov = _chol(cov)
             logw = torch.where(w > 0, torch.log(w.clamp_min(1e-300)),
                                torch.full_like(w, -torch.inf))
-            ll, w, mu, cov = _em_step_nchunked(X, wc, w, mu, chol,
+            ll, w, mu, cov = _em_step_nchunked(X, weight_chunks, w, mu, chol,
                                                logw, reg_covar, n_chunk,
-                                               rows=act)
+                                               rows=active_rows)
         done = (ll - prev).abs() < threshold_fit
         if done.any():
-            di = ai[done]
+            di = active_idx[done]
             w_out[di], mu_out[di], cov_out[di] = w[done], mu[done], cov[done]
             ll_out[di] = ll[done]
             keep = ~done
-            ai, prev = ai[keep], ll[keep]
+            active_idx, prev = active_idx[keep], ll[keep]
             if not stream:
-                sa = sa[keep]
+                weights_active = weights_active[keep]
             w, mu, cov = w[keep], mu[keep], cov[keep]
-            leg = leg[keep]
-            if ai.shape[0] == 0:
+            legacy_mask = legacy_mask[keep]
+            if active_idx.shape[0] == 0:
                 return EMResult(w_out, mu_out, cov_out, ll_out, 0, n_rerouted)
         else:
             prev = ll
     # unconverged stragglers: write back current state
-    w_out[ai], mu_out[ai], cov_out[ai], ll_out[ai] = w, mu, cov, prev
-    return EMResult(w_out, mu_out, cov_out, ll_out, int(ai.shape[0]),
+    w_out[active_idx], mu_out[active_idx], cov_out[active_idx], \
+        ll_out[active_idx] = w, mu, cov, prev
+    return EMResult(w_out, mu_out, cov_out, ll_out, int(active_idx.shape[0]),
                     n_rerouted)
 
 
@@ -1683,46 +1700,49 @@ def _val_ll_core(X, s_val, w, mu, cov, n_chunk=None):
     (a RuntimeWarning per call reports them, as in em_fit). `s_val` is a dense
     (R,N) tensor or a _WeightChunks accessor; either way the weights are
     read per sample chunk and only the rerouted rows are ever gathered."""
-    wc = (s_val if isinstance(s_val, _WeightChunks)
+    weight_chunks = (s_val if isinstance(s_val, _WeightChunks)
           else _WeightChunks(s_val, slice(0, s_val.shape[0]), n_chunk))
-    R, N = wc.shape
+    R, N = weight_chunks.shape
     n_rerouted = 0
     if _EM_KERNEL == 'gemm':
         chol_all, cov, rep = _chol(cov, return_repaired=True)
         trips = _reroute_trips(w, mu, cov, repaired=rep)
         n_rerouted = int(trips.sum())
         acc = torch.zeros(R, dtype=torch.float64, device=X.device)
-        gi = (~trips).nonzero(as_tuple=True)[0]
-        li = trips.nonzero(as_tuple=True)[0]
-        if gi.numel():
-            coef, const = _gauss_coef(w[gi], mu[gi], cov[gi])
-            rows_g = None if li.numel() == 0 else gi     # all rows: a view
+        gemm_idx = (~trips).nonzero(as_tuple=True)[0]
+        legacy_idx = trips.nonzero(as_tuple=True)[0]
+        if gemm_idx.numel():
+            coef, const = _gauss_coef(w[gemm_idx], mu[gemm_idx], cov[gemm_idx])
+            # all rows: a view
+            rows_g = None if legacy_idx.numel() == 0 else gemm_idx
             n = n_chunk or N
-            accg = torch.zeros(gi.numel(), dtype=torch.float64,
+            accg = torch.zeros(gemm_idx.numel(), dtype=torch.float64,
                                device=X.device)
             for i in range(0, N, n):
                 Fc = _features(X[i:i+n])
                 lj = torch.matmul(Fc.unsqueeze(0), coef.transpose(1, 2))
                 lj += const.unsqueeze(1)
-                accg = accg + (wc.rows(i, n, rows_g)
+                accg = accg + (weight_chunks.rows(i, n, rows_g)
                                * torch.logsumexp(lj, -1)).sum(1).double()
                 del lj, Fc
-            acc[gi] = accg
-        if li.numel():
+            acc[gemm_idx] = accg
+        if legacy_idx.numel():
             # rerouted rows are scored by the centred legacy kernels in
             # the same model-derived sample chunk em_fit streams them with
             # (one broadcast pass over N would exceed the budget the
             # replicate chunk was sized with several times over)
-            nl = _legacy_sample_chunk(N, w.shape[-1], X.shape[-1], X.dtype,
-                                      n_chunk)
-            acc[li] = _legacy_score_sum(X, wc, w[li], mu[li], chol_all[li],
-                                        min(nl, n_chunk or N), rows=li)
+            legacy_sample_chunk = _legacy_sample_chunk(
+                N, w.shape[-1], X.shape[-1], X.dtype, n_chunk)
+            acc[legacy_idx] = _legacy_score_sum(
+                X, weight_chunks, w[legacy_idx], mu[legacy_idx],
+                chol_all[legacy_idx], min(legacy_sample_chunk, n_chunk or N),
+                rows=legacy_idx)
     else:
         # legacy kernels selected by the environment: em_chunk was sized
         # from the legacy model, so the caller's n_chunk stands
         chol, _ = _chol(cov)
-        acc = _legacy_score_sum(X, wc, w, mu, chol, n_chunk)
-    tot = wc.totals()
+        acc = _legacy_score_sum(X, weight_chunks, w, mu, chol, n_chunk)
+    tot = weight_chunks.totals()
     vals = torch.where(tot > 0, acc / tot.clamp_min(1e-30),
                        torch.full_like(acc, -torch.inf)).to(X.dtype)
     return ValLLResult(vals, n_rerouted)
