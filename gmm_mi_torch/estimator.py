@@ -1578,6 +1578,268 @@ def _reroute_trips(w, mu, cov, repaired=None):
     return trips.any(-1)
 
 
+def _check_reroute(w, mu, cov, legacy_mask):
+    """
+    Kernel-reroute check on the parameters entering an E-step (GEMM kernel).
+
+    Runs on the parameters entering EVERY E-step, including the first (warm
+    starts can already carry a collapsed component). The factorisation
+    doubles as the escalation evidence and its repair is written back.
+
+    Parameters
+    ----------
+    w, mu, cov : torch.Tensor
+        Parameters of the active replicates, shapes (Ra, K), (Ra, K, d),
+        (Ra, K, d, d).
+    legacy_mask : torch.Tensor
+        Sticky per-replicate reroute mask over the active set, shape (Ra,).
+
+    Returns
+    -------
+    cov : torch.Tensor
+        The factorised (possibly repaired) covariances.
+    legacy_mask : torch.Tensor
+        The mask with any newly tripped replicates added.
+    n_new : int
+        Replicates rerouted by this check (not already in the mask).
+    """
+    _, cov, rep = _chol(cov, return_repaired=True)
+    trips = _reroute_trips(w, mu, cov, repaired=rep)
+    new = trips & ~legacy_mask
+    n_new = 0
+    if bool(new.any()):
+        n_new = int(new.sum())
+        legacy_mask = legacy_mask | trips
+    return cov, legacy_mask, n_new
+
+
+def _em_step_mixed(X, F, weights_active, weight_chunks, w, mu, cov,
+                   legacy_mask, active_idx, reg_covar, n_chunk,
+                   legacy_sample_chunk):
+    """
+    One EM iteration on a batch split between the GEMM and legacy kernels.
+
+    Replicates outside `legacy_mask` take the GEMM step (single pass or
+    streamed), rerouted ones the centred legacy step in sample chunks of
+    `legacy_sample_chunk`; the results are scattered back into batch order.
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        Shared data, shape (N, d).
+    F : torch.Tensor or None
+        Quadratic features of `X` (single-pass GEMM path), else None.
+    weights_active : torch.Tensor or None
+        Dense weights of the active replicates, shape (Ra, N), on the
+        single-pass path; None on the streamed path.
+    weight_chunks : _WeightChunks or None
+        The streamed path's weight accessor; None on the single-pass path.
+    w, mu, cov : torch.Tensor
+        Parameters of the active replicates, shapes (Ra, K), (Ra, K, d),
+        (Ra, K, d, d).
+    legacy_mask : torch.Tensor
+        Rerouted replicates among the active ones, shape (Ra,).
+    active_idx : torch.Tensor
+        Indices of the active replicates in the accessor's rows, shape (Ra,).
+    reg_covar : float
+        Covariance floor.
+    n_chunk : int or None
+        Sample chunk of the streamed path; None for the single pass.
+    legacy_sample_chunk : int
+        Sample chunk of the legacy step on rerouted replicates.
+
+    Returns
+    -------
+    ll : torch.Tensor
+        Weighted mean per-sample log-likelihood of the incoming parameters,
+        shape (Ra,).
+    w, mu, cov : torch.Tensor
+        Parameters after the M-step, same shapes as the inputs.
+    """
+    n_active = active_idx.shape[0]
+    d = X.shape[-1]
+    dev = X.device
+    gemm_idx = (~legacy_mask).nonzero(as_tuple=True)[0]
+    legacy_idx = legacy_mask.nonzero(as_tuple=True)[0]
+    ll = torch.empty(n_active, dtype=X.dtype, device=dev)
+    w_next, mu_next, cov_next = (torch.empty_like(w),
+                                 torch.empty_like(mu),
+                                 torch.empty_like(cov))
+    if gemm_idx.numel():
+        if n_chunk is None:
+            resp, llg = _estep_gemm(F, weights_active[gemm_idx],
+                                    w[gemm_idx], mu[gemm_idx],
+                                    cov[gemm_idx])
+            wg, mug, covg = _mstep_gemm(F, resp,
+                                        weights_active[gemm_idx],
+                                        reg_covar, d)
+            del resp
+        else:
+            llg, wg, mug, covg = _em_step_gemm_nchunked(
+                X, weight_chunks, w[gemm_idx], mu[gemm_idx],
+                cov[gemm_idx], reg_covar, n_chunk,
+                rows=active_idx[gemm_idx])
+        ll[gemm_idx] = llg
+        w_next[gemm_idx], mu_next[gemm_idx], cov_next[gemm_idx] = \
+            wg, mug, covg
+    if legacy_idx.numel():
+        chol_l, cov_l = _chol(cov[legacy_idx])
+        logw_l = torch.where(
+            w[legacy_idx] > 0,
+            torch.log(w[legacy_idx].clamp_min(1e-300)),
+            torch.full_like(w[legacy_idx], -torch.inf))
+        if n_chunk is not None:
+            lll, wl, mul, covl = _em_step_nchunked(
+                X, weight_chunks, w[legacy_idx], mu[legacy_idx],
+                chol_l, logw_l, reg_covar, legacy_sample_chunk,
+                rows=active_idx[legacy_idx])
+        else:
+            # dense compacted weights: a view-only accessor whose
+            # totals are the one-pass sums (bitwise the old code)
+            lll, wl, mul, covl = _em_step_nchunked(
+                X, _WeightChunks(weights_active, slice(0, n_active)),
+                w[legacy_idx], mu[legacy_idx], chol_l, logw_l,
+                reg_covar, legacy_sample_chunk, rows=legacy_idx)
+        ll[legacy_idx] = lll
+        w_next[legacy_idx], mu_next[legacy_idx], \
+            cov_next[legacy_idx] = wl, mul, covl
+    w, mu, cov = w_next, mu_next, cov_next
+    return ll, w, mu, cov
+
+
+def _em_iteration(X, F, weights_active, weight_chunks, w, mu, cov,
+                  legacy_mask, active_idx, active_rows, gemm, N, reg_covar,
+                  n_chunk, legacy_sample_chunk):
+    """
+    One EM iteration of the active replicates, on the kernels they need.
+
+    Dispatches to the GEMM step (single pass: `_estep_gemm` and
+    `_mstep_gemm`; streamed: `_em_step_gemm_nchunked`), to the mixed batch
+    (`_em_step_mixed`) when some replicates are rerouted, or to the legacy
+    step (single pass inline; streamed: `_em_step_nchunked`) when the
+    legacy kernels are selected by the environment.
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        Shared data, shape (N, d).
+    F : torch.Tensor or None
+        Quadratic features of `X` (single-pass GEMM path), else None.
+    weights_active : torch.Tensor or None
+        Dense weights of the active replicates, shape (Ra, N), on the
+        single-pass path; None on the streamed path.
+    weight_chunks : _WeightChunks or None
+        The streamed path's weight accessor; None on the single-pass path.
+    w, mu, cov : torch.Tensor
+        Parameters of the active replicates, shapes (Ra, K), (Ra, K, d),
+        (Ra, K, d, d).
+    legacy_mask : torch.Tensor
+        Rerouted replicates among the active ones, shape (Ra,).
+    active_idx : torch.Tensor
+        Indices of the active replicates in the accessor's rows, shape (Ra,).
+    active_rows : torch.Tensor or None
+        `active_idx`, or None while no replicate has converged (all rows).
+    gemm : bool
+        Whether the GEMM kernels are selected.
+    N : int
+        Number of samples.
+    reg_covar : float
+        Covariance floor.
+    n_chunk : int or None
+        Sample chunk of the streamed path; None for the single pass.
+    legacy_sample_chunk : int
+        Sample chunk of the legacy step on rerouted replicates.
+
+    Returns
+    -------
+    ll : torch.Tensor
+        Weighted mean per-sample log-likelihood of the incoming parameters,
+        shape (Ra,).
+    w, mu, cov : torch.Tensor
+        Parameters after the M-step, same shapes as the inputs.
+    """
+    n_active = active_idx.shape[0]
+    if gemm and not bool(legacy_mask.any()):
+        if n_chunk is None:
+            resp, ll = _estep_gemm(F, weights_active, w, mu, cov)
+            w, mu, cov = _mstep_gemm(F, resp, weights_active, reg_covar,
+                                     X.shape[-1])
+            # release the consumed responsibilities as soon as the M-step
+            # has used them (they are the (Ra,N,K) peak)
+            del resp
+        else:
+            ll, w, mu, cov = _em_step_gemm_nchunked(
+                X, weight_chunks, w, mu, cov, reg_covar, n_chunk,
+                rows=active_rows)
+    elif gemm:
+        ll, w, mu, cov = _em_step_mixed(
+            X, F, weights_active, weight_chunks, w, mu, cov,
+            legacy_mask=legacy_mask, active_idx=active_idx,
+            reg_covar=reg_covar, n_chunk=n_chunk,
+            legacy_sample_chunk=legacy_sample_chunk)
+    elif n_chunk is None:
+        chol, cov = _chol(cov)
+        logw = torch.where(w > 0, torch.log(w.clamp_min(1e-300)),
+                           torch.full_like(w, -torch.inf))
+        Xr = X.expand(n_active, N, X.shape[-1])
+        # shapes (n_active,N,K), then (n_active,N)
+        logjoint = logw.unsqueeze(1) + log_gauss(Xr, mu, chol)
+        ll_n = torch.logsumexp(logjoint, dim=-1)
+        resp = torch.exp(logjoint - ll_n.unsqueeze(-1))
+        ll = (weights_active * ll_n).sum(1) / weights_active.sum(1)
+        w, mu, cov = _m_step(Xr, resp, weights_active, reg_covar)
+    else:
+        chol, cov = _chol(cov)
+        logw = torch.where(w > 0, torch.log(w.clamp_min(1e-300)),
+                           torch.full_like(w, -torch.inf))
+        ll, w, mu, cov = _em_step_nchunked(X, weight_chunks, w, mu, chol,
+                                           logw, reg_covar, n_chunk,
+                                           rows=active_rows)
+    return ll, w, mu, cov
+
+
+def _compact_converged(done, ll, active_idx, weights_active, w, mu, cov,
+                       legacy_mask, w_out, mu_out, cov_out, ll_out):
+    """
+    Store the converged replicates' results and drop them from the batch.
+
+    Parameters
+    ----------
+    done : torch.Tensor
+        Converged replicates among the active ones, shape (Ra,) bool.
+    ll : torch.Tensor
+        This iteration's log-likelihoods, shape (Ra,).
+    active_idx : torch.Tensor
+        Indices of the active replicates in the output rows, shape (Ra,).
+    weights_active : torch.Tensor or None
+        Dense weights of the active replicates (single-pass path); None on
+        the streamed path, whose weights are addressed through `active_idx`.
+    w, mu, cov : torch.Tensor
+        Parameters of the active replicates.
+    legacy_mask : torch.Tensor
+        Rerouted replicates among the active ones, shape (Ra,).
+    w_out, mu_out, cov_out, ll_out : torch.Tensor
+        Results for all R replicates; the converged rows are written in
+        place.
+
+    Returns
+    -------
+    active_idx, prev, weights_active, w, mu, cov, legacy_mask
+        The same quantities for the replicates still active; `prev` is
+        their log-likelihood from this iteration.
+    """
+    di = active_idx[done]
+    w_out[di], mu_out[di], cov_out[di] = w[done], mu[done], cov[done]
+    ll_out[di] = ll[done]
+    keep = ~done
+    active_idx, prev = active_idx[keep], ll[keep]
+    if weights_active is not None:
+        weights_active = weights_active[keep]
+    w, mu, cov = w[keep], mu[keep], cov[keep]
+    legacy_mask = legacy_mask[keep]
+    return active_idx, prev, weights_active, w, mu, cov, legacy_mask
+
+
 class EMResult(NamedTuple):
     """
     Result of `_em_fit_core` for one replicate batch.
@@ -1618,6 +1880,11 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
     n_unconverged the replicates that exhausted max_iter and n_rerouted the
     replicates the kernel-reroute detector moved to the legacy kernels
     (each aggregated and warned about once by em_fit).
+
+    Each iteration is: the reroute check (`_check_reroute`, GEMM kernel
+    only), one EM step on the kernels each replicate needs
+    (`_em_iteration`), the convergence test, and the compaction of the
+    converged replicates (`_compact_converged`).
     """
     stream = n_chunk is not None
     if isinstance(s, _WeightChunks):
@@ -1655,104 +1922,19 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
         # active_idx is then the identity
         active_rows = None if n_active == R else active_idx
         if gemm:
-            # the trip check runs on the parameters entering EVERY E-step,
-            # including the first (warm starts can already carry a
-            # collapsed component); the factorisation doubles as the
-            # escalation evidence and its repair is written back
-            _, cov, rep = _chol(cov, return_repaired=True)
-            trips = _reroute_trips(w, mu, cov, repaired=rep)
-            new = trips & ~legacy_mask
-            if bool(new.any()):
-                n_rerouted += int(new.sum())
-                legacy_mask = legacy_mask | trips
-        if gemm and not bool(legacy_mask.any()):
-            if n_chunk is None:
-                resp, ll = _estep_gemm(F, weights_active, w, mu, cov)
-                w, mu, cov = _mstep_gemm(F, resp, weights_active, reg_covar,
-                                         X.shape[-1])
-                # release the consumed responsibilities now: left bound,
-                # they would stay allocated through the next E-step and
-                # double the (R,N,K) peak
-                del resp
-            else:
-                ll, w, mu, cov = _em_step_gemm_nchunked(
-                    X, weight_chunks, w, mu, cov, reg_covar, n_chunk,
-                    rows=active_rows)
-        elif gemm:
-            gemm_idx = (~legacy_mask).nonzero(as_tuple=True)[0]
-            legacy_idx = legacy_mask.nonzero(as_tuple=True)[0]
-            ll = torch.empty(n_active, dtype=X.dtype, device=dev)
-            w_next, mu_next, cov_next = (torch.empty_like(w),
-                                         torch.empty_like(mu),
-                                         torch.empty_like(cov))
-            if gemm_idx.numel():
-                if n_chunk is None:
-                    resp, llg = _estep_gemm(F, weights_active[gemm_idx],
-                                            w[gemm_idx], mu[gemm_idx],
-                                            cov[gemm_idx])
-                    wg, mug, covg = _mstep_gemm(F, resp,
-                                                weights_active[gemm_idx],
-                                                reg_covar, d)
-                    del resp
-                else:
-                    llg, wg, mug, covg = _em_step_gemm_nchunked(
-                        X, weight_chunks, w[gemm_idx], mu[gemm_idx],
-                        cov[gemm_idx], reg_covar, n_chunk,
-                        rows=active_idx[gemm_idx])
-                ll[gemm_idx] = llg
-                w_next[gemm_idx], mu_next[gemm_idx], cov_next[gemm_idx] = \
-                    wg, mug, covg
-            if legacy_idx.numel():
-                chol_l, cov_l = _chol(cov[legacy_idx])
-                logw_l = torch.where(
-                    w[legacy_idx] > 0,
-                    torch.log(w[legacy_idx].clamp_min(1e-300)),
-                    torch.full_like(w[legacy_idx], -torch.inf))
-                if stream:
-                    lll, wl, mul, covl = _em_step_nchunked(
-                        X, weight_chunks, w[legacy_idx], mu[legacy_idx],
-                        chol_l, logw_l, reg_covar, legacy_sample_chunk,
-                        rows=active_idx[legacy_idx])
-                else:
-                    # dense compacted weights: a view-only accessor whose
-                    # totals are the one-pass sums (bitwise the old code)
-                    lll, wl, mul, covl = _em_step_nchunked(
-                        X, _WeightChunks(weights_active, slice(0, n_active)),
-                        w[legacy_idx], mu[legacy_idx], chol_l, logw_l,
-                        reg_covar, legacy_sample_chunk, rows=legacy_idx)
-                ll[legacy_idx] = lll
-                w_next[legacy_idx], mu_next[legacy_idx], \
-                    cov_next[legacy_idx] = wl, mul, covl
-            w, mu, cov = w_next, mu_next, cov_next
-        elif n_chunk is None:
-            chol, cov = _chol(cov)
-            logw = torch.where(w > 0, torch.log(w.clamp_min(1e-300)),
-                               torch.full_like(w, -torch.inf))
-            Xr = X.expand(n_active, N, X.shape[-1])
-            # shapes (n_active,N,K), then (n_active,N)
-            logjoint = logw.unsqueeze(1) + log_gauss(Xr, mu, chol)
-            ll_n = torch.logsumexp(logjoint, dim=-1)
-            resp = torch.exp(logjoint - ll_n.unsqueeze(-1))
-            ll = (weights_active * ll_n).sum(1) / weights_active.sum(1)
-            w, mu, cov = _m_step(Xr, resp, weights_active, reg_covar)
-        else:
-            chol, cov = _chol(cov)
-            logw = torch.where(w > 0, torch.log(w.clamp_min(1e-300)),
-                               torch.full_like(w, -torch.inf))
-            ll, w, mu, cov = _em_step_nchunked(X, weight_chunks, w, mu, chol,
-                                               logw, reg_covar, n_chunk,
-                                               rows=active_rows)
+            cov, legacy_mask, n_new = _check_reroute(w, mu, cov, legacy_mask)
+            n_rerouted += n_new
+        ll, w, mu, cov = _em_iteration(
+            X, F, weights_active, weight_chunks, w, mu, cov,
+            legacy_mask=legacy_mask, active_idx=active_idx,
+            active_rows=active_rows, gemm=gemm, N=N, reg_covar=reg_covar,
+            n_chunk=n_chunk, legacy_sample_chunk=legacy_sample_chunk)
         done = (ll - prev).abs() < threshold_fit
         if done.any():
-            di = active_idx[done]
-            w_out[di], mu_out[di], cov_out[di] = w[done], mu[done], cov[done]
-            ll_out[di] = ll[done]
-            keep = ~done
-            active_idx, prev = active_idx[keep], ll[keep]
-            if not stream:
-                weights_active = weights_active[keep]
-            w, mu, cov = w[keep], mu[keep], cov[keep]
-            legacy_mask = legacy_mask[keep]
+            (active_idx, prev, weights_active, w, mu, cov,
+             legacy_mask) = _compact_converged(
+                done, ll, active_idx, weights_active, w, mu, cov,
+                legacy_mask, w_out, mu_out, cov_out, ll_out)
             if active_idx.shape[0] == 0:
                 return EMResult(w_out, mu_out, cov_out, ll_out, 0, n_rerouted)
         else:
