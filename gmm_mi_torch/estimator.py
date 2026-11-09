@@ -1063,10 +1063,10 @@ def _init_mstep_random(sl, X, seeds, active_k, K, reg_covar, n_chunk):
     lo, hi = sl.start, min(sl.stop, R)
     c = hi - lo
     active_k_chunk = None if active_k is None else active_k[lo:hi]
-    gens = [torch.Generator(device=dev).manual_seed(seeds[lo + j])
-            for j in range(c)]
     if n_chunk is None:
         r = torch.empty(c, N, K, dtype=dt, device=dev)
+        gens = [torch.Generator(device=dev).manual_seed(seeds[lo + j])
+                for j in range(c)]
         _draw_init_blocks(r, gens)
         return _m_step(X.expand(c, N, d),
                        _normalise_responsibilities(r, active_k_chunk),
@@ -1871,8 +1871,9 @@ def _val_ll_core(X, s_val, w, mu, cov, n_chunk=None):
     (a RuntimeWarning per call reports them, as in em_fit). `s_val` is a dense
     (R,N) tensor or a _WeightChunks accessor; either way the weights are
     read per sample chunk and only the rerouted rows are ever gathered."""
-    weight_chunks = (s_val if isinstance(s_val, _WeightChunks)
-          else _WeightChunks(s_val, slice(0, s_val.shape[0]), n_chunk))
+    weight_chunks = (
+        s_val if isinstance(s_val, _WeightChunks)
+        else _WeightChunks(s_val, slice(0, s_val.shape[0]), n_chunk))
     R, N = weight_chunks.shape
     n_rerouted = 0
     if _EM_KERNEL == 'gemm':
