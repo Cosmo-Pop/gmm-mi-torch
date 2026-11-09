@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.8.0 (2026-11-09)
+
+Readability, phase 1 of scoping/readability-proposal-2026-11-04.md (items
+3.1, 3.2 and 3.4, as approved by the RSE on 2026-11-06). Names and layout
+only, no behaviour change: no formula, constant, default, random stream,
+error or warning text moved, and every public function keeps its name,
+arguments and results.
+
+- Named results (3.1): `_em_fit_core` returns an `EMResult` (w, mu, cov,
+  ll, n_unconverged, n_rerouted), `_val_ll_core` a `ValLLResult` (values,
+  n_rerouted), and `estimate_categorical` keeps its per-category fits as
+  `CategoryFit` (w, mu, cov, chol), all `typing.NamedTuple`s; the
+  positional reads (`o[4]`, `o[5]`, `fits[cj][3]`, ...) are field reads.
+  `em_fit` and `val_ll` still return plain tuples / tensors.
+- Bookkeeping names (3.2): inside `_em_fit_core` and `_val_ll_core`,
+  `ai`, `sa`, `leg`, `gi`/`li`, `Ra`, `nl`, `act`, `wc`, `w_n`/`mu_n`/
+  `cov_n` are `active_idx`, `weights_active`, `legacy_mask`,
+  `gemm_idx`/`legacy_idx`, `n_active`, `legacy_sample_chunk`,
+  `active_rows`, `weight_chunks`, `w_next`/`mu_next`/`cov_next`.
+- Hoisted chunk callbacks (3.4): the closures inside `_init_params`,
+  `estimate` and `estimate_categorical` are module-level functions with
+  explicit arguments, bound with `functools.partial`:
+  `_init_mstep_random`, `_draw_init_blocks`,
+  `_normalise_responsibilities`, `_kmeans_assign_stats`,
+  `_hard_assignments`, `_finish_kmeans_params`, `_mc_stage`,
+  `_mc_stage_categorical`, each with a numpydoc docstring and a direct
+  unit test (8 new tests; 133 in all).
+- Two leftovers tidied after the landed read (commit f6f90cd): a
+  continuation line in `_val_ll_core` re-wrapped, and in
+  `_init_mstep_random` the per-replicate generator list built inside the
+  single-pass branch, as in v0.7.2's closure, so the streamed path no
+  longer builds a list it discards.
+
+Proof of no behaviour change, at each of the three item commits: the syntax
+tree of `estimator.py` with docstrings removed matches v0.7.2 under the
+allow-listed renames and moves (the pass's `astcheck_080.py`, kept with
+the gate logs outside the repository), the
+v0.7.0 reference sets compare with 0 mismatches on both kernels, and
+`inspect.signature` of `estimate`, `estimate_categorical`,
+`FittedGMM.__init__`, `em_fit`, `val_ll`, `select_batched` and
+`select_sequential` equals v0.7.2's. Test matrix (passed / skipped): CPU
+fp64 123 / 2, CPU fp64 legacy 121 / 4, CUDA fp32 124 / 1, CUDA fp32
+legacy 122 / 3 at the first two commits (125 tests); 131 / 2, 129 / 4,
+132 / 1, 130 / 3 at the third (133 tests). The walkthrough notebook and
+the multi-GPU example re-run clean.
+
+The landed read by a session that did not write the code
+(scoping/review-findings-readability-phase1-2026-11-09.md, verdict TAG)
+added a check the gates above lack on CUDA: v0.7.2 and the new code run
+side by side in one process and compared with `torch.equal`, on CPU and
+CUDA with both kernels (`_init_params`, `estimate` and
+`estimate_categorical`, float32 and float64, single-pass and streamed):
+0 mismatches. At the tidy commit the same comparison, the reference sets
+and the signatures are again clean, the syntax tree differs from the
+third commit's by the one moved statement, and the matrix is again
+131 / 2, 129 / 4, 132 / 1, 130 / 3.
+
 ## 0.7.2 (2026-10-25)
 
 A small patch under the owner's lightweight process
