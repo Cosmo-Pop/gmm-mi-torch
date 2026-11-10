@@ -2207,16 +2207,29 @@ def test_init_stage_sized_apart_from_em():
     torch.cuda.mem_get_info = lambda dev=None: (10**9, 10**9)
     try:
         X = torch.randn(20000, 2, dtype=torch.float32)
-        E._select_and_fit(X, 'batched', None, 20, 2, 3, 1e-6, 1e-5, 2, 0,
-                          'auto', 'minmax', None, 'valid', 1e-5, 1, None)
+        E._select_and_fit(
+            X,
+            dict(protocol='batched', fixed_components_number=None,
+                 max_components=20, n_folds=2, n_inits=3,
+                 metric_method='valid', threshold_components=1e-5,
+                 patience=1),
+            dict(reg_covar=1e-6, threshold_fit=1e-5, max_iter=2,
+                 em_chunk='auto', n_chunk=None,
+                 init_type='minmax', scale=None, seed=0))
         if torch.cuda.is_available():
             # only a CUDA device resolves 'auto' from the models (and
             # bypasses the floor at this budget); CPU returns 8 for both
             Xc = X.cuda()
             seen.clear()
-            E._select_and_fit(Xc, 'batched', None, 20, 2, 3, 1e-6, 1e-5, 2,
-                              0, 'auto', 'random_responsibilities', None,
-                              'valid', 1e-5, 1, None)
+            E._select_and_fit(
+                Xc,
+                dict(protocol='batched', fixed_components_number=None,
+                     max_components=20, n_folds=2, n_inits=3,
+                     metric_method='valid', threshold_components=1e-5,
+                     patience=1),
+                dict(reg_covar=1e-6, threshold_fit=1e-5, max_iter=2,
+                     em_chunk='auto', n_chunk=None,
+                     init_type='random_responsibilities', scale=None, seed=0))
             if E._EM_KERNEL == 'gemm':
                 assert seen['init'] < seen['em'], seen
             else:
@@ -2224,8 +2237,15 @@ def test_init_stage_sized_apart_from_em():
                 # both land on the floor at this budget
                 assert seen['init'] >= seen['em'], seen
         seen.clear()
-        E._select_and_fit(X, 'batched', None, 3, 2, 3, 1e-6, 1e-5, 2, 0,
-                          5, 'minmax', None, 'valid', 1e-5, 1, None)
+        E._select_and_fit(
+            X,
+            dict(protocol='batched', fixed_components_number=None,
+                 max_components=3, n_folds=2, n_inits=3,
+                 metric_method='valid', threshold_components=1e-5,
+                 patience=1),
+            dict(reg_covar=1e-6, threshold_fit=1e-5, max_iter=2,
+                 em_chunk=5, n_chunk=None,
+                 init_type='minmax', scale=None, seed=0))
         assert seen == {'init': 5, 'em': 5}
     finally:
         E._init_params, E.em_fit, torch.cuda.mem_get_info = saved
@@ -2865,14 +2885,25 @@ def test_init_hopeless_case_raises_readably():
     try:
         X = torch.randn(200_000, 8, device='cuda', dtype=torch.float32)
         with pytest.raises(RuntimeError, match="n_chunk.*'minmax'"):
-            E._select_and_fit(X, 'batched', None, 20, 2, 3, 1e-6, 1e-5, 2, 0,
-                              'auto', 'random_responsibilities', None, 'valid',
-                              1e-5, 1, None)
+            E._select_and_fit(
+                X,
+                dict(protocol='batched', fixed_components_number=None,
+                     max_components=20, n_folds=2, n_inits=3,
+                     metric_method='valid', threshold_components=1e-5,
+                     patience=1),
+                dict(reg_covar=1e-6, threshold_fit=1e-5, max_iter=2,
+                     em_chunk='auto', n_chunk=None,
+                     init_type='random_responsibilities', scale=None, seed=0))
         # with n_chunk the init streams and the same call proceeds
-        k, params = E._select_and_fit(X[:20000], 'batched', None, 2, 2, 1,
-                                      1e-6, 1e-5, 2, 0, 'auto',
-                                      'random_responsibilities', None,
-                                      'valid', 1e-5, 1, 4096)
+        k, params = E._select_and_fit(
+            X[:20000],
+            dict(protocol='batched', fixed_components_number=None,
+                 max_components=2, n_folds=2, n_inits=1,
+                 metric_method='valid', threshold_components=1e-5,
+                 patience=1),
+            dict(reg_covar=1e-6, threshold_fit=1e-5, max_iter=2,
+                 em_chunk='auto', n_chunk=4096,
+                 init_type='random_responsibilities', scale=None, seed=0))
         assert k >= 1
     finally:
         (torch.cuda.mem_get_info, torch.cuda.memory_reserved,
