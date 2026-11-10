@@ -2202,24 +2202,28 @@ def _cv_masks(N, n_folds, n_inits, dtype, seed=42, device='cpu'):
             val.unsqueeze(0).expand(n_inits, n_folds, N))
 
 
-def _cv_fit_for_k(X, K, n_folds, n_inits, reg_covar, threshold_fit, max_iter, seed, em_chunk=8,
-                  init_type='random_responsibilities', scale=None,
-                  n_chunk=None, init_chunk=None):
-    """CV fits for a single k, batched over inits x folds. `init_chunk`
-    (default em_chunk) batches the initialisation stage, whose peak per
-    replicate differs from the EM step's (see _init_bytes_per_replicate)."""
-    g = torch.Generator(device=X.device).manual_seed(seed + K)
+def _cv_fit_for_k(X, K, n_folds, n_inits, fit, init_chunk=None):
+    """CV fits for a single k, batched over inits x folds. `fit` is the
+    dict of fit settings (keys reg_covar, threshold_fit, max_iter,
+    em_chunk, n_chunk, init_type, scale, seed; em_chunk an integer here).
+    `init_chunk` (default fit['em_chunk']) batches the initialisation
+    stage, whose peak per replicate differs from the EM step's (see
+    _init_bytes_per_replicate)."""
+    g = torch.Generator(device=X.device).manual_seed(fit['seed'] + K)
     train, val = _cv_masks(X.shape[0], n_folds, n_inits, X.dtype,
-                           seed=seed + _CV_MASK_SEED_OFFSET, device=X.device)
+                           seed=fit['seed'] + _CV_MASK_SEED_OFFSET,
+                           device=X.device)
     R = n_inits * n_folds
-    w0, mu0, cov0 = _init_params(X, K, R, reg_covar, generator=g,
-                                 init_type=init_type, scale=scale,
-                                 em_chunk=em_chunk if init_chunk is None
-                                 else init_chunk, n_chunk=n_chunk)
-    w, mu, cov, _ = em_fit(X, train, w0, mu0, cov0, reg_covar, threshold_fit, max_iter,
-                           em_chunk=em_chunk, n_chunk=n_chunk)
-    v = val_ll(X, val, w, mu, cov, n_chunk=n_chunk,
-               em_chunk=em_chunk)                         # (I*F,)
+    w0, mu0, cov0 = _init_params(X, K, R, fit['reg_covar'], generator=g,
+                                 init_type=fit['init_type'],
+                                 scale=fit['scale'],
+                                 em_chunk=fit['em_chunk'] if init_chunk is None
+                                 else init_chunk, n_chunk=fit['n_chunk'])
+    w, mu, cov, _ = em_fit(X, train, w0, mu0, cov0, fit['reg_covar'],
+                           fit['threshold_fit'], fit['max_iter'],
+                           em_chunk=fit['em_chunk'], n_chunk=fit['n_chunk'])
+    v = val_ll(X, val, w, mu, cov, n_chunk=fit['n_chunk'],
+               em_chunk=fit['em_chunk'])                  # (I*F,)
     v_if = v.view(n_inits, n_folds)
     metric = v_if.mean(1).max().item()                    # best init's mean fold LL
     best_i = int(v_if.mean(1).argmax())
@@ -2285,12 +2289,13 @@ def select_sequential(X, max_components=20, n_folds=2, n_inits=3,
         error at one replicate per batch).
     """
     _validate_folds(X.shape[0], n_folds)
+    fit = {'reg_covar': reg_covar, 'threshold_fit': threshold_fit,
+           'max_iter': max_iter, 'em_chunk': em_chunk, 'n_chunk': n_chunk,
+           'init_type': init_type, 'scale': scale, 'seed': seed}
     best_metric, best_k, pat, history = -torch.inf, None, 0, {}
     for K in range(1, max_components + 1):
-        metric, params = _cv_fit_for_k(X, K, n_folds, n_inits, reg_covar, threshold_fit,
-                                       max_iter, seed, em_chunk=em_chunk,
-                                       init_type=init_type, scale=scale,
-                                       n_chunk=n_chunk, init_chunk=init_chunk)
+        metric, params = _cv_fit_for_k(X, K, n_folds, n_inits, fit,
+                                       init_chunk=init_chunk)
         history[K] = (metric, params)
         if not math.isfinite(metric):
             # a diverged fit at this k: skip it without consuming patience
@@ -2599,16 +2604,19 @@ def _rank_gaussianise(X, tie_rank='average', generator=None):
     return torch.special.ndtri(p.cpu()).to(dtype=X.dtype, device=X.device)
 
 
-def _select_and_fit(X, protocol, fixed_components_number, max_components,
-                    n_folds, n_inits, reg_covar, threshold_fit, max_iter,
-                    seed, em_chunk, init_type, scale, metric_method,
-                    threshold_components, patience, n_chunk):
+def _select_and_fit(X, selection, fit):
     """Component selection and best CV fit for one dataset.
 
     The single home of the selection pipeline shared by `estimate` and
     `estimate_categorical` (per-category), so the two cannot drift apart:
     chunk sizing, the fixed-k shortcut, protocol dispatch and the
     protocol/metric_method compatibility rules live only here.
+    `selection` and `fit` are the two plain dicts the entry points build
+    from their validated arguments: the selection knobs (protocol,
+    fixed_components_number, max_components, n_folds, n_inits,
+    metric_method, threshold_components, patience) and the fit settings
+    (reg_covar, threshold_fit, max_iter, em_chunk, n_chunk, init_type,
+    scale, seed).
     Returns (k, (w, mu, cov)) with dead components sliced away and k the
     LIVE component count of the returned parameters — the model that is
     actually bootstrapped, MC-integrated and returned — which can be
@@ -2617,40 +2625,42 @@ def _select_and_fit(X, protocol, fixed_components_number, max_components,
     fixed_components_number).
     """
     N, d = X.shape
-    IF = n_inits * n_folds
+    IF = selection['n_inits'] * selection['n_folds']
     # compatibility rules before the fixed-k shortcut: a typo'd
     # metric_method must raise even when selection itself is skipped
-    if protocol == 'sequential':
-        if metric_method != 'valid':
+    if selection['protocol'] == 'sequential':
+        if selection['metric_method'] != 'valid':
             raise ValueError("metric_method is only supported by the "
                              "batched protocol")
-    elif metric_method not in ('valid', 'aic', 'bic'):
+    elif selection['metric_method'] not in ('valid', 'aic', 'bic'):
         raise ValueError(f"metric_method must be one of 'valid', "
-                         f"'aic', 'bic'; found '{metric_method}'")
-    if fixed_components_number is not None:
-        k_sel, r_sel = int(fixed_components_number), IF
-    elif protocol == 'sequential':
-        k_sel, r_sel = max_components, IF
+                         f"'aic', 'bic'; found '{selection['metric_method']}'")
+    if selection['fixed_components_number'] is not None:
+        k_sel, r_sel = int(selection['fixed_components_number']), IF
+    elif selection['protocol'] == 'sequential':
+        k_sel, r_sel = selection['max_components'], IF
     else:
-        k_sel, r_sel = max_components, max_components * IF
+        k_sel, r_sel = (selection['max_components'],
+                        selection['max_components'] * IF)
     em_chunk_sel = _resolve_chunk(
-        em_chunk, r_sel, _em_bytes_per_replicate(N, k_sel, d, X.dtype, n_chunk),
-        X.device, fixed_bytes=_em_fixed_bytes(N, d, X.dtype, n_chunk),
+        fit['em_chunk'], r_sel,
+        _em_bytes_per_replicate(N, k_sel, d, X.dtype, fit['n_chunk']),
+        X.device, fixed_bytes=_em_fixed_bytes(N, d, X.dtype, fit['n_chunk']),
         name='em_chunk')
     # the init stage has its own (larger) model, streamed with n_chunk: an
     # integer em_chunk is honoured as given, 'auto' sizes the two apart
-    init_bytes = _init_bytes_per_replicate(N, k_sel, d, X.dtype, init_type,
-                                           n_chunk)
+    init_bytes = _init_bytes_per_replicate(N, k_sel, d, X.dtype,
+                                           fit['init_type'], fit['n_chunk'])
     if X.device.type == 'cuda':
         # a per-replicate feasibility test, whatever the replicate batching
         # (the model's estimate; it is a conservative envelope)
         free = _cuda_free_bytes(X.device)
         if init_bytes > free:
-            stage = ("EM stage" if init_type == 'minmax'
-                     else f"initialisation stage of init_type='{init_type}'")
+            stage = ("EM stage" if fit['init_type'] == 'minmax'
+                     else f"initialisation stage of init_type='{fit['init_type']}'")
             remedy = ("set n_chunk, which streams the samples (reduction-order "
                       "cost only), or use float32"
-                      if init_type == 'minmax' else
+                      if fit['init_type'] == 'minmax' else
                       "set n_chunk, which streams the initialisation over "
                       "sample chunks (reduction-order cost only), or use "
                       "init_type='minmax', which allocates nothing of this size")
@@ -2660,28 +2670,31 @@ def _select_and_fit(X, protocol, fixed_components_number, max_components,
                 f"k={k_sel}, d={d} — more than the {free / 2**30:.1f} GiB "
                 f"this process can allocate on {X.device}, so not even one "
                 f"replicate fits: {remedy}")
-    init_chunk_sel = _resolve_chunk(em_chunk, r_sel, init_bytes, X.device,
-                                    name='em_chunk')
-    if fixed_components_number is not None:
-        k_best = int(fixed_components_number)
-        _, params = _cv_fit_for_k(X, k_best, n_folds, n_inits, reg_covar,
-                                  threshold_fit, max_iter, seed,
-                                  em_chunk=em_chunk_sel, init_type=init_type,
-                                  scale=scale, n_chunk=n_chunk,
+    init_chunk_sel = _resolve_chunk(fit['em_chunk'], r_sel, init_bytes,
+                                    X.device, name='em_chunk')
+    if selection['fixed_components_number'] is not None:
+        k_best = int(selection['fixed_components_number'])
+        # the CV fit runs at the replicate chunk resolved above
+        _, params = _cv_fit_for_k(X, k_best, selection['n_folds'],
+                                  selection['n_inits'],
+                                  {**fit, 'em_chunk': em_chunk_sel},
                                   init_chunk=init_chunk_sel)
     else:
-        kw = dict(max_components=max_components, n_folds=n_folds,
-                  n_inits=n_inits, reg_covar=reg_covar,
-                  threshold_fit=threshold_fit, max_iter=max_iter, seed=seed,
-                  threshold_components=threshold_components,
-                  em_chunk=em_chunk_sel, init_type=init_type, scale=scale,
-                  n_chunk=n_chunk, init_chunk=init_chunk_sel)
-        if protocol == 'sequential':
+        kw = dict(max_components=selection['max_components'],
+                  n_folds=selection['n_folds'],
+                  n_inits=selection['n_inits'], reg_covar=fit['reg_covar'],
+                  threshold_fit=fit['threshold_fit'],
+                  max_iter=fit['max_iter'], seed=fit['seed'],
+                  threshold_components=selection['threshold_components'],
+                  em_chunk=em_chunk_sel, init_type=fit['init_type'],
+                  scale=fit['scale'], n_chunk=fit['n_chunk'],
+                  init_chunk=init_chunk_sel)
+        if selection['protocol'] == 'sequential':
             sel = select_sequential
-            kw['patience'] = patience
+            kw['patience'] = selection['patience']
         else:
             sel = select_batched
-            kw['metric_method'] = metric_method
+            kw['metric_method'] = selection['metric_method']
         k_best, params, _ = sel(X, **kw)
     # the batched protocol pads parameters to K=max_components, and any
     # protocol can leave dead components in the best CV fit; a zero-weight
@@ -2692,7 +2705,7 @@ def _select_and_fit(X, protocol, fixed_components_number, max_components,
     w1, mu1, cov1 = params
     alive = w1 > 0
     k_live = int(alive.sum())
-    if fixed_components_number is not None and k_live != k_best:
+    if selection['fixed_components_number'] is not None and k_live != k_best:
         warnings.warn(
             f"fixed_components_number={k_best}: {k_best - k_live} "
             f"component(s) died during the CV fit, so the model that is "
@@ -3262,11 +3275,17 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
             f"(a column's scale lies beyond the working dtype's range); "
             f"use dtype=torch.float64")
     N, d = X.shape
-    k_best, (w1, mu1, cov1) = _select_and_fit(
-        X, protocol, fixed_components_number, max_components, n_folds,
-        n_inits, reg_covar, threshold_fit, max_iter, seed, em_chunk,
-        init_type, scale, metric_method, threshold_components, patience,
-        n_chunk)
+    # the hyperparameters the selection stage reads, as two plain dicts
+    selection = {'protocol': protocol,
+                 'fixed_components_number': fixed_components_number,
+                 'max_components': max_components, 'n_folds': n_folds,
+                 'n_inits': n_inits, 'metric_method': metric_method,
+                 'threshold_components': threshold_components,
+                 'patience': patience}
+    fit = {'reg_covar': reg_covar, 'threshold_fit': threshold_fit,
+           'max_iter': max_iter, 'em_chunk': em_chunk, 'n_chunk': n_chunk,
+           'init_type': init_type, 'scale': scale, 'seed': seed}
+    k_best, (w1, mu1, cov1) = _select_and_fit(X, selection, fit)
 
     B = max(n_bootstrap, 1)
     K = w1.shape[0]
@@ -3292,10 +3311,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         chol_s, cov_s = _chol(covf[0][alive].unsqueeze(0))
         D = col_std.to(device=device)                 # float64 scales
         mean64 = col_mean.to(device=device)
-        fit = FittedGMM(wf[0][alive].double(),
-                        muf[0][alive].double() * D + mean64,
-                        cov_s[0].double() * (D[:, None] * D[None, :]),
-                        chol=chol_s[0].double() * D[:, None])
+        fitted = FittedGMM(wf[0][alive].double(),
+                           muf[0][alive].double() * D + mean64,
+                           cov_s[0].double() * (D[:, None] * D[None, :]),
+                           chol=chol_s[0].double() * D[:, None])
     g = torch.Generator(device=X.device).manual_seed(seed + 10_000)
     if n_bootstrap >= 1:
         s = _bootstrap_counts(N, B, X.dtype, X.device, g)
@@ -3319,7 +3338,7 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     if return_k:
         out += (k_best,)
     if return_fit:
-        out += (fit,)
+        out += (fitted,)
     return out
 
 
@@ -3592,6 +3611,16 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         raise ValueError("category_weights must be 'empirical' or 'uniform'")
     logpi = torch.log(pi)
     B = max(n_bootstrap, 1)
+    # the hyperparameters the selection stage reads, as two plain dicts
+    selection = {'protocol': protocol,
+                 'fixed_components_number': fixed_components_number,
+                 'max_components': max_components, 'n_folds': n_folds,
+                 'n_inits': n_inits, 'metric_method': metric_method,
+                 'threshold_components': threshold_components,
+                 'patience': patience}
+    fit = {'reg_covar': reg_covar, 'threshold_fit': threshold_fit,
+           'max_iter': max_iter, 'em_chunk': em_chunk, 'n_chunk': n_chunk,
+           'init_type': init_type, 'scale': scale, 'seed': seed}
     fits, k_bests = [], []
     for ci in range(C):
         Xc = X[Y == cats[ci]]
@@ -3603,11 +3632,9 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         # data, so it is documented rather than re-seeded under the
         # validated init/bootstrap offsets
         seed_c = seed + 997 * ci
-        k_c, (w1, mu1, cov1) = _select_and_fit(
-            Xc, protocol, fixed_components_number, max_components, n_folds,
-            n_inits, reg_covar, threshold_fit, max_iter, seed_c, em_chunk,
-            init_type, scale, metric_method, threshold_components, patience,
-            n_chunk)
+        # each category's selection runs on its own seed
+        k_c, (w1, mu1, cov1) = _select_and_fit(Xc, selection,
+                                               {**fit, 'seed': seed_c})
         k_bests.append(k_c)
         g = torch.Generator(device=X.device).manual_seed(seed_c + 10_000)
         if n_bootstrap >= 1:
