@@ -132,9 +132,8 @@ def _integrand_KL_forward(pts, w, mu, cov, chol):
     """
     Integrand of KL[p(x) || p(y)] between the two 1-D marginals.
 
-    KL[p(x)||p(y)] between the two 1D marginals (GMM-MI estimate_KL_MC):
-    E_{x~p(x)}[log p_x(x) - log p_y(x)], with x the first column of the
-    joint samples.
+    As in GMM-MI's estimate_KL_MC: E_{x~p(x)}[log p_x(x) - log p_y(x)], with x
+    the first column of the joint samples.
 
     Parameters
     ----------
@@ -161,7 +160,7 @@ def _integrand_KL_reverse(pts, w, mu, cov, chol):
     """
     Integrand of KL[p(y) || p(x)] between the two 1-D marginals.
 
-    KL[p(y)||p(x)]: E_{y~p(y)}[log p_y(y) - log p_x(y)].
+    E_{y~p(y)}[log p_y(y) - log p_x(y)].
 
     Parameters
     ----------
@@ -540,9 +539,6 @@ class FittedGMM:
         """
         Draw `n_samples` from the mixture.
 
-        Draw `n_samples` from the mixture; returns a (n_samples, d) numpy
-        array.
-
         Parameters
         ----------
         n_samples : int
@@ -565,10 +561,9 @@ class FittedGMM:
         """
         Mixture log-density at X.
 
-        Mixture log-density at X of shape (n, d); returns a (n,) numpy
-        array. A 1-D X is n points of a 1-D model, or one point of a d-D
-        model (sklearn rejects 1-D input); any other shape raises a
-        ValueError naming the expected one.
+        A 1-D X is n points of a 1-D model, or one point of a d-D model
+        (sklearn rejects 1-D input); any other shape raises a ValueError naming
+        the expected one.
 
         Parameters
         ----------
@@ -1100,18 +1095,18 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         would otherwise make every NaN its own category.
     protocol : {'batched', 'sequential'}, default='batched'
         As in `estimate`, applied per category.
-    n_bootstrap, mc_samples : int
+    n_bootstrap, mc_samples : int, optional
         As in `estimate`, applied per category.
     max_components : int, default=10
         Largest number of components considered per category's 1D fit.
-    n_folds, n_inits : int
+    n_folds, n_inits : int, optional
         As in `estimate`, applied per category.
     reg_covar : float, default=1e-6
         As in `estimate`; X is standardised once over all categories, so the
         floor is relative to the variance of X as a whole.
     threshold_fit : float, default=1e-5
         As in `estimate`.
-    max_iter, seed : int
+    max_iter, seed : int, optional
         As in `estimate`.
     return_k : bool, default=False
         If True, also return the selected component count per category.
@@ -1119,7 +1114,7 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         As in `estimate`.
     dtype : torch.dtype, default=torch.float64
         As in `estimate`.
-    em_chunk, mc_chunk : int or 'auto'
+    em_chunk, mc_chunk : int or 'auto', optional
         As in `estimate`.
     init_type : str, default='random_responsibilities'
         As in `estimate`, applied per category.

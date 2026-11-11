@@ -17,10 +17,9 @@ def _cuda_free_bytes(dev):
     """
     Bytes this process can still allocate on a CUDA device.
 
-    Bytes this process can still allocate on `dev`: the driver's free
-    memory plus torch's cached-but-unallocated blocks (ours to reuse),
-    capped by torch.cuda.set_per_process_memory_fraction when one is set
-    (the allocator then refuses anything above fraction x total, so sizing
+    The driver's free memory plus torch's cached-but-unallocated blocks (ours
+    to reuse), capped by torch.cuda.set_per_process_memory_fraction when one is
+    set (the allocator then refuses anything above fraction x total, so sizing
     against the device's free memory would open every stage with a
     guaranteed-OOM attempt).
 
@@ -52,8 +51,8 @@ def _auto_chunk(n_items, bytes_per_item, device, default=_AUTO_CHUNK_CPU_DEFAULT
     """
     Chunk size for `n_items` replicates costing `bytes_per_item` each.
 
-    Chunk size for `n_items` replicates costing `bytes_per_item` each,
-    after `fixed_bytes` the stage allocates once regardless of the chunk.
+    The budget is what remains after `fixed_bytes`, which the stage allocates
+    once regardless of the chunk.
 
     `default` on CPU; on CUDA, as many items as fit in a fraction of the
     allocatable device memory (at least 1), capped at n_items.
@@ -91,8 +90,8 @@ def _resolve_chunk(value, n_items, bytes_per_item, device, fixed_bytes=0,
     """
     Turn an `em_chunk` or `mc_chunk` argument into an int.
 
-    Turn an `em_chunk` / `mc_chunk` argument ('auto' or int) into an int,
-    sizing 'auto' from the stage's memory model.
+    'auto' is sized from the stage's memory model; an int is checked and
+    returned.
 
     Parameters
     ----------
@@ -125,8 +124,7 @@ def _em_bytes_per_replicate(N, K, d, dtype, n_chunk=None):
     """
     Peak memory per EM replicate.
 
-    Peak memory per EM replicate, from the measured model (design notes:
-    _AUTO_CHUNK_MEM_FRACTION).
+    From the measured model (design notes: _AUTO_CHUNK_MEM_FRACTION).
 
     Parameters
     ----------
@@ -159,9 +157,8 @@ def _em_fixed_bytes(N, d, dtype, n_chunk=None):
     """
     Memory an EM or val_ll stage allocates once, whatever the replicate chunk.
 
-    What an EM/val_ll stage allocates once, whatever the replicate
-    chunk: the (N_eff, q) quadratic features of the GEMM path (the whole
-    (N, q) in the single-pass path, one sample chunk's in the streamed).
+    The (N_eff, q) quadratic features of the GEMM path (the whole (N, q) in the
+    single-pass path, one sample chunk's in the streamed).
 
     Parameters
     ----------
@@ -191,9 +188,8 @@ def _init_sample_chunk(N, n_chunk=None):
     """
     Sample chunk of the streamed initialisation.
 
-    Sample chunk of the streamed initialisation: n_chunk rounded down to
-    a whole number of draw blocks (at least one block), capped at N; None
-    (single pass) is the full N.
+    n_chunk rounded down to a whole number of draw blocks (at least one block),
+    capped at N; None (single pass) is the full N.
 
     Parameters
     ----------
@@ -216,11 +212,9 @@ def _init_bytes_per_replicate(N, K, d, dtype, init_type, n_chunk=None):
     """
     Peak memory per replicate of the initialisation stage.
 
-    Peak memory per replicate of the initialisation stage: the default
-    and k-means inits run the broadcast M-step / assignment statistics over
-    the full N without n_chunk, and over sample chunks of
-    _init_sample_chunk(N, n_chunk) with it; minmax allocates nothing of
-    note.
+    The default and k-means inits run the broadcast M-step / assignment
+    statistics over the full N without n_chunk, and over sample chunks of
+    _init_sample_chunk(N, n_chunk) with it; minmax allocates nothing of note.
 
     Parameters
     ----------
@@ -255,8 +249,7 @@ def _mc_bytes_per_replicate(mc_samples, K, d, dtype):
     """
     Peak memory per Monte Carlo integration replicate.
 
-    Peak memory per MC-integration replicate, from the model in the
-    design notes (_AUTO_CHUNK_MEM_FRACTION).
+    From the model in the design notes (_AUTO_CHUNK_MEM_FRACTION).
 
     Parameters
     ----------
@@ -282,8 +275,7 @@ def _n_rows(s):
     """
     Replicate count of a per-replicate weight tensor.
 
-    Replicate count of a per-replicate weight tensor whose leading dims
-    (all but the sample axis) form the replicate axis.
+    Its leading dims (all but the sample axis) form the replicate axis.
 
     Parameters
     ----------
@@ -302,11 +294,10 @@ def _rows(s, sl):
     """
     Rows `sl` of per-replicate weights, along the flattened leading dims.
 
-    Rows [sl] of the per-replicate weights `s` along its flattened
-    leading dims. A 2-D `s` is sliced (a view of the caller's tensor); an
-    N-D `s` — typically an expand() view whose repeat structure (CV masks
-    tiled over inits and candidate k) must never be materialised — is
-    gathered into one (chunk, N) copy per replicate chunk.
+    A 2-D `s` is sliced (a view of the caller's tensor); an N-D `s` — typically
+    an expand() view whose repeat structure (CV masks tiled over inits and
+    candidate k) must never be materialised — is gathered into one (chunk, N)
+    copy per replicate chunk.
 
     Parameters
     ----------
@@ -426,9 +417,8 @@ def _as_weight_chunks(s, n_chunk=None):
     """
     Accept a dense weight tensor where a `_WeightChunks` accessor is expected.
 
-    Accept a dense (R, N) tensor where a _WeightChunks accessor is
-    expected (direct callers of the streamed steps): a view-only accessor
-    over all of its rows.
+    For direct callers of the streamed steps: a dense (R, N) tensor becomes a
+    view-only accessor over all of its rows.
 
     Parameters
     ----------
@@ -451,11 +441,10 @@ def _legacy_sample_chunk(N, K, d, dtype, n_chunk=None):
     """
     Sample chunk for the centred legacy kernels on rerouted replicates.
 
-    Sample chunk for the centred legacy kernels on rerouted replicates:
-    their (4d+4)K-per-sample broadcast peak must fit three quarters of the
-    GEMM budget the replicate chunk was sized with (the partition's
-    chunk-sized gathers take the rest). Shared by em_fit and val_ll so the
-    two cannot drift apart.
+    Their (4d+4)K-per-sample broadcast peak must fit three quarters of the GEMM
+    budget the replicate chunk was sized with (the partition's chunk-sized
+    gathers take the rest). Shared by em_fit and val_ll so the two cannot drift
+    apart.
 
     Parameters
     ----------
@@ -483,11 +472,11 @@ def _run_chunked(n, chunk, fn):
     """
     Apply a callback over replicate chunks, halving the chunk on CUDA OOM.
 
-    Apply fn(slice) over [0, n) in chunks of `chunk`, halving the chunk
-    and retrying on a CUDA out-of-memory error. Results do not depend on
-    the chunk on CPU (bitwise, with one float32 exception: see
-    docs/estimate_notes.md, "Reproducibility"), so there the retry changes
-    only peak memory; on CUDA they move at reduction order.
+    fn(slice) runs over [0, n) in chunks of `chunk`; a CUDA out-of-memory error
+    halves the chunk and retries. Results do not depend on the chunk on CPU
+    (bitwise, with one float32 exception: see docs/estimate_notes.md,
+    "Reproducibility"), so there the retry changes only peak memory; on CUDA
+    they move at reduction order.
 
     Parameters
     ----------
