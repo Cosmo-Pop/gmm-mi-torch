@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.9.0 (2026-11-11)
+
+Readability, phase 2 of scoping/readability-proposal-2026-11-04.md (items
+3.3 and 3.5, with the RSE's ruling of 2026-11-06 for 3.5). Names and layout
+only, no behaviour change: no formula, constant, default, random stream,
+error or warning text moved, and every public function keeps its name,
+arguments and results.
+
+- The EM iteration untangled (3.3): the loop of `_em_fit_core` now reads as
+  its steps, with each former branch body in a function of its own:
+  `_check_reroute` (the kernel-reroute check, GEMM kernel), `_em_iteration`
+  (one EM iteration, dispatching to the existing step kernels),
+  `_em_step_mixed` (a batch split between the GEMM and legacy kernels) and
+  `_compact_converged` (store the converged replicates, drop them from the
+  batch). The arithmetic lines moved verbatim, in the same order.
+- The threaded hyperparameters as two plain dicts (3.5): `estimate` and
+  `estimate_categorical` build `selection` (protocol,
+  fixed_components_number, max_components, n_folds, n_inits,
+  metric_method, threshold_components, patience) and `fit` (reg_covar,
+  threshold_fit, max_iter, em_chunk, n_chunk, init_type, scale, seed) once;
+  `_select_and_fit(X, selection, fit)` (formerly 17 positional arguments)
+  and `_cv_fit_for_k(X, K, n_folds, n_inits, fit, init_chunk=None)`
+  (formerly 13) read them. The keyword arguments of every public function
+  are unchanged; code that called the two private helpers directly must
+  pass the dicts.
+
+Proof of no behaviour change, at each of the two commits: the syntax tree
+of `estimator.py` with docstrings removed matches v0.8.0 piecewise (each
+new function against the block it came from, the dict reads mapped back to
+the old names), with every remaining difference on an exact allow-list and
+a planted-edit negative test; the v0.7.0 reference sets compare with 0
+mismatches on both kernels; the earlier releases (v0.7.2, which is bitwise
+v0.8.0, and v0.8.0 itself) and the new code, run side by side and
+compared with `torch.equal` on CPU and CUDA with both kernels (`em_fit`
+with mixed and all-legacy batches, `val_ll`, the selection protocols,
+`_init_params`, `estimate`, `estimate_categorical`, and every warning's
+text), agree with 0 mismatches; `inspect.signature` of the seven public
+callables equals v0.8.0's. Test matrix (passed / skipped, 133 tests): CPU
+fp64 131 / 2, CPU fp64 legacy 129 / 4, CUDA fp32 132 / 1, CUDA fp32
+legacy 130 / 3 at both commits. The walkthrough notebook and the
+multi-GPU example re-run clean.
+
+The landed read by a session that did not write the code
+(scoping/review-findings-readability-phase2-2026-11-10.md, verdict TAG)
+checked the commits with its own syntax-tree script, recorded every
+argument reaching the fits through `estimate` and `estimate_categorical`
+with all sixteen hyperparameters set away from their defaults (old and new
+records equal), and compared v0.8.0 with the new code bitwise on CUDA with
+both kernels (0 mismatches). It found no behaviour change; the one claim it
+corrected (peak memory moves by a few kilobytes in either direction, not
+"can only fall") is fixed in the pass's record.
+
 ## 0.8.0 (2026-11-09)
 
 Readability, phase 1 of scoping/readability-proposal-2026-11-04.md (items
