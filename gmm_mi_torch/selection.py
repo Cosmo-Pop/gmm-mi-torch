@@ -25,14 +25,33 @@ _SMALL_SAMPLE_WARN = 100
 
 
 def _validate_folds(N, n_folds, what='X', d=None, stacklevel=4):
-    """Reject CV settings that produce empty or degenerate folds up front:
+    """
+    Reject CV settings that produce empty or degenerate folds.
+
+    Reject CV settings that produce empty or degenerate folds up front:
     they otherwise surface as 0/0 NaN metrics and far-away index errors.
 
     With `d` given, also reject sizes whose smallest TRAINING fold holds
     fewer than d+1 samples — a full covariance cannot be estimated from
     them, every component sits on the reg_covar floor, and the estimate
     is meaningless (MI ~ 5-6 nats from N=2-3 points) — and warn below
-    _SMALL_SAMPLE_WARN samples."""
+    _SMALL_SAMPLE_WARN samples.
+
+    Parameters
+    ----------
+    N : int
+        Number of samples.
+    n_folds : int
+        Number of CV folds.
+    what : str, default='X'
+        How the error and warning messages name the data.
+    d : int, optional
+        Number of variables; enables the training-fold size check and the
+        small-sample warning.
+    stacklevel : int, default=4
+        Stack level of the small-sample warning, so it points at the
+        caller of the public entry point.
+    """
     N, n_folds = int(N), int(n_folds)
     if n_folds < 2:
         raise ValueError(f"n_folds must be >= 2 (each fit needs a held-out "
@@ -59,9 +78,23 @@ def _validate_folds(N, n_folds, what='X', d=None, stacklevel=4):
 
 
 def _validate_device(device):
-    """Resolve `device` to a torch.device and fail at entry, under the
+    """
+    Resolve and check the `device` argument at entry.
+
+    Resolve `device` to a torch.device and fail at entry, under the
     argument's own name, for strings torch cannot parse or CUDA devices
-    that are not there — instead of deep inside the first transfer."""
+    that are not there — instead of deep inside the first transfer.
+
+    Parameters
+    ----------
+    device : str or torch.device
+        The argument as given.
+
+    Returns
+    -------
+    torch.device
+        The resolved device.
+    """
     try:
         dev = torch.device(device)
     except (RuntimeError, TypeError) as e:
@@ -85,7 +118,10 @@ def _validate_device(device):
 
 
 def _cv_masks(N, n_folds, n_inits, dtype, seed=42, device='cpu'):
-    """0/1 train masks and val masks, shape (n_inits, n_folds, N), as
+    """
+    Train and validation masks of the CV folds, as expand() views.
+
+    0/1 train masks and val masks, shape (n_inits, n_folds, N), as
     expand() views over the inits of one (n_folds, N) mask pair living on
     `device` — em_fit/val_ll gather the rows each replicate chunk needs, so
     the tiling over inits (and over candidate k in select_batched) costs
@@ -94,7 +130,28 @@ def _cv_masks(N, n_folds, n_inits, dtype, seed=42, device='cpu'):
 
     Factories are pinned to the CPU: the masks are built with a CPU
     generator, and torch.set_default_device('cuda') must not reroute them
-    mid-construction."""
+    mid-construction.
+
+    Parameters
+    ----------
+    N : int
+        Number of samples.
+    n_folds : int
+        Number of folds.
+    n_inits : int
+        Number of initialisations the masks are tiled over.
+    dtype : torch.dtype
+        Dtype of the masks.
+    seed : int, default=42
+        Seed of the fold permutation.
+    device : str or torch.device, default='cpu'
+        Device of the masks.
+
+    Returns
+    -------
+    train, val : torch.Tensor of shape (n_inits, n_folds, N)
+        The masks, expand() views of one (n_folds, N) pair.
+    """
     g = torch.Generator().manual_seed(seed)
     perm = torch.randperm(N, generator=g, device='cpu')
     fold_id = torch.zeros(N, dtype=torch.long, device='cpu')
@@ -108,12 +165,38 @@ def _cv_masks(N, n_folds, n_inits, dtype, seed=42, device='cpu'):
 
 
 def _cv_fit_for_k(X, K, n_folds, n_inits, fit, init_chunk=None):
-    """CV fits for a single k, batched over inits x folds. `fit` is the
+    """
+    CV fits for a single k, batched over inits x folds.
+
+    CV fits for a single k, batched over inits x folds. `fit` is the
     dict of fit settings (keys reg_covar, threshold_fit, max_iter,
     em_chunk, n_chunk, init_type, scale, seed; em_chunk an integer here).
     `init_chunk` (default fit['em_chunk']) batches the initialisation
     stage, whose peak per replicate differs from the EM step's (see
-    _init_bytes_per_replicate)."""
+    _init_bytes_per_replicate).
+
+    Parameters
+    ----------
+    X : torch.Tensor of shape (N, d)
+        The data.
+    K : int
+        Number of components.
+    n_folds : int
+        Number of CV folds.
+    n_inits : int
+        Number of initialisations.
+    fit : dict
+        The fit settings, as described above.
+    init_chunk : int, optional
+        Replicates per batch of the initialisation stage.
+
+    Returns
+    -------
+    metric : float
+        The best init's mean validation log-likelihood over the folds.
+    params : tuple of torch.Tensor
+        (w, mu, cov) of the best fold of the best init.
+    """
     g = torch.Generator(device=X.device).manual_seed(fit['seed'] + K)
     train, val = _cv_masks(X.shape[0], n_folds, n_inits, X.dtype,
                            seed=fit['seed'] + _CV_MASK_SEED_OFFSET,
@@ -142,7 +225,8 @@ def select_sequential(X, max_components=20, n_folds=2, n_inits=3,
                       max_iter=500, seed=0, em_chunk=8,
                       init_type='random_responsibilities', scale=None,
                       n_chunk=None, init_chunk=None):
-    """Select the number of components by GMM-MI's sequential protocol.
+    """
+    Select the number of components by GMM-MI's sequential protocol.
 
     Components are added one at a time; the search stops when the validation
     metric fails to improve by `threshold_components` for `patience`
@@ -159,15 +243,25 @@ def select_sequential(X, max_components=20, n_folds=2, n_inits=3,
         The data, already on the target device/dtype.
     max_components : int, default=20
         Largest k tried if the early stop never triggers.
+    n_folds, n_inits : int
+        As in `estimate`.
     threshold_components : float, default=1e-5
         Minimum metric improvement that counts as progress.
     patience : int, default=1
         Number of consecutive non-improving k values tolerated before
         stopping; the counter resets on every improvement, and the selected
         k is the best-scoring one.
-    n_folds, n_inits, reg_covar, threshold_fit, max_iter, seed
+    reg_covar, threshold_fit : float
         As in `estimate`.
-    em_chunk, init_type, scale, n_chunk
+    max_iter, seed : int
+        As in `estimate`.
+    em_chunk : int, default=8
+        As in `estimate`, an integer here.
+    init_type : str, default='random_responsibilities'
+        As in `estimate`.
+    scale : float, optional
+        As in `estimate`.
+    n_chunk : int, optional
         As in `estimate`.
     init_chunk : int, optional
         Replicates per batch for the initialisation stage (default
@@ -227,7 +321,8 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
                    reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, seed=0, em_chunk=8,
                    init_type='random_responsibilities', scale=None,
                    metric_method='valid', n_chunk=None, init_chunk=None):
-    """Select the number of components with all candidate k fitted at once.
+    """
+    Select the number of components with all candidate k fitted at once.
 
     Every k = 1..max_components (times inits and folds) is fitted as a single
     batched EM via dead-component padding, so no k's evaluation depends on
@@ -240,18 +335,28 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
         The data, already on the target device/dtype.
     max_components : int, default=20
         Largest k fitted; all are paid for unconditionally.
+    n_folds, n_inits : int
+        As in `estimate`.
     threshold_components : float, default=1e-5
         Parsimony rule for metric_method='valid': the smallest k whose
         validation log-likelihood is within this threshold of the best wins,
         so noise-level improvements do not inflate k.
+    reg_covar, threshold_fit : float
+        As in `estimate`.
+    max_iter, seed : int
+        As in `estimate`.
+    em_chunk : int, default=8
+        As in `estimate`, an integer here.
+    init_type : str, default='random_responsibilities'
+        As in `estimate`.
+    scale : float, optional
+        As in `estimate`.
     metric_method : {'valid', 'aic', 'bic'}, default='valid'
         'valid' scores held-out log-likelihood with the parsimony rule.
         'aic'/'bic' follow GMM-MI: each k's best CV parameters are refit on
         the full data, the criterion is computed on it, and the minimising k
         wins; the returned parameters are still the CV-selected ones.
-    n_folds, n_inits, reg_covar, threshold_fit, max_iter, seed
-        As in `estimate`.
-    em_chunk, init_type, scale, n_chunk
+    n_chunk : int, optional
         As in `estimate`.
     init_chunk : int, optional
         Replicates per batch for the initialisation stage (default

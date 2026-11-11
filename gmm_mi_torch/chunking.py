@@ -14,12 +14,26 @@ from .precision import _check_chunk_arg
 
 
 def _cuda_free_bytes(dev):
-    """Bytes this process can still allocate on `dev`: the driver's free
+    """
+    Bytes this process can still allocate on a CUDA device.
+
+    Bytes this process can still allocate on `dev`: the driver's free
     memory plus torch's cached-but-unallocated blocks (ours to reuse),
     capped by torch.cuda.set_per_process_memory_fraction when one is set
     (the allocator then refuses anything above fraction x total, so sizing
     against the device's free memory would open every stage with a
-    guaranteed-OOM attempt)."""
+    guaranteed-OOM attempt).
+
+    Parameters
+    ----------
+    dev : torch.device or str
+        A CUDA device.
+
+    Returns
+    -------
+    int
+        The allocatable bytes, at least 0.
+    """
     dev = torch.device(dev)
     free, total = torch.cuda.mem_get_info(dev)
     allocated = torch.cuda.memory_allocated(dev)
@@ -35,11 +49,32 @@ def _cuda_free_bytes(dev):
 
 def _auto_chunk(n_items, bytes_per_item, device, default=_AUTO_CHUNK_CPU_DEFAULT,
                 fixed_bytes=0):
-    """Chunk size for `n_items` replicates costing `bytes_per_item` each,
+    """
+    Chunk size for `n_items` replicates costing `bytes_per_item` each.
+
+    Chunk size for `n_items` replicates costing `bytes_per_item` each,
     after `fixed_bytes` the stage allocates once regardless of the chunk.
 
     `default` on CPU; on CUDA, as many items as fit in a fraction of the
     allocatable device memory (at least 1), capped at n_items.
+
+    Parameters
+    ----------
+    n_items : int
+        Number of replicates in the stage.
+    bytes_per_item : int
+        Peak memory per replicate, from the stage's memory model.
+    device : torch.device or str
+        Device the stage runs on.
+    default : int, default=_AUTO_CHUNK_CPU_DEFAULT
+        The chunk on CPU.
+    fixed_bytes : int, default=0
+        Memory the stage allocates once, whatever the chunk.
+
+    Returns
+    -------
+    int
+        Replicates per batch, between 1 and `n_items`.
     """
     dev = torch.device(device)
     if dev.type != 'cuda':
@@ -53,8 +88,32 @@ def _auto_chunk(n_items, bytes_per_item, device, default=_AUTO_CHUNK_CPU_DEFAULT
 
 def _resolve_chunk(value, n_items, bytes_per_item, device, fixed_bytes=0,
                    name='em_chunk'):
-    """Turn an `em_chunk` / `mc_chunk` argument ('auto' or int) into an int,
-    sizing 'auto' from the stage's memory model."""
+    """
+    Turn an `em_chunk` or `mc_chunk` argument into an int.
+
+    Turn an `em_chunk` / `mc_chunk` argument ('auto' or int) into an int,
+    sizing 'auto' from the stage's memory model.
+
+    Parameters
+    ----------
+    value : int or str
+        The argument as given: 'auto' or a positive integer.
+    n_items : int
+        Number of replicates in the stage.
+    bytes_per_item : int
+        Peak memory per replicate, from the stage's memory model.
+    device : torch.device or str
+        Device the stage runs on.
+    fixed_bytes : int, default=0
+        Memory the stage allocates once, whatever the chunk.
+    name : str, default='em_chunk'
+        The argument's name, used in error messages.
+
+    Returns
+    -------
+    int
+        Replicates per batch.
+    """
     value = _check_chunk_arg(value, name)
     if isinstance(value, str):
         return _auto_chunk(n_items, bytes_per_item, device,
@@ -63,7 +122,30 @@ def _resolve_chunk(value, n_items, bytes_per_item, device, fixed_bytes=0,
 
 
 def _em_bytes_per_replicate(N, K, d, dtype, n_chunk=None):
-    """Peak memory per EM replicate, from the measured model above."""
+    """
+    Peak memory per EM replicate.
+
+    Peak memory per EM replicate, from the measured model (design notes:
+    _AUTO_CHUNK_MEM_FRACTION).
+
+    Parameters
+    ----------
+    N : int
+        Number of samples.
+    K : int
+        Number of components.
+    d : int
+        Number of variables.
+    dtype : torch.dtype
+        Working dtype.
+    n_chunk : int, optional
+        Sample chunk of the streamed path; None for the single pass.
+
+    Returns
+    -------
+    int
+        Bytes per replicate, for the kernels selected at import.
+    """
     n_eff = N if n_chunk is None else min(N, int(n_chunk))
     if _EM_KERNEL == 'gemm':
         q = d + d * (d + 1) // 2
@@ -74,9 +156,29 @@ def _em_bytes_per_replicate(N, K, d, dtype, n_chunk=None):
 
 
 def _em_fixed_bytes(N, d, dtype, n_chunk=None):
-    """What an EM/val_ll stage allocates once, whatever the replicate
+    """
+    Memory an EM or val_ll stage allocates once, whatever the replicate chunk.
+
+    What an EM/val_ll stage allocates once, whatever the replicate
     chunk: the (N_eff, q) quadratic features of the GEMM path (the whole
-    (N, q) in the single-pass path, one sample chunk's in the streamed)."""
+    (N, q) in the single-pass path, one sample chunk's in the streamed).
+
+    Parameters
+    ----------
+    N : int
+        Number of samples.
+    d : int
+        Number of variables.
+    dtype : torch.dtype
+        Working dtype.
+    n_chunk : int, optional
+        Sample chunk of the streamed path; None for the single pass.
+
+    Returns
+    -------
+    int
+        Bytes (0 for the legacy kernels).
+    """
     if _EM_KERNEL != 'gemm':
         return 0
     n_eff = N if n_chunk is None else min(N, int(n_chunk))
@@ -86,20 +188,61 @@ def _em_fixed_bytes(N, d, dtype, n_chunk=None):
 
 
 def _init_sample_chunk(N, n_chunk=None):
-    """Sample chunk of the streamed initialisation: n_chunk rounded down to
+    """
+    Sample chunk of the streamed initialisation.
+
+    Sample chunk of the streamed initialisation: n_chunk rounded down to
     a whole number of draw blocks (at least one block), capped at N; None
-    (single pass) is the full N."""
+    (single pass) is the full N.
+
+    Parameters
+    ----------
+    N : int
+        Number of samples.
+    n_chunk : int, optional
+        The caller's sample chunk; None for the single pass.
+
+    Returns
+    -------
+    int
+        Samples per chunk of the initialisation.
+    """
     if n_chunk is None:
         return N
     return min(N, _INIT_DRAW_BLOCK * max(1, int(n_chunk) // _INIT_DRAW_BLOCK))
 
 
 def _init_bytes_per_replicate(N, K, d, dtype, init_type, n_chunk=None):
-    """Peak memory per replicate of the initialisation stage: the default
+    """
+    Peak memory per replicate of the initialisation stage.
+
+    Peak memory per replicate of the initialisation stage: the default
     and k-means inits run the broadcast M-step / assignment statistics over
     the full N without n_chunk, and over sample chunks of
     _init_sample_chunk(N, n_chunk) with it; minmax allocates nothing of
-    note."""
+    note.
+
+    Parameters
+    ----------
+    N : int
+        Number of samples.
+    K : int
+        Number of components.
+    d : int
+        Number of variables.
+    dtype : torch.dtype
+        Working dtype.
+    init_type : str
+        As in `estimate`.
+    n_chunk : int, optional
+        Sample chunk of the streamed path; None for the single pass.
+
+    Returns
+    -------
+    int
+        Bytes per replicate (the EM model for minmax, which is followed by
+        EM within the same budget).
+    """
     if init_type == 'minmax':
         return _em_bytes_per_replicate(N, K, d, dtype, n_chunk)
     n_eff = _init_sample_chunk(N, n_chunk)
@@ -109,23 +252,74 @@ def _init_bytes_per_replicate(N, K, d, dtype, init_type, n_chunk=None):
 
 
 def _mc_bytes_per_replicate(mc_samples, K, d, dtype):
-    """Peak memory per MC-integration replicate, from the model above."""
+    """
+    Peak memory per Monte Carlo integration replicate.
+
+    Peak memory per MC-integration replicate, from the model in the
+    design notes (_AUTO_CHUNK_MEM_FRACTION).
+
+    Parameters
+    ----------
+    mc_samples : int
+        Monte Carlo samples per replicate.
+    K : int
+        Number of components.
+    d : int
+        Number of variables.
+    dtype : torch.dtype
+        Working dtype.
+
+    Returns
+    -------
+    int
+        Bytes per replicate.
+    """
     return int(1.03 * mc_samples * dtype.itemsize
                * max((3 * d + 2) * K + d + 7, d * d + 4 * d + 6))
 
 
 def _n_rows(s):
-    """Replicate count of a per-replicate weight tensor whose leading dims
-    (all but the sample axis) form the replicate axis."""
+    """
+    Replicate count of a per-replicate weight tensor.
+
+    Replicate count of a per-replicate weight tensor whose leading dims
+    (all but the sample axis) form the replicate axis.
+
+    Parameters
+    ----------
+    s : torch.Tensor of shape (..., n_samples)
+        Per-replicate weights.
+
+    Returns
+    -------
+    int
+        The product of the leading dims.
+    """
     return s.shape[:-1].numel()
 
 
 def _rows(s, sl):
-    """Rows [sl] of the per-replicate weights `s` along its flattened
+    """
+    Rows `sl` of per-replicate weights, along the flattened leading dims.
+
+    Rows [sl] of the per-replicate weights `s` along its flattened
     leading dims. A 2-D `s` is sliced (a view of the caller's tensor); an
     N-D `s` — typically an expand() view whose repeat structure (CV masks
     tiled over inits and candidate k) must never be materialised — is
-    gathered into one (chunk, N) copy per replicate chunk."""
+    gathered into one (chunk, N) copy per replicate chunk.
+
+    Parameters
+    ----------
+    s : torch.Tensor of shape (..., n_samples)
+        Per-replicate weights.
+    sl : slice
+        Replicate range (step 1).
+
+    Returns
+    -------
+    torch.Tensor of shape (chunk, n_samples)
+        The rows, clipped to the replicate count.
+    """
     if s.dim() == 2:
         return s[sl]
     idx = torch.arange(sl.start, min(sl.stop, _n_rows(s)), device=s.device)
@@ -137,7 +331,8 @@ def _rows(s, sl):
 
 
 class _WeightChunks:
-    """Per-replicate sample weights read one sample chunk at a time.
+    """
+    Per-replicate sample weights read one sample chunk at a time.
 
     Wraps the caller's weights `s` — 2-D (R, N), or (..., N) with the
     replicate axis over the leading dims, typically an expand() view of the
@@ -150,7 +345,17 @@ class _WeightChunks:
     indices are absolute within the slice. The float64 total of per-chunk
     working-dtype sums is bitwise the full-row sum for the module's own
     weights (0/1 masks, resample counts, ones) and reduction-order for
-    real-valued weights passed directly to em_fit/val_ll."""
+    real-valued weights passed directly to em_fit/val_ll.
+
+    Parameters
+    ----------
+    s : torch.Tensor of shape (..., n_samples)
+        Per-replicate weights.
+    sl : slice
+        The replicate range this accessor covers (clipped to the count).
+    n_chunk : int, optional
+        Sample chunk of `totals()`; None sums each row in one piece.
+    """
 
     def __init__(self, s, sl, n_chunk=None):
         self.s = s
@@ -175,6 +380,24 @@ class _WeightChunks:
         return (self.R, self.N)
 
     def rows(self, i, n, rows=None):
+        """
+        Dense weights of samples [i, i + n) for some or all replicate rows.
+
+        Parameters
+        ----------
+        i : int
+            First sample.
+        n : int
+            Number of samples (clipped at the end of the sample axis).
+        rows : torch.Tensor, optional
+            Replicate rows within the slice; None for all of them.
+
+        Returns
+        -------
+        torch.Tensor of shape (n_rows, n)
+            A view for 2-D weights read without `rows`; otherwise one
+            block-sized gather.
+        """
         blk = self.s[..., i:i + n]
         if self._idx is None:
             blk = blk[self.start:self.start + self.R]
@@ -183,6 +406,14 @@ class _WeightChunks:
         return blk[ix]
 
     def totals(self):
+        """
+        Per-replicate weight sums over all samples, at float64, cached.
+
+        Returns
+        -------
+        torch.Tensor of shape (R,)
+            The sums, accumulated over sample chunks of `n_chunk`.
+        """
         if self._tot is None:
             tot = torch.zeros(self.R, dtype=torch.float64, device=self.s.device)
             for i in range(0, self.N, self.n_chunk):
@@ -192,30 +423,86 @@ class _WeightChunks:
 
 
 def _as_weight_chunks(s, n_chunk=None):
-    """Accept a dense (R, N) tensor where a _WeightChunks accessor is
+    """
+    Accept a dense weight tensor where a `_WeightChunks` accessor is expected.
+
+    Accept a dense (R, N) tensor where a _WeightChunks accessor is
     expected (direct callers of the streamed steps): a view-only accessor
-    over all of its rows."""
+    over all of its rows.
+
+    Parameters
+    ----------
+    s : torch.Tensor of shape (R, N) or _WeightChunks
+        Weights, or an accessor (returned as it is).
+    n_chunk : int, optional
+        Sample chunk of the accessor's `totals()`.
+
+    Returns
+    -------
+    _WeightChunks
+        The accessor.
+    """
     if isinstance(s, _WeightChunks):
         return s
     return _WeightChunks(s, slice(0, s.shape[0]), n_chunk)
 
 
 def _legacy_sample_chunk(N, K, d, dtype, n_chunk=None):
-    """Sample chunk for the centred legacy kernels on rerouted replicates:
+    """
+    Sample chunk for the centred legacy kernels on rerouted replicates.
+
+    Sample chunk for the centred legacy kernels on rerouted replicates:
     their (4d+4)K-per-sample broadcast peak must fit three quarters of the
     GEMM budget the replicate chunk was sized with (the partition's
     chunk-sized gathers take the rest). Shared by em_fit and val_ll so the
-    two cannot drift apart."""
+    two cannot drift apart.
+
+    Parameters
+    ----------
+    N : int
+        Number of samples.
+    K : int
+        Number of components.
+    d : int
+        Number of variables.
+    dtype : torch.dtype
+        Working dtype.
+    n_chunk : int, optional
+        Sample chunk of the streamed path; None for the single pass.
+
+    Returns
+    -------
+    int
+        Samples per legacy chunk, at least 1.
+    """
     return max(1, int(0.75 * _em_bytes_per_replicate(N, K, d, dtype, n_chunk))
                // (K * dtype.itemsize * (4 * d + 4)))
 
 
 def _run_chunked(n, chunk, fn):
-    """Apply fn(slice) over [0, n) in chunks of `chunk`, halving the chunk
+    """
+    Apply a callback over replicate chunks, halving the chunk on CUDA OOM.
+
+    Apply fn(slice) over [0, n) in chunks of `chunk`, halving the chunk
     and retrying on a CUDA out-of-memory error. Results do not depend on
-    the chunk on CPU (bitwise, with one float32 exception: see `estimate`,
-    Notes), so there the retry changes only peak memory; on CUDA they move
-    at reduction order."""
+    the chunk on CPU (bitwise, with one float32 exception: see
+    docs/estimate_notes.md, "Reproducibility"), so there the retry changes
+    only peak memory; on CUDA they move at reduction order.
+
+    Parameters
+    ----------
+    n : int
+        Number of replicates.
+    chunk : int
+        Replicates per call to start with.
+    fn : callable
+        Called as fn(slice) for consecutive replicate ranges.
+
+    Returns
+    -------
+    list
+        The results of the calls, in replicate order.
+    """
     outs, i = [], 0
     chunk = max(1, min(int(chunk), int(n)))
     while i < n:
