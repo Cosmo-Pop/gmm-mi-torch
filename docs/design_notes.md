@@ -37,8 +37,9 @@ per-component coefficients, and the M-step moments as the transposed product
 resp^T F (Machlica, Vaněk & Zajíc 2011). The expanded quadratic form cancels
 almost completely for points inside a component, so the coefficients are
 assembled and the moments accumulated at float64, and the data are
-standardised at entry (Chan, Golub & LeVeque 1983). The kernel-section
-comments in `estimator.py` give the precision argument in full.
+standardised at entry (Chan, Golub & LeVeque 1983). The precision
+argument in full: "GEMM-formulated EM kernels" under "Notes moved from
+the code" below.
 
 ### Kernel reroute
 
@@ -249,3 +250,270 @@ concurrent callers in other threads of the same process will also run these
 calls' matmuls at full precision, and the save/restore can race with theirs.
 Use processes, not threads, for parallel estimates (see
 `examples/mi_grid_multigpu.py`).
+
+## Notes moved from the code
+
+Comment blocks longer than three lines that stood in `estimator.py` up to
+v0.9.0, moved here verbatim (readability item 3.6), in the order they
+stood in the file. Each subsection is named after the function or
+constant the block sat in or above; the code keeps one line saying what
+the next lines do and naming the subsection. In these notes, "the kernel
+section" means "GEMM-formulated EM kernels" below, and "the
+kernel-reroute comment above _REROUTE_TOL_NATS" means the subsection
+`_REROUTE_TOL_NATS`.
+
+### `_EM_KERNEL`
+
+EM kernel implementation. 'gemm' evaluates the Gaussian log-densities
+and the M-step moments as matrix products against per-sample quadratic
+features (see the kernel section below); 'legacy' selects the previous
+broadcast kernels. The two agree at reduction-order precision wherever
+the GEMM cancellation residue is below the reg_covar floor (reg_covar >=
+~1e-13 at float64; at float32, standardised data with the reroute
+guarding collapsed components — see the kernel section). A typo must
+fail here, not silently select the legacy kernels.
+
+### `_FP32_KNOBS`
+
+torch >= 2.9 replaces get/set_float32_matmul_precision with per-backend
+fp32_precision settings; once user code has set any of those, the legacy
+getter RAISES ("mix of the legacy and new APIs"). The per-backend settings
+are also what make an exact restore possible: the legacy setter rewrites
+every backend at once, so restoring through it would hand a caller who had
+only enabled CUDA TF32 a changed mkldnn (CPU) setting.
+
+### `_MC_SEED_OFFSET`
+
+Per-replicate Monte-Carlo streams: bootstrap replicate r draws its MC
+samples from a generator seeded seed + _MC_SEED_OFFSET + r (estimate), or
+\+ ci * _MC_CAT_STRIDE + r per category ci (estimate_categorical), so the
+draws are independent of mc_chunk and of the OOM halve-and-retry by
+construction. n_bootstrap is capped at _MC_CAT_STRIDE and |seed| at 2**62
+at entry so the offsets stay inside torch.Generator.manual_seed's range
+and category streams cannot collide.
+
+### `_INIT_DRAW_BLOCK`
+
+The default initialisation draws each replicate's responsibilities in
+fixed sample blocks of this many rows, sequentially from the replicate's
+own generator, on the single-pass and the streamed (n_chunk) path alike:
+the draw is then invariant to em_chunk AND n_chunk by construction on
+every device (CUDA's Philox streams are not sequential across calls, so
+any other chunking of the draw would depend on the chunk size). Timings
+of the 2^14 block: docs/design_notes.md.
+
+### `_AUTO_CHUNK_MEM_FRACTION`
+
+Auto-sizing of the replicate chunks (em_chunk / mc_chunk = 'auto'). The
+per-replicate peak-memory models below are measured on the GB10 over
+K = 1..20 and d = 1..8 by validation/bench_mem_models.py (the bench and
+its one known exception: docs/design_notes.md, "Memory models"), in
+units of N_eff x itemsize per replicate, with one to two units of slack
+over the measured peaks:
+```text
+  GEMM EM step      max(K+4, 2K) + 3Kq/block   (E-step: one (R,N,K)
+                    buffer plus four (R,N) temporaries; M-step: the
+                    buffer plus its one blocked copy and the block
+                    outputs; q = d + d(d+1)/2)
+  legacy EM step    (4d+4)K + ~2                (broadcast (R,N,K,d)
+                    operands; the rerouted replicates stream their
+                    samples so they fit the GEMM budget — _em_fit_core)
+  init stage        (4d+3)K + 12 for the default and k-means inits over
+                    N, or over the n_chunk-rounded sample chunk when
+                    streamed; ~0 for minmax
+  MC stage          max((3d+2)K + d + 7, d^2 + 4d + 6) per mc_sample
+                    (integrand with its analytic marginals; gmm_sample's
+                    (S,d,d) Cholesky gather dominates at small K)
+```
+On CUDA a stage's batch is whatever fits the budget fraction of the
+memory this process can still allocate; there is no replicate floor. CPU
+keeps the default of 8.
+
+### `_auto_chunk`
+
+the driver counts torch's cached-but-unallocated blocks as used;
+they are ours to reuse, so every stage after the first (and every
+later call in the process) would otherwise be sized against
+free - cache, about half the intended batch in the memory-bound
+regime, and never recover
+
+### GEMM-formulated EM kernels
+
+log w_k N(x|mu_k, Sigma_k) is a quadratic form in x, so against per-sample
+features F(x) = [x, x_i x_j (i<=j)] it is one matrix product with
+per-component coefficients, and the M-step moments are the transposed
+product resp^T F (Machlica, Vanek & Zajic 2011). The only tensor of shape
+(n_replicates, n_samples, n_components) is the responsibilities, plus
+one transient float32 copy of it inside the blocked M-step (see
+_moment_gemm).
+The expanded quadratic form cancels almost completely for points inside a
+component, so the coefficients are assembled at float64 and the moments
+accumulated at float64 (see _gauss_coef and _moment_gemm); the data are
+standardised in estimate(), which bounds the magnitudes entering the
+cancellation (Chan, Golub & LeVeque 1983).
+
+Standardisation bounds |x| but NOT the residue relative to a collapsed
+component's variance: the uncentred form leaves a rounding residue
+~ u * P_k * |x|^2 in the log-density and ~ u * |mu_k|^2 per entry of the
+M2 - m1 m1^T covariance (u = unit roundoff), so a component at the
+reg_covar floor away from the origin is beyond these kernels' precision
+at float32 (and below reg_covar ~1e-13 at float64). Replicates in that
+regime are detected and finished on the centred legacy kernels (see the
+kernel-reroute comment above _REROUTE_TOL_NATS, which also states the
+detector's deliberate blind spot for rho->1 components). Direct
+em_fit/val_ll calls on unstandardised
+float32 data fall in the detected regime too: they run correctly, via
+the slower legacy path.
+
+### `_init_params`
+
+The (R,N,K) responsibility draw is the largest allocation of the
+selection stage (R = max_components x n_inits x n_folds), so it
+is drawn per replicate chunk inside the OOM-guarded callback, in
+place (mask, normalise) so no second full-size transient exists.
+Each replicate draws from its own generator seeded from one
+value taken off the caller's stream: the draw is then invariant
+to em_chunk and to the halve-and-retry by construction on every
+device (CUDA's Philox streams are NOT sequential across calls,
+so chunked draws from one generator would depend on the chunking).
+CPU manual_seed keeps 32 of these 62 bits (CUDA all 64): the CPU
+per-replicate seed space is 2^32, collision R(R-1)/2^33.
+
+### `_REROUTE_TOL_NATS`
+
+Kernel reroute: the GEMM kernels evaluate the Gaussian quadratic form and
+the M-step covariance from uncentred origin moments, whose rounding
+residue scales as u * P_k * |x|^2 (u = unit roundoff). For a component
+collapsed to the reg_covar floor away from the origin this swamps both
+the log-density (O(1)-nat errors at float32) and the covariance
+(indefinite every iteration), silently biasing MI on spike-bearing,
+zero-inflated or duplicated-point data — and at float64 it defeats
+reg_covar <= ~1e-13. The centred legacy kernels are immune, so replicates
+whose parameters make the residue material are finished on them. The
+detector uses the min diagonal as the precision proxy: it trips on every
+executed failure case and never on continuous data, but is DELIBERATELY
+blind to rho->1 components with O(1) diagonals: there the GEMM float32
+kernels stay within 1 sigma of float64 while legacy float32 is
+measurably WORSE, so such replicates must NOT be rerouted; tests pin
+both sides (measurements: docs/design_notes.md, "Kernel reroute").
+
+### `_reroute_trips`
+
+escalation is corroborating evidence of the cancellation at work,
+but alone it also fires for rho->1 components where legacy fp32
+is the worse kernel, so it only LOWERS the threshold tenfold —
+and only for the ESCALATED component itself, so a repaired
+blind-spot component cannot conscript an unrelated one's danger
+
+### `_em_fit_core`, compaction
+
+compaction: only still-active replicates stay in the working batch;
+on the streamed path the weights are addressed through `active_idx`,
+on the single-pass path the dense `weights_active` is compacted
+alongside
+
+### `_em_fit_core`, reroute mask
+
+sticky per-replicate reroute mask over the active set; the legacy step
+streams its samples in chunks of legacy_sample_chunk so its
+(4d+4)K-per-sample peak stays inside the GEMM budget the replicate
+chunk was sized with
+
+### `_val_ll_core`
+
+rerouted rows are scored by the centred legacy kernels in
+the same model-derived sample chunk em_fit streams them with
+(one broadcast pass over N would exceed the budget the
+replicate chunk was sized with several times over)
+
+### `_SMALL_SAMPLE_WARN`
+
+Below this many samples (per dataset, or per category) the estimator
+warns: the GMM MI estimate carries a positive finite-sample bias that the
+bootstrap errorbar does not include, and the validation campaign started
+at N ~ 1e3.
+
+### `_GAUSSIANISE_TIE_WARN_FRACTION`
+
+Tie fraction (excess samples in tied blocks of size >= 3, per column)
+above which gaussianise warns. Blocks of two are ignored: genuinely
+continuous data acquires birthday-pair collisions once quantised (a
+float32-native standard-normal column crosses 1% of paired samples around
+N ~ 2e6), and a two-sample block is harmless jitter, while real
+quantisation or zero inflation shows up as large blocks.
+
+### `_rank_gaussianise`
+
+positional ranks after a seeded random row permutation: with
+a STABLE sort, the order within each tied block is exactly
+the permutation's — i.e. uniformly random — while untied
+values keep their exact ranks
+
+### `_select_and_fit`
+
+the batched protocol pads parameters to K=max_components, and any
+protocol can leave dead components in the best CV fit; a zero-weight
+component can never resurrect under EM, so drop them here (the same
+masking FittedGMM applies) instead of paying for them through the
+bootstrap, refit and MC stages — and letting them shrink the
+auto-sized chunks by the padding factor.
+
+### `_bootstrap_counts`
+
+floor(u N) from float64 uniforms: uniform to <= N/2^52; the
+clamp guards only u == 1.0 (no float64 u < 1 reaches N).
+Temporaries, not bound: binding them across iterations keeps
+two extra (N,) vectors live (24 B/sample instead of 16).
+
+### `estimate`, float64 entry
+
+The entry pipeline (finiteness check, rank transform, affine
+standardisation) runs at float64 BEFORE the cast to the working dtype:
+casting first quantises large-offset columns (MJDs, Julian dates,
+timestamps) at float32 resolution before the centring that would have
+made them representable, silently destroying the estimate. Integer and
+half-precision inputs are promoted the same way; already-float32 input
+cannot be un-quantised, so the upcast there is best effort. The one-off
+float64 copy of X at entry is the price.
+
+### `estimate`, standardisation
+
+Internal per-variable affine standardisation.  MI, cMI and TC are
+exactly invariant under per-variable affine maps, and the KL quantities
+under a map shared by both columns, so no estimated quantity changes;
+it makes `reg_covar` a scale-free floor and prevents float32 Cholesky
+failures on unstandardised, strongly correlated pairs.  The fitted
+model returned by `return_fit` is mapped back to the original units.
+
+### `estimate`, return_fit units
+
+factorise/repair in STANDARDISED units, where reg_covar, the
+absolute dead test and the repair bump scale are meaningful, then
+back-transform both the covariance and its factor at float64:
+D L is lower-triangular and (D L)(D L)^T = D cov D exactly, so
+cov == chol chol^T survives the change of units, and a float32
+working dtype can no longer overflow (or zero out) the
+original-units covariance of a healthy fit
+
+### `_mc_stage_categorical`
+
+log sum_c' pi_c' p(x|c') as a running logaddexp over the
+categories, so the peak holds three (b,S) tensors instead of
+a (C,b,S) stack plus its C-element list; results differ from
+the stacked logsumexp at floating-point roundoff only
+
+### `estimate_categorical`, labels
+
+non-numeric labels (strings, objects — the common case for
+categorical astrophysical data) are factorised via numpy:
+categories are the sorted unique labels, as np.unique orders
+them, and MI only needs the partition
+
+### `estimate_categorical`, seeds
+
+known, low-risk stream coincidence: category
+ci+10's init stream at K=30 equals category ci's bootstrap stream
+(997*10 + 30 = 10_000); it needs >= 11 categories AND
+max_components >= 30 (default 10) and the streams drive different
+data, so it is documented rather than re-seeded under the
+validated init/bootstrap offsets

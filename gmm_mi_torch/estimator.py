@@ -22,26 +22,14 @@ from typing import NamedTuple
 
 import torch
 
-# EM kernel implementation. 'gemm' evaluates the Gaussian log-densities
-# and the M-step moments as matrix products against per-sample quadratic
-# features (see the kernel section below); 'legacy' selects the previous
-# broadcast kernels. The two agree at reduction-order precision wherever
-# the GEMM cancellation residue is below the reg_covar floor (reg_covar >=
-# ~1e-13 at float64; at float32, standardised data with the reroute
-# guarding collapsed components — see the kernel section). A typo must
-# fail here, not silently select the legacy kernels.
+# EM kernels, 'gemm' or 'legacy'; design notes: _EM_KERNEL
 _EM_KERNEL = os.environ.get('GMM_MI_TORCH_EM_KERNEL', 'gemm')
 if _EM_KERNEL not in ('gemm', 'legacy'):
     raise ValueError(f"GMM_MI_TORCH_EM_KERNEL must be 'gemm' or 'legacy'; "
                      f"found '{_EM_KERNEL}'")
 
 
-# torch >= 2.9 replaces get/set_float32_matmul_precision with per-backend
-# fp32_precision settings; once user code has set any of those, the legacy
-# getter RAISES ("mix of the legacy and new APIs"). The per-backend settings
-# are also what make an exact restore possible: the legacy setter rewrites
-# every backend at once, so restoring through it would hand a caller who had
-# only enabled CUDA TF32 a changed mkldnn (CPU) setting.
+# torch >= 2.9 per-backend precision settings; design notes: _FP32_KNOBS
 try:
     _FP32_KNOBS = (torch.backends, torch.backends.cuda.matmul,
                    torch.backends.mkldnn.matmul)
@@ -154,23 +142,11 @@ LOG2PI = math.log(2.0 * math.pi)
 # that path at small N by lowering it.
 _MULTINOMIAL_MAX_CATEGORIES = 1 << 24
 
-# Per-replicate Monte-Carlo streams: bootstrap replicate r draws its MC
-# samples from a generator seeded seed + _MC_SEED_OFFSET + r (estimate), or
-# + ci * _MC_CAT_STRIDE + r per category ci (estimate_categorical), so the
-# draws are independent of mc_chunk and of the OOM halve-and-retry by
-# construction. n_bootstrap is capped at _MC_CAT_STRIDE and |seed| at 2**62
-# at entry so the offsets stay inside torch.Generator.manual_seed's range
-# and category streams cannot collide.
+# per-replicate Monte-Carlo seed offsets; design notes: _MC_SEED_OFFSET
 _MC_SEED_OFFSET = 50_000
 _MC_CAT_STRIDE = 1 << 20
 
-# The default initialisation draws each replicate's responsibilities in
-# fixed sample blocks of this many rows, sequentially from the replicate's
-# own generator, on the single-pass and the streamed (n_chunk) path alike:
-# the draw is then invariant to em_chunk AND n_chunk by construction on
-# every device (CUDA's Philox streams are not sequential across calls, so
-# any other chunking of the draw would depend on the chunk size). Timings
-# of the 2^14 block: docs/design_notes.md.
+# sample block of the default-init draw; design notes: _INIT_DRAW_BLOCK
 _INIT_DRAW_BLOCK = 1 << 14
 
 # gaussianise's random tie-breaking draws its permutations from
@@ -178,28 +154,7 @@ _INIT_DRAW_BLOCK = 1 << 14
 # per-column permutations are independent).
 _TIE_SEED_OFFSET = 40_000
 
-# Auto-sizing of the replicate chunks (em_chunk / mc_chunk = 'auto'). The
-# per-replicate peak-memory models below are measured on the GB10 over
-# K = 1..20 and d = 1..8 by validation/bench_mem_models.py (the bench and
-# its one known exception: docs/design_notes.md, "Memory models"), in
-# units of N_eff x itemsize per replicate, with one to two units of slack
-# over the measured peaks:
-#   GEMM EM step      max(K+4, 2K) + 3Kq/block   (E-step: one (R,N,K)
-#                     buffer plus four (R,N) temporaries; M-step: the
-#                     buffer plus its one blocked copy and the block
-#                     outputs; q = d + d(d+1)/2)
-#   legacy EM step    (4d+4)K + ~2                (broadcast (R,N,K,d)
-#                     operands; the rerouted replicates stream their
-#                     samples so they fit the GEMM budget — _em_fit_core)
-#   init stage        (4d+3)K + 12 for the default and k-means inits over
-#                     N, or over the n_chunk-rounded sample chunk when
-#                     streamed; ~0 for minmax
-#   MC stage          max((3d+2)K + d + 7, d^2 + 4d + 6) per mc_sample
-#                     (integrand with its analytic marginals; gmm_sample's
-#                     (S,d,d) Cholesky gather dominates at small K)
-# On CUDA a stage's batch is whatever fits the budget fraction of the
-# memory this process can still allocate; there is no replicate floor. CPU
-# keeps the default of 8.
+# auto-sized replicate chunks; design notes: _AUTO_CHUNK_MEM_FRACTION
 _AUTO_CHUNK_MEM_FRACTION = 0.5      # of the allocatable device memory at call time
 _AUTO_CHUNK_CPU_DEFAULT = 8
 
@@ -235,11 +190,7 @@ def _auto_chunk(n_items, bytes_per_item, device, default=_AUTO_CHUNK_CPU_DEFAULT
     dev = torch.device(device)
     if dev.type != 'cuda':
         return max(1, min(int(n_items), int(default)))
-    # the driver counts torch's cached-but-unallocated blocks as used;
-    # they are ours to reuse, so every stage after the first (and every
-    # later call in the process) would otherwise be sized against
-    # free - cache, about half the intended batch in the memory-bound
-    # regime, and never recover
+    # free memory counts torch's cache as ours; design notes: _auto_chunk
     free = _cuda_free_bytes(dev)
     bytes_per_item = max(int(bytes_per_item), 1)
     n = int((free * _AUTO_CHUNK_MEM_FRACTION - fixed_bytes) // bytes_per_item)
@@ -714,31 +665,7 @@ def marginal_score(X_full, w, mu, cov, idx):
 # ----------------------------------------------------------------------
 # GEMM-formulated EM kernels
 # ----------------------------------------------------------------------
-# log w_k N(x|mu_k, Sigma_k) is a quadratic form in x, so against per-sample
-# features F(x) = [x, x_i x_j (i<=j)] it is one matrix product with
-# per-component coefficients, and the M-step moments are the transposed
-# product resp^T F (Machlica, Vanek & Zajic 2011). The only tensor of shape
-# (n_replicates, n_samples, n_components) is the responsibilities, plus
-# one transient float32 copy of it inside the blocked M-step (see
-# _moment_gemm).
-# The expanded quadratic form cancels almost completely for points inside a
-# component, so the coefficients are assembled at float64 and the moments
-# accumulated at float64 (see _gauss_coef and _moment_gemm); the data are
-# standardised in estimate(), which bounds the magnitudes entering the
-# cancellation (Chan, Golub & LeVeque 1983).
-#
-# Standardisation bounds |x| but NOT the residue relative to a collapsed
-# component's variance: the uncentred form leaves a rounding residue
-# ~ u * P_k * |x|^2 in the log-density and ~ u * |mu_k|^2 per entry of the
-# M2 - m1 m1^T covariance (u = unit roundoff), so a component at the
-# reg_covar floor away from the origin is beyond these kernels' precision
-# at float32 (and below reg_covar ~1e-13 at float64). Replicates in that
-# regime are detected and finished on the centred legacy kernels (see the
-# kernel-reroute comment above _REROUTE_TOL_NATS, which also states the
-# detector's deliberate blind spot for rho->1 components). Direct
-# em_fit/val_ll calls on unstandardised
-# float32 data fall in the detected regime too: they run correctly, via
-# the slower legacy path.
+# how they work and their limits; design notes: GEMM-formulated EM kernels
 
 
 def _features(X):
@@ -1286,17 +1213,7 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
     eye = torch.eye(d, dtype=dt, device=dev)
 
     if init_type == 'random_responsibilities':
-        # The (R,N,K) responsibility draw is the largest allocation of the
-        # selection stage (R = max_components x n_inits x n_folds), so it
-        # is drawn per replicate chunk inside the OOM-guarded callback, in
-        # place (mask, normalise) so no second full-size transient exists.
-        # Each replicate draws from its own generator seeded from one
-        # value taken off the caller's stream: the draw is then invariant
-        # to em_chunk and to the halve-and-retry by construction on every
-        # device (CUDA's Philox streams are NOT sequential across calls,
-        # so chunked draws from one generator would depend on the chunking).
-        # CPU manual_seed keeps 32 of these 62 bits (CUDA all 64): the CPU
-        # per-replicate seed space is 2^32, collision R(R-1)/2^33.
+        # per-replicate seeded draw; design notes: _init_params
         seeds = torch.randint(0, 1 << 62, (R,), generator=generator,
                               device=dev).tolist()
         stage = functools.partial(_init_mstep_random, X=X, seeds=seeds,
@@ -1541,21 +1458,7 @@ def _em_step_nchunked(X, weight_chunks, w, mu, chol, logw, reg_covar,
     return ll, w_new.to(dt), mu_new.to(dt), cov_new.to(dt)
 
 
-# Kernel reroute: the GEMM kernels evaluate the Gaussian quadratic form and
-# the M-step covariance from uncentred origin moments, whose rounding
-# residue scales as u * P_k * |x|^2 (u = unit roundoff). For a component
-# collapsed to the reg_covar floor away from the origin this swamps both
-# the log-density (O(1)-nat errors at float32) and the covariance
-# (indefinite every iteration), silently biasing MI on spike-bearing,
-# zero-inflated or duplicated-point data — and at float64 it defeats
-# reg_covar <= ~1e-13. The centred legacy kernels are immune, so replicates
-# whose parameters make the residue material are finished on them. The
-# detector uses the min diagonal as the precision proxy: it trips on every
-# executed failure case and never on continuous data, but is DELIBERATELY
-# blind to rho->1 components with O(1) diagonals: there the GEMM float32
-# kernels stay within 1 sigma of float64 while legacy float32 is
-# measurably WORSE, so such replicates must NOT be rerouted; tests pin
-# both sides (measurements: docs/design_notes.md, "Kernel reroute").
+# kernel reroute; design notes: _REROUTE_TOL_NATS
 _REROUTE_TOL_NATS = 1e-3
 
 
@@ -1577,11 +1480,7 @@ def _reroute_trips(w, mu, cov, repaired=None):
     dgr = _reroute_danger(w, mu, cov)                                # (R,K)
     trips = dgr > thr
     if repaired is not None:
-        # escalation is corroborating evidence of the cancellation at work,
-        # but alone it also fires for rho->1 components where legacy fp32
-        # is the worse kernel, so it only LOWERS the threshold tenfold —
-        # and only for the ESCALATED component itself, so a repaired
-        # blind-spot component cannot conscript an unrelated one's danger
+        # escalation lowers the threshold tenfold; design notes: _reroute_trips
         trips = trips | (repaired & (dgr > thr / 10.0))
     return trips.any(-1)
 
@@ -1908,10 +1807,7 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
     R, N = weight_chunks.shape if stream else s.shape
     dev = X.device
     d = X.shape[-1]
-    # compaction: only still-active replicates stay in the working batch;
-    # on the streamed path the weights are addressed through `active_idx`,
-    # on the single-pass path the dense `weights_active` is compacted
-    # alongside
+    # compact the batch; design notes: _em_fit_core, compaction
     active_idx = torch.arange(R, device=dev)
     w_out, mu_out, cov_out = w.clone(), mu.clone(), cov.clone()
     ll_out = torch.full((R,), -torch.inf, dtype=X.dtype, device=dev)
@@ -1919,10 +1815,7 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
     weights_active = None if stream else s
     gemm = _EM_KERNEL == 'gemm'
     F = _features(X) if gemm and n_chunk is None else None
-    # sticky per-replicate reroute mask over the active set; the legacy step
-    # streams its samples in chunks of legacy_sample_chunk so its
-    # (4d+4)K-per-sample peak stays inside the GEMM budget the replicate
-    # chunk was sized with
+    # sticky reroute mask; design notes: _em_fit_core, reroute mask
     legacy_mask = torch.zeros(R, dtype=torch.bool, device=dev)
     n_rerouted = 0
     K = w.shape[-1]
@@ -2092,10 +1985,7 @@ def _val_ll_core(X, s_val, w, mu, cov, n_chunk=None):
                 del lj, Fc
             acc[gemm_idx] = accg
         if legacy_idx.numel():
-            # rerouted rows are scored by the centred legacy kernels in
-            # the same model-derived sample chunk em_fit streams them with
-            # (one broadcast pass over N would exceed the budget the
-            # replicate chunk was sized with several times over)
+            # rerouted rows: legacy kernels; design notes: _val_ll_core
             legacy_sample_chunk = _legacy_sample_chunk(
                 N, w.shape[-1], X.shape[-1], X.dtype, n_chunk)
             acc[legacy_idx] = _legacy_score_sum(
@@ -2123,10 +2013,7 @@ def _val_ll_core(X, s_val, w, mu, cov, n_chunk=None):
 _CV_MASK_SEED_OFFSET = 30_000
 
 
-# Below this many samples (per dataset, or per category) the estimator
-# warns: the GMM MI estimate carries a positive finite-sample bias that the
-# bootstrap errorbar does not include, and the validation campaign started
-# at N ~ 1e3.
+# small-sample warning threshold; design notes: _SMALL_SAMPLE_WARN
 _SMALL_SAMPLE_WARN = 100
 
 
@@ -2522,12 +2409,7 @@ _INTEGRANDS = {'MI': _integrand_MI, 'cMI': _integrand_cMI, 'TC': _integrand_TC,
                'KL_reverse': _integrand_KL_reverse}
 
 
-# Tie fraction (excess samples in tied blocks of size >= 3, per column)
-# above which gaussianise warns. Blocks of two are ignored: genuinely
-# continuous data acquires birthday-pair collisions once quantised (a
-# float32-native standard-normal column crosses 1% of paired samples around
-# N ~ 2e6), and a two-sample block is harmless jitter, while real
-# quantisation or zero inflation shows up as large blocks.
+# tie warning threshold; design notes: _GAUSSIANISE_TIE_WARN_FRACTION
 _GAUSSIANISE_TIE_WARN_FRACTION = 0.01
 
 
@@ -2572,10 +2454,7 @@ def _rank_gaussianise(X, tie_rank='average', generator=None):
         big = cnt[cnt >= 3]
         tie_frac.append(float((big - 1).sum()) / N)
         if tie_rank == 'random':
-            # positional ranks after a seeded random row permutation: with
-            # a STABLE sort, the order within each tied block is exactly
-            # the permutation's — i.e. uniformly random — while untied
-            # values keep their exact ranks
+            # random order within tied blocks; design notes: _rank_gaussianise
             perm = torch.randperm(N, generator=generator,
                                   device='cpu').to(xj.device)
             order = torch.argsort(xj[perm], dim=0, stable=True)
@@ -2707,12 +2586,7 @@ def _select_and_fit(X, selection, fit):
             sel = select_batched
             kw['metric_method'] = selection['metric_method']
         k_best, params, _ = sel(X, **kw)
-    # the batched protocol pads parameters to K=max_components, and any
-    # protocol can leave dead components in the best CV fit; a zero-weight
-    # component can never resurrect under EM, so drop them here (the same
-    # masking FittedGMM applies) instead of paying for them through the
-    # bootstrap, refit and MC stages — and letting them shrink the
-    # auto-sized chunks by the padding factor.
+    # drop dead components; design notes: _select_and_fit
     w1, mu1, cov1 = params
     alive = w1 > 0
     k_live = int(alive.sum())
@@ -2761,10 +2635,7 @@ def _bootstrap_counts(N, B, dtype, device, generator):
     one = torch.ones((), dtype=dtype, device=device).expand(N)
     for b in range(B):
         gen = torch.Generator(device=device).manual_seed(seeds[b])
-        # floor(u N) from float64 uniforms: uniform to <= N/2^52; the
-        # clamp guards only u == 1.0 (no float64 u < 1 reaches N).
-        # Temporaries, not bound: binding them across iterations keeps
-        # two extra (N,) vectors live (24 B/sample instead of 16).
+        # floor(u N) from float64 uniforms; design notes: _bootstrap_counts
         s[b].scatter_add_(
             0, torch.rand(N, dtype=torch.float64, device=device,
                           generator=gen).mul_(N).long().clamp_(max=N - 1),
@@ -3197,14 +3068,7 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         raise ValueError(f"dtype must be torch.float32 or torch.float64; "
                          f"found {dtype}")
     device = _validate_device(device)
-    # The entry pipeline (finiteness check, rank transform, affine
-    # standardisation) runs at float64 BEFORE the cast to the working dtype:
-    # casting first quantises large-offset columns (MJDs, Julian dates,
-    # timestamps) at float32 resolution before the centring that would have
-    # made them representable, silently destroying the estimate. Integer and
-    # half-precision inputs are promoted the same way; already-float32 input
-    # cannot be un-quantised, so the upcast there is best effort. The one-off
-    # float64 copy of X at entry is the price.
+    # entry pipeline at float64; design notes: estimate, float64 entry
     # a private float64 copy (copy=True also for float64 input, whose
     # storage torch.as_tensor shares with the caller) that the
     # standardisation below then updates in place
@@ -3261,12 +3125,7 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     elif preprocess != 'none':
         raise ValueError(f"preprocess must be 'none' or 'gaussianise'; "
                          f"found '{preprocess}'")
-    # Internal per-variable affine standardisation.  MI, cMI and TC are
-    # exactly invariant under per-variable affine maps, and the KL quantities
-    # under a map shared by both columns, so no estimated quantity changes;
-    # it makes `reg_covar` a scale-free floor and prevents float32 Cholesky
-    # failures on unstandardised, strongly correlated pairs.  The fitted
-    # model returned by `return_fit` is mapped back to the original units.
+    # affine standardisation; design notes: estimate, standardisation
     if quantity in ('KL_forward', 'KL_reverse'):
         col_mean = X.mean().expand(X.shape[1]).contiguous()
         col_std = X.std().expand(X.shape[1]).contiguous()
@@ -3312,13 +3171,7 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
                                   cov1.unsqueeze(0), reg_covar, threshold_fit,
                                   max_iter, em_chunk=em_chunk_boot, n_chunk=n_chunk)
         alive = wf[0] > 0
-        # factorise/repair in STANDARDISED units, where reg_covar, the
-        # absolute dead test and the repair bump scale are meaningful, then
-        # back-transform both the covariance and its factor at float64:
-        # D L is lower-triangular and (D L)(D L)^T = D cov D exactly, so
-        # cov == chol chol^T survives the change of units, and a float32
-        # working dtype can no longer overflow (or zero out) the
-        # original-units covariance of a healthy fit
+        # factor, then back-transform; design notes: estimate, return_fit units
         chol_s, cov_s = _chol(covf[0][alive].unsqueeze(0))
         D = col_std.to(device=device)                 # float64 scales
         mean64 = col_mean.to(device=device)
@@ -3415,10 +3268,7 @@ def _mc_stage_categorical(sl, ci, fits, pi, logpi, mc_samples, seed,
                    .manual_seed(seed + _MC_SEED_OFFSET
                                 + ci * _MC_CAT_STRIDE + r))
         for r in range(sl.start, min(sl.stop, n_replicates))])
-    # log sum_c' pi_c' p(x|c') as a running logaddexp over the
-    # categories, so the peak holds three (b,S) tensors instead of
-    # a (C,b,S) stack plus its C-element list; results differ from
-    # the stacked logsumexp at floating-point roundoff only
+    # running logaddexp over categories; design notes: _mc_stage_categorical
     log_pbar = own = None
     for cj in range(C):
         sc = gmm_score(pts, fits[cj].w[sl], fits[cj].mu[sl],
@@ -3533,7 +3383,8 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
                          f"found {dtype}")
     device = _validate_device(device)
     # as in estimate: the entry pipeline runs at float64 and the cast to the
-    # working dtype happens after the standardisation (see the comment there)
+    # working dtype happens after the standardisation (design notes:
+    # estimate, float64 entry)
     X = X.to(torch.float64, copy=True)
     if X.dim() > 2 or (X.dim() == 2 and X.shape[1] != 1):
         raise ValueError(f"X must be 1-D or a single column; found shape "
@@ -3548,10 +3399,7 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     try:
         Y = torch.as_tensor(_as_array(Y), device=device).detach()
     except (TypeError, ValueError):
-        # non-numeric labels (strings, objects — the common case for
-        # categorical astrophysical data) are factorised via numpy:
-        # categories are the sorted unique labels, as np.unique orders
-        # them, and MI only needs the partition
+        # labels via np.unique; design notes: estimate_categorical, labels
         import numpy as np
         arr = np.asarray(Y)
         if arr.ndim == 2 and arr.shape[1] == 1:
@@ -3636,12 +3484,7 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
     for ci in range(C):
         Xc = X[Y == cats[ci]]
         Nc = Xc.shape[0]
-        # known, low-risk stream coincidence: category
-        # ci+10's init stream at K=30 equals category ci's bootstrap stream
-        # (997*10 + 30 = 10_000); it needs >= 11 categories AND
-        # max_components >= 30 (default 10) and the streams drive different
-        # data, so it is documented rather than re-seeded under the
-        # validated init/bootstrap offsets
+        # per-category seed; design notes: estimate_categorical, seeds
         seed_c = seed + 997 * ci
         # each category's selection runs on its own seed
         k_c, (w1, mu1, cov1) = _select_and_fit(Xc, selection,
