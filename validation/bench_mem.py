@@ -1,15 +1,16 @@
 """Peak CUDA memory per replicate for one EM step and for one MC chunk, to fit the auto-chunk model."""
 import torch, itertools
 import gmm_mi_torch.estimator as E
+from gmm_mi_torch import em, gaussian
 dev='cuda'
 def peak_em(N,K,d,Ra,dt,n_chunk=None):
     X=torch.randn(N,d,device=dev,dtype=dt)
     g=torch.Generator(device=dev).manual_seed(0)
-    w,mu,cov=E._init_params(X,K,Ra,1e-6,generator=g,em_chunk=Ra)
+    w,mu,cov=em._init_params(X,K,Ra,1e-6,generator=g,em_chunk=Ra)
     s=torch.ones(Ra,N,device=dev,dtype=dt)
     torch.cuda.synchronize(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
     base=torch.cuda.memory_allocated()
-    E._em_fit_core(X,s,w,mu,cov,max_iter=2,n_chunk=n_chunk)
+    em._em_fit_core(X,s,w,mu,cov,max_iter=2,n_chunk=n_chunk)
     torch.cuda.synchronize()
     return torch.cuda.max_memory_allocated()-base
 print("EM step: units = peak / (Ra*Neff*K*itemsize)")
@@ -29,8 +30,8 @@ for d in (2,3,5):
     K,S,b=20,100_000,8
     g=torch.Generator(device=dev).manual_seed(0)
     X=torch.randn(2000,d,device=dev)
-    w,mu,cov=E._init_params(X,K,b,1e-6,generator=g,em_chunk=b)
-    chol, cov=E._chol(cov)
+    w,mu,cov=em._init_params(X,K,b,1e-6,generator=g,em_chunk=b)
+    chol, cov=gaussian._chol(cov)
     torch.cuda.synchronize(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(); base=torch.cuda.memory_allocated()
     pts=E.gmm_sample(w,mu,chol,S,generator=g)
     q='MI' if d==2 else ('TC')

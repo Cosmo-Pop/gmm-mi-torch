@@ -1,6 +1,6 @@
 # Design notes
 
-The mechanisms and measurements behind `gmm_mi_torch/estimator.py`. The
+The mechanisms and measurements behind the `gmm_mi_torch` package. The
 docstrings state what each function promises; this file records why the code
 is shaped as it is and the measurements behind its constants;
 [CHANGELOG.md](../CHANGELOG.md) records what changed in which release.
@@ -8,6 +8,17 @@ Measurements are on the NVIDIA GB10 (128 GB unified memory) unless stated.
 
 ## Architecture
 
+- The code is split along its stages (since 0.10.0; one file,
+  `estimator.py`, before): `constants` (module constants and the
+  `GMM_MI_TORCH_EM_KERNEL` switch), `precision` (full-precision float32
+  matmuls, entry validation), `chunking` (memory models, chunk sizes,
+  per-replicate weights, the out-of-memory retry), `gaussian` (Cholesky
+  with repair, densities, sampling, marginals), `em` (the GEMM and legacy
+  EM kernels, the initialisations, `em_fit`, `val_ll`), `selection` (CV
+  masks, the two protocols) and `estimator` (integrands, preprocessing,
+  bootstrap, `FittedGMM`, `estimate`, `estimate_categorical`). Each module
+  imports from the ones before it; `estimator` re-exports the public names
+  it defined before the split.
 - No sklearn. EM is implemented as *weighted* EM over a leading replicate
   dimension R. Per-sample weights unify everything that GMM-MI does with
   loops and index resampling:

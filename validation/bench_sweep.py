@@ -22,6 +22,7 @@ import torch
 
 import gmm_mi_torch
 import gmm_mi_torch.estimator as E
+from gmm_mi_torch import em, gaussian
 from gmm_mi_torch import estimate
 
 
@@ -72,23 +73,23 @@ def saturation(Xt, dtype, batches, K=20):
     out = {}
     for Ra in batches:
         g = torch.Generator(device=Xt.device).manual_seed(0)
-        w, mu, cov = E._init_params(Xt, K, Ra, 1e-6, generator=g, em_chunk=Ra)
+        w, mu, cov = em._init_params(Xt, K, Ra, 1e-6, generator=g, em_chunk=Ra)
         s = torch.ones(Ra, N, device=Xt.device, dtype=dtype)
 
         if getattr(E, '_EM_KERNEL', 'legacy') == 'gemm':
-            F = E._features(Xt)
+            F = em._features(Xt)
 
             def step():
-                resp, _ = E._estep_gemm(F, s, w, mu, cov)
-                return E._mstep_gemm(F, resp, s, 1e-6, d)
+                resp, _ = em._estep_gemm(F, s, w, mu, cov)
+                return em._mstep_gemm(F, resp, s, 1e-6, d)
         else:
             def step():
-                chol = E._chol(cov)[0]
+                chol = gaussian._chol(cov)[0]
                 logw = torch.log(w.clamp_min(1e-300))
                 Xr = Xt.expand(Ra, N, d)
                 lj = logw.unsqueeze(1) + E.log_gauss(Xr, mu, chol)
                 ll_n = torch.logsumexp(lj, -1)
-                return E._m_step(Xr, torch.exp(lj - ll_n.unsqueeze(-1)), s, 1e-6)
+                return em._m_step(Xr, torch.exp(lj - ll_n.unsqueeze(-1)), s, 1e-6)
         step(); sync(); t = time.perf_counter()
         for _ in range(5):
             step()

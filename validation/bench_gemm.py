@@ -1,12 +1,13 @@
 import torch, time, math, numpy as np
 import gmm_mi_torch.estimator as E
+from gmm_mi_torch import em, gaussian
 N=20000; rho=0.3
 X=np.random.default_rng(0).multivariate_normal([0,0],[[1,rho],[rho,1]],N)
 X[:,1]=np.sign(X[:,1])*np.abs(X[:,1])**1.5
 Xt=torch.as_tensor(X,dtype=torch.float32,device='cuda')
 Ra,K,d=300,20,2
 g=torch.Generator(device='cuda').manual_seed(0)
-w,mu,cov=E._init_params(Xt,K,Ra,1e-6,generator=g,em_chunk=Ra)
+w,mu,cov=em._init_params(Xt,K,Ra,1e-6,generator=g,em_chunk=Ra)
 s=torch.ones(Ra,N,device='cuda')
 def T(f,n=5):
     f(); torch.cuda.synchronize(); t=time.perf_counter()
@@ -14,12 +15,12 @@ def T(f,n=5):
     torch.cuda.synchronize(); return (time.perf_counter()-t)/n*1e3, out
 
 # ---- current pieces
-chol, cov=E._chol(cov); logw=torch.log(w.clamp_min(1e-300)); Xr=Xt.expand(Ra,N,d)
+chol, cov=gaussian._chol(cov); logw=torch.log(w.clamp_min(1e-300)); Xr=Xt.expand(Ra,N,d)
 t_lg,lj=T(lambda: logw.unsqueeze(1)+E.log_gauss(Xr,mu,chol))
 def resp_f():
     ll_n=torch.logsumexp(lj,-1); return torch.exp(lj-ll_n.unsqueeze(-1)), ll_n
 t_resp,(resp,ll_n)=T(resp_f)
-t_m,(w1,mu1,cov1)=T(lambda: E._m_step(Xr,resp,s,1e-6))
+t_m,(w1,mu1,cov1)=T(lambda: em._m_step(Xr,resp,s,1e-6))
 print(f"current: log_gauss={t_lg:.1f}ms  resp={t_resp:.1f}ms  m_step={t_m:.1f}ms  total={t_lg+t_resp+t_m:.1f}ms")
 
 # ---- GEMM-formulated E-step: maha = x^T P x - 2 x^T P mu + mu^T P mu, with P = cov^-1
