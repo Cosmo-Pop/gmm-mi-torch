@@ -28,8 +28,8 @@ def _validate_folds(N, n_folds, what='X', d=None, stacklevel=4):
     """
     Reject CV settings that produce empty or degenerate folds.
 
-    Reject CV settings that produce empty or degenerate folds up front:
-    they otherwise surface as 0/0 NaN metrics and far-away index errors.
+    Checked up front: such folds otherwise surface as 0/0 NaN metrics and
+    far-away index errors.
 
     With `d` given, also reject sizes whose smallest TRAINING fold holds
     fewer than d+1 samples — a full covariance cannot be estimated from
@@ -81,9 +81,8 @@ def _validate_device(device):
     """
     Resolve and check the `device` argument at entry.
 
-    Resolve `device` to a torch.device and fail at entry, under the
-    argument's own name, for strings torch cannot parse or CUDA devices
-    that are not there — instead of deep inside the first transfer.
+    Fails under the argument's own name, for strings torch cannot parse or CUDA
+    devices that are not there — instead of deep inside the first transfer.
 
     Parameters
     ----------
@@ -243,7 +242,7 @@ def select_sequential(X, max_components=20, n_folds=2, n_inits=3,
         The data, already on the target device/dtype.
     max_components : int, default=20
         Largest k tried if the early stop never triggers.
-    n_folds, n_inits : int
+    n_folds, n_inits : int, optional
         As in `estimate`.
     threshold_components : float, default=1e-5
         Minimum metric improvement that counts as progress.
@@ -251,9 +250,9 @@ def select_sequential(X, max_components=20, n_folds=2, n_inits=3,
         Number of consecutive non-improving k values tolerated before
         stopping; the counter resets on every improvement, and the selected
         k is the best-scoring one.
-    reg_covar, threshold_fit : float
+    reg_covar, threshold_fit : float, optional
         As in `estimate`.
-    max_iter, seed : int
+    max_iter, seed : int, optional
         As in `estimate`.
     em_chunk : int, default=8
         As in `estimate`, an integer here.
@@ -335,15 +334,15 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
         The data, already on the target device/dtype.
     max_components : int, default=20
         Largest k fitted; all are paid for unconditionally.
-    n_folds, n_inits : int
+    n_folds, n_inits : int, optional
         As in `estimate`.
     threshold_components : float, default=1e-5
         Parsimony rule for metric_method='valid': the smallest k whose
         validation log-likelihood is within this threshold of the best wins,
         so noise-level improvements do not inflate k.
-    reg_covar, threshold_fit : float
+    reg_covar, threshold_fit : float, optional
         As in `estimate`.
-    max_iter, seed : int
+    max_iter, seed : int, optional
         As in `estimate`.
     em_chunk : int, default=8
         As in `estimate`, an integer here.

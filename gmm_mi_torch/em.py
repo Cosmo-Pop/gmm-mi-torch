@@ -27,7 +27,7 @@ def _features(X):
     """
     Quadratic features of the samples, for the GEMM kernels.
 
-    Quadratic features [x, x_i x_j (i<=j)] of X (..., d): (..., d + d(d+1)/2).
+    [x, x_i x_j (i<=j)] of X (..., d), shape (..., d + d(d+1)/2).
 
     Assembled in place — the output, one gathered operand copied into it,
     the second gathered operand multiplied in — so the transient is
@@ -58,11 +58,10 @@ def _tri_inv(L):
     """
     Batched inverse of lower-triangular matrices.
 
-    Batched inverse of lower-triangular (..., d, d) by forward
-    substitution in plain tensor ops. The library routines
+    By forward substitution in plain tensor ops. The library routines
     (cholesky_inverse, solve_triangular) are slow on some GPUs when batched
-    over many small matrices; d^2 vectorised element operations are cheap
-    at the small d used here.
+    over many small matrices; d^2 vectorised element operations are cheap at
+    the small d used here.
 
     Parameters
     ----------
@@ -215,7 +214,7 @@ def _mstep_from_moments(S, Nk, ssum, reg_covar, d, dt):
     """
     Finalise the M-step from accumulated float64 moments.
 
-    Finalise the M-step from float64 moments S=(resp*s)^T F, Nk, s.sum(1).
+    The moments are S=(resp*s)^T F, Nk and s.sum(1).
 
     Parameters
     ----------
@@ -265,9 +264,9 @@ def _moment_gemm(wr, F):
     """
     Weighted feature moments S = wr^T F, accumulated at float64.
 
-    S = wr^T F accumulated at float64: one GEMM at float64 input, else
-    block-wise float32 GEMMs reduced in float64 (accumulation error scales
-    with sqrt(block) instead of sqrt(N), at plain-SGEMM cost).
+    One GEMM at float64 input, else block-wise float32 GEMMs reduced in float64
+    (accumulation error scales with sqrt(block) instead of sqrt(N), at
+    plain-SGEMM cost).
 
     The float32 blocks are batched over BLOCKS only, with (k, r) folded
     into the GEMM's row dimension: one transient copy of wr[:, :N0] (a
@@ -313,7 +312,7 @@ def _mstep_gemm(F, resp, s, reg_covar, d):
     """
     M-step on the GEMM kernels, single pass.
 
-    M-step via resp^T F; consumes resp in place. float64 accumulation.
+    Via resp^T F; consumes resp in place. float64 accumulation.
 
     Parameters
     ----------
@@ -345,11 +344,10 @@ def _em_step_gemm_nchunked(X, weight_chunks, w, mu, cov, reg_covar, n_chunk,
     """
     One EM iteration on the GEMM kernels, streamed over sample chunks.
 
-    One GEMM EM iteration streamed over sample chunks (float64 moments).
-    `weight_chunks` is a _WeightChunks accessor (a dense (R,N) tensor is
-    wrapped); with `rows`, only those replicates take part, read one sample
-    chunk at a time (an up-front s[rows] would be an (R,N) copy —
-    N/n_chunk units of the streamed budget).
+    The moments accumulate at float64. `weight_chunks` is a _WeightChunks
+    accessor (a dense (R,N) tensor is wrapped); with `rows`, only those
+    replicates take part, read one sample chunk at a time (an up-front s[rows]
+    would be an (R,N) copy — N/n_chunk units of the streamed budget).
 
     Parameters
     ----------
@@ -419,8 +417,7 @@ def _init_draw_block(out, generator):
     """
     One block of the default init's responsibility draw.
 
-    One block of the default init's responsibility draw (a seam the
-    tests spy on to check the draw is identical across chunkings).
+    A seam the tests spy on to check the draw is identical across chunkings.
 
     Parameters
     ----------
@@ -852,7 +849,7 @@ def _m_step(X, resp, s, reg_covar):
     """
     Weighted M-step on the legacy (broadcast) kernels.
 
-    Weighted M-step.  X:(R,N,d), resp:(R,N,K), s:(R,N) sample weights.
+    X:(R,N,d), resp:(R,N,K), s:(R,N) sample weights.
 
     Parameters
     ----------
@@ -914,9 +911,9 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
         only its own (chunk, n_samples) rows.
     w, mu, cov : torch.Tensor
         Initial mixture parameters, shapes (R, K), (R, K, d), (R, K, d, d).
-    reg_covar, threshold_fit : float
+    reg_covar, threshold_fit : float, optional
         As in `estimate`.
-    max_iter : int
+    max_iter : int, optional
         As in `estimate`.
     em_chunk : int, default=8
         Replicates per batch; a CUDA out-of-memory error halves it and
@@ -991,16 +988,14 @@ def _em_step_nchunked(X, weight_chunks, w, mu, chol, logw, reg_covar,
     """
     One EM iteration on the legacy kernels, streamed over sample chunks.
 
-    One EM iteration accumulated over sample chunks (streaming M-step).
-
-    Accumulates N_k, sum resp*(x - mu_old) and sum resp*(x - mu_old)(..)^T
-    per sample-chunk; shifting the moments by the incoming means is
-    algebraically identical to accumulating resp*x / resp*xx^T but avoids
-    the fp32 cancellation of the origin-moment form when |mu|^2 >> var.  As
-    in the GEMM path, the cross-chunk accumulators run at float64 and the
-    finished diagonal is clamped back to the reg_covar floor, which float32
-    rounding of the shifted moments can otherwise undercut. `weight_chunks`
-    and `rows` as in _em_step_gemm_nchunked.
+    Accumulates N_k, sum resp*(x - mu_old) and sum resp*(x - mu_old)(..)^T per
+    sample-chunk; shifting the moments by the incoming means is algebraically
+    identical to accumulating resp*x / resp*xx^T but avoids the fp32
+    cancellation of the origin-moment form when |mu|^2 >> var.  As in the GEMM
+    path, the cross-chunk accumulators run at float64 and the finished diagonal
+    is clamped back to the reg_covar floor, which float32 rounding of the
+    shifted moments can otherwise undercut. `weight_chunks` and `rows` as in
+    _em_step_gemm_nchunked.
 
     Parameters
     ----------
@@ -1087,9 +1082,8 @@ def _reroute_danger(w, mu, cov):
     """
     Per-component danger statistic of the kernel-reroute detector.
 
-    Per-component danger statistic (R,K): (|mu_k|^2 + 1) / min_j diag
-    cov_k, zeroed for dead components, at float64; the estimated
-    log-density residue is u x this.
+    Shape (R,K): (|mu_k|^2 + 1) / min_j diag cov_k, zeroed for dead components,
+    at float64; the estimated log-density residue is u x this.
 
     Parameters
     ----------
@@ -1193,7 +1187,7 @@ def _em_step_mixed(X, F, weights_active, weight_chunks, w, mu, cov,
         Dense weights of the active replicates, shape (n_active, N), on the
         single-pass path; None on the streamed path.
     weight_chunks : _WeightChunks or None
-        The streamed path's weight accessor; None on the single-pass path.
+        The weight accessor; used only on the streamed path.
     w, mu, cov : torch.Tensor
         Parameters of the active replicates, shapes (n_active, K),
         (n_active, K, d), (n_active, K, d, d).
@@ -1290,7 +1284,7 @@ def _em_iteration(X, F, weights_active, weight_chunks, w, mu, cov,
         Dense weights of the active replicates, shape (n_active, N), on the
         single-pass path; None on the streamed path.
     weight_chunks : _WeightChunks or None
-        The streamed path's weight accessor; None on the single-pass path.
+        The weight accessor; used only on the streamed path.
     w, mu, cov : torch.Tensor
         Parameters of the active replicates, shapes (n_active, K),
         (n_active, K, d), (n_active, K, d, d).
@@ -1590,9 +1584,9 @@ def _legacy_score_sum(X, weight_chunks, w, mu, chol, n_chunk, rows=None):
     """
     Weighted log-likelihood sums on the centred legacy kernels.
 
-    Weighted log-likelihood sums via the centred kernels, float64 acc,
-    over sample chunks of `n_chunk` (None: one chunk, which is bitwise the
-    unchunked evaluation) for the `rows` of the accessor `weight_chunks`.
+    Accumulated at float64 over sample chunks of `n_chunk` (None: one chunk,
+    which is bitwise the unchunked evaluation) for the `rows` of the accessor
+    `weight_chunks`.
 
     Parameters
     ----------
@@ -1647,8 +1641,7 @@ def _val_ll_core(X, s_val, w, mu, cov, n_chunk=None):
     """
     `val_ll` for one replicate batch.
 
-    `val_ll` for one replicate batch; returns a ValLLResult
-    (values, n_rerouted).
+    Returns a ValLLResult (values, n_rerouted).
 
     The cross-chunk accumulator runs at float64, as in the EM kernels: at
     float32 the drift of a working-dtype sum grows as sqrt(#chunks) x ulp

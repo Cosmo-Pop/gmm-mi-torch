@@ -81,14 +81,12 @@ def _full_precision(fn):
     """
     Decorator: run `fn` with float32 matmuls pinned to full precision.
 
-    Pin float32 matmuls to full precision for the duration of a call:
-    frameworks that set torch's matmul precision ('high'/'medium' via the
-    legacy API, TF32/bf16 via the per-backend fp32_precision settings of
-    torch >= 2.9) would silently degrade the GEMM-formulated EM. The pin
-    uses the per-backend settings when torch has them (generic,
-    cuda.matmul, mkldnn.matmul — the legacy getter raises once any of
-    those has been set in the process) and the legacy get/set pair
-    otherwise.
+    Frameworks that set torch's matmul precision ('high'/'medium' via the
+    legacy API, TF32/bf16 via the per-backend fp32_precision settings of torch
+    >= 2.9) would silently degrade the GEMM-formulated EM. The pin uses the
+    per-backend settings when torch has them (generic, cuda.matmul,
+    mkldnn.matmul — the legacy getter raises once any of those has been set in
+    the process) and the legacy get/set pair otherwise.
 
     Applied to estimate/estimate_categorical and, so that direct kernel
     calls are covered too, at the cancellation-critical kernel boundaries
@@ -120,13 +118,13 @@ def _entry_precision(fn):
     """
     Decorator for the public estimators: full precision and no autograd.
 
-    _full_precision plus torch.no_grad() for the public estimators: they
-    return plain floats, so an input tensor carrying requires_grad (model
-    latents taken without .detach()) would otherwise build and retain the
-    EM autograd graph of every iteration — several times the peak memory —
-    and crash FittedGMM's .numpy() calls under return_fit=True. em_fit and
-    val_ll keep plain _full_precision: differentiating a log-likelihood
-    with respect to the parameters is legitimate.
+    _full_precision plus torch.no_grad(). The public estimators return plain
+    floats, so an input tensor carrying requires_grad (model latents taken
+    without .detach()) would otherwise build and retain the EM autograd graph
+    of every iteration — several times the peak memory — and crash FittedGMM's
+    .numpy() calls under return_fit=True. em_fit and val_ll keep plain
+    _full_precision: differentiating a log-likelihood with respect to the
+    parameters is legitimate.
 
     Parameters
     ----------
@@ -150,9 +148,8 @@ def _check_chunk_arg(value, name):
     """
     Validate an `em_chunk` or `mc_chunk` argument.
 
-    Validate an `em_chunk` / `mc_chunk` argument: 'auto' is returned as
-    is, anything else coerced to an int >= 1. A float (2.7) fails under the
-    argument's name like every other count.
+    'auto' is returned as is, anything else coerced to an int >= 1. A float
+    (2.7) fails under the argument's name like every other count.
 
     Parameters
     ----------
@@ -178,11 +175,10 @@ def _index_arg(value, name, minimum=None):
     """
     Coerce an integer argument at entry.
 
-    Coerce an integer argument at entry: operator.index accepts numpy
-    integers (the natural output of numpy RNGs in seed sweeps) and rejects
-    floats, so a malformed count fails here under the argument's own name
-    instead of deep inside EM with an opaque torch error after the compute
-    has already been spent.
+    operator.index accepts numpy integers (the natural output of numpy RNGs in
+    seed sweeps) and rejects floats, so a malformed count fails here under the
+    argument's own name instead of deep inside EM with an opaque torch error
+    after the compute has already been spent.
 
     Parameters
     ----------
@@ -210,10 +206,9 @@ def _index_arg(value, name, minimum=None):
 
 def _as_array(X):
     """
-    Turn an array-protocol container into an array torch can read.
+    Unwrap array-protocol containers that torch.as_tensor cannot inspect.
 
-    Unwrap array-protocol containers that torch.as_tensor cannot inspect:
-    a pandas DataFrame exposes __array__ but torch's sequence path fails on
+    A pandas DataFrame exposes __array__ but torch's sequence path fails on
     it with "could not determine the shape of object type 'DataFrame'".
     The container converts itself, so no numpy import is needed, and a
     plain ndarray returns itself (no copy). Read-only arrays (pandas
@@ -246,11 +241,10 @@ def _validate_entry_args(seed, n_bootstrap, mc_samples, max_components,
     """
     Validate the arguments shared by `estimate` and `estimate_categorical`.
 
-    Entry validation shared by estimate and estimate_categorical, so the
-    two cannot drift apart. Returns the integer arguments coerced to plain
-    Python ints (torch.Generator.manual_seed and torch factory sizes reject
-    numpy integers and floats). mc_chunk is only checked here: its 'auto'
-    sizing needs the selected k, so the caller resolves it later.
+    Shared, so the two cannot drift apart. Returns the integer arguments
+    coerced to plain Python ints (torch.Generator.manual_seed and torch factory
+    sizes reject numpy integers and floats). mc_chunk is only checked here: its
+    'auto' sizing needs the selected k, so the caller resolves it later.
 
     Parameters
     ----------
