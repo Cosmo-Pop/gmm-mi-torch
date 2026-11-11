@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gmm-mi-torch"
-version = "0.9.0"
+version = "0.10.0"
 description = "PyTorch port of GMM-MI: mutual information with bootstrap errorbars from Gaussian mixture models, GPU-batched"
 readme = "README.md"
 requires-python = ">=3.9"
