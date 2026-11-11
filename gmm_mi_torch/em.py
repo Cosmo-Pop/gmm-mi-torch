@@ -24,12 +24,26 @@ from .gaussian import _chol, gmm_score, log_gauss
 
 
 def _features(X):
-    """Quadratic features [x, x_i x_j (i<=j)] of X (..., d): (..., d + d(d+1)/2).
+    """
+    Quadratic features of the samples, for the GEMM kernels.
+
+    Quadratic features [x, x_i x_j (i<=j)] of X (..., d): (..., d + d(d+1)/2).
 
     Assembled in place — the output, one gathered operand copied into it,
     the second gathered operand multiplied in — so the transient is
     q + d(d+1)/2 units of n x itemsize; the products are bitwise those of
-    a concatenated assembly."""
+    a concatenated assembly.
+
+    Parameters
+    ----------
+    X : torch.Tensor of shape (..., d)
+        Samples.
+
+    Returns
+    -------
+    torch.Tensor of shape (..., d + d(d+1)/2)
+        The features F, in X's dtype.
+    """
     d = X.shape[-1]
     iu = torch.triu_indices(d, d, device=X.device)
     F = torch.empty(*X.shape[:-1], d + iu.shape[1], dtype=X.dtype,
@@ -41,11 +55,25 @@ def _features(X):
 
 
 def _tri_inv(L):
-    """Batched inverse of lower-triangular (..., d, d) by forward
+    """
+    Batched inverse of lower-triangular matrices.
+
+    Batched inverse of lower-triangular (..., d, d) by forward
     substitution in plain tensor ops. The library routines
     (cholesky_inverse, solve_triangular) are slow on some GPUs when batched
     over many small matrices; d^2 vectorised element operations are cheap
-    at the small d used here."""
+    at the small d used here.
+
+    Parameters
+    ----------
+    L : torch.Tensor of shape (..., d, d)
+        Lower-triangular matrices with non-zero diagonals.
+
+    Returns
+    -------
+    torch.Tensor of shape (..., d, d)
+        Their inverses (lower-triangular).
+    """
     d = L.shape[-1]
     inv_diag = 1.0 / torch.diagonal(L, dim1=-2, dim2=-1)   # (...,d)
     Y = torch.zeros_like(L)
@@ -57,7 +85,8 @@ def _tri_inv(L):
 
 
 def _gauss_coef(w, mu, cov):
-    """GEMM coefficients of the weighted log-density quadratic form.
+    """
+    GEMM coefficients of the weighted log-density quadratic form.
 
     Returns coef (R,K,q), const (R,K) with
     log w_k N(x|mu_k, cov_k) = _features(x) . coef_k + const_k.
@@ -67,6 +96,22 @@ def _gauss_coef(w, mu, cov):
     arithmetic there corrupts the log-density itself, whereas a small error
     in the precision matrix only evaluates the density of a slightly
     perturbed Gaussian.
+
+    Parameters
+    ----------
+    w : torch.Tensor of shape (R, K)
+        Component weights; zero-weight components get a -inf constant.
+    mu : torch.Tensor of shape (R, K, d)
+        Component means.
+    cov : torch.Tensor of shape (R, K, d, d)
+        Component covariances.
+
+    Returns
+    -------
+    coef : torch.Tensor of shape (R, K, q)
+        Coefficients of the features, q = d + d(d+1)/2.
+    const : torch.Tensor of shape (R, K)
+        Constant terms, including log w_k.
     """
     dt = cov.dtype
     d = cov.shape[-1]
@@ -88,8 +133,29 @@ def _gauss_coef(w, mu, cov):
 
 
 def _estep_gemm(F, s, w, mu, cov):
-    """Responsibilities (n_active,N,K) and weighted mean log-likelihood
-    (n_active,)."""
+    """
+    E-step on the GEMM kernels, single pass.
+
+    Responsibilities (n_active,N,K) and weighted mean log-likelihood
+    (n_active,).
+
+    Parameters
+    ----------
+    F : torch.Tensor of shape (N, q)
+        Quadratic features of the samples (`_features`).
+    s : torch.Tensor of shape (n_active, N)
+        Sample weights per replicate.
+    w, mu, cov : torch.Tensor
+        Mixture parameters, shapes (n_active, K), (n_active, K, d),
+        (n_active, K, d, d).
+
+    Returns
+    -------
+    resp : torch.Tensor of shape (n_active, N, K)
+        Responsibilities.
+    ll : torch.Tensor of shape (n_active,)
+        Weighted mean per-sample log-likelihood of the parameters given.
+    """
     coef, const = _gauss_coef(w, mu, cov)
     lj = torch.matmul(F.unsqueeze(0), coef.transpose(1, 2))
     lj += const.unsqueeze(1)                               # (n_active,N,K)
@@ -103,7 +169,8 @@ def _estep_gemm(F, s, w, mu, cov):
 
 
 def _restore_floor(cov, reg_covar):
-    """Restore the reg_covar floor on a finished M-step covariance, in place.
+    """
+    Restore the reg_covar floor on a finished M-step covariance, in place.
 
     Rounding of the (origin or shifted) moments can push a collapsed
     component's variance below reg_covar; the diagonal is clamped back. For
@@ -117,7 +184,20 @@ def _restore_floor(cov, reg_covar):
     verbatim, so data that never clamps is bitwise unaffected. At d >= 3
     the pairwise bound is necessary, not sufficient — the residue's signs
     can leave lambda_min ~ -reg_covar — but the matrix is then inside the
-    escalation's reach (one warning), where the unbounded one is not."""
+    escalation's reach (one warning), where the unbounded one is not.
+
+    Parameters
+    ----------
+    cov : torch.Tensor of shape (..., d, d)
+        Covariances, modified in place.
+    reg_covar : float
+        The floor.
+
+    Returns
+    -------
+    torch.Tensor of shape (..., d, d)
+        `cov` itself.
+    """
     diag = torch.diagonal(cov, dim1=-2, dim2=-1)
     clamped = (diag < reg_covar).any(-1)                        # (R,K)
     diag.clamp_(min=reg_covar)
@@ -132,7 +212,33 @@ def _restore_floor(cov, reg_covar):
 
 
 def _mstep_from_moments(S, Nk, ssum, reg_covar, d, dt):
-    """Finalise the M-step from float64 moments S=(resp*s)^T F, Nk, s.sum(1)."""
+    """
+    Finalise the M-step from accumulated float64 moments.
+
+    Finalise the M-step from float64 moments S=(resp*s)^T F, Nk, s.sum(1).
+
+    Parameters
+    ----------
+    S : torch.Tensor of shape (R, K, q)
+        Weighted feature moments, float64.
+    Nk : torch.Tensor of shape (R, K)
+        Weighted responsibility sums, float64.
+    ssum : torch.Tensor of shape (R,)
+        Total sample weight per replicate.
+    reg_covar : float
+        Covariance floor.
+    d : int
+        Number of variables.
+    dt : torch.dtype
+        Working dtype of the results.
+
+    Returns
+    -------
+    w, mu, cov : torch.Tensor
+        Weights (R, K), means (R, K, d) and covariances (R, K, d, d) at
+        `dt`; dead components (Nk < 1e-10) get weight 0, mean 0 and
+        identity covariance.
+    """
     dev = S.device
     dead = Nk < 1e-10
     Nks = Nk.clamp_min(1e-10).unsqueeze(-1)
@@ -156,7 +262,10 @@ def _mstep_from_moments(S, Nk, ssum, reg_covar, d, dt):
 
 
 def _moment_gemm(wr, F):
-    """S = wr^T F accumulated at float64: one GEMM at float64 input, else
+    """
+    Weighted feature moments S = wr^T F, accumulated at float64.
+
+    S = wr^T F accumulated at float64: one GEMM at float64 input, else
     block-wise float32 GEMMs reduced in float64 (accumulation error scales
     with sqrt(block) instead of sqrt(N), at plain-SGEMM cost).
 
@@ -165,6 +274,18 @@ def _moment_gemm(wr, F):
     view at K = 1), and F is never broadcast (why: docs/design_notes.md).
     Per block the dot products are 512 float32 terms, the cross-block sum
     float64 terms.
+
+    Parameters
+    ----------
+    wr : torch.Tensor of shape (R, N, K)
+        Weighted responsibilities.
+    F : torch.Tensor of shape (N, q)
+        Quadratic features of the samples.
+
+    Returns
+    -------
+    torch.Tensor of shape (R, K, q)
+        The moments, float64.
     """
     R, N, K = wr.shape
     q = F.shape[-1]
@@ -189,7 +310,30 @@ def _moment_gemm(wr, F):
 
 
 def _mstep_gemm(F, resp, s, reg_covar, d):
-    """M-step via resp^T F; consumes resp in place. float64 accumulation."""
+    """
+    M-step on the GEMM kernels, single pass.
+
+    M-step via resp^T F; consumes resp in place. float64 accumulation.
+
+    Parameters
+    ----------
+    F : torch.Tensor of shape (N, q)
+        Quadratic features of the samples.
+    resp : torch.Tensor of shape (R, N, K)
+        Responsibilities; overwritten with resp * s.
+    s : torch.Tensor of shape (R, N)
+        Sample weights.
+    reg_covar : float
+        Covariance floor.
+    d : int
+        Number of variables.
+
+    Returns
+    -------
+    w, mu, cov : torch.Tensor
+        Updated weights (R, K), means (R, K, d) and covariances
+        (R, K, d, d), in F's dtype.
+    """
     wr = resp.mul_(s.unsqueeze(-1))
     S = _moment_gemm(wr, F)
     return _mstep_from_moments(S, wr.sum(1).double(), s.sum(1), reg_covar, d,
@@ -198,11 +342,38 @@ def _mstep_gemm(F, resp, s, reg_covar, d):
 
 def _em_step_gemm_nchunked(X, weight_chunks, w, mu, cov, reg_covar, n_chunk,
                            rows=None):
-    """One GEMM EM iteration streamed over sample chunks (float64 moments).
+    """
+    One EM iteration on the GEMM kernels, streamed over sample chunks.
+
+    One GEMM EM iteration streamed over sample chunks (float64 moments).
     `weight_chunks` is a _WeightChunks accessor (a dense (R,N) tensor is
     wrapped); with `rows`, only those replicates take part, read one sample
     chunk at a time (an up-front s[rows] would be an (R,N) copy —
-    N/n_chunk units of the streamed budget)."""
+    N/n_chunk units of the streamed budget).
+
+    Parameters
+    ----------
+    X : torch.Tensor of shape (N, d)
+        Shared data.
+    weight_chunks : _WeightChunks or torch.Tensor
+        Sample weights, an accessor or a dense (R, N) tensor.
+    w, mu, cov : torch.Tensor
+        Parameters of the replicates taking part, shapes (n_active, K),
+        (n_active, K, d), (n_active, K, d, d).
+    reg_covar : float
+        Covariance floor.
+    n_chunk : int
+        Samples per chunk.
+    rows : torch.Tensor, optional
+        Replicate rows of the accessor taking part; None for all.
+
+    Returns
+    -------
+    ll : torch.Tensor of shape (n_active,)
+        Weighted mean per-sample log-likelihood of the incoming parameters.
+    w, mu, cov : torch.Tensor
+        Parameters after the M-step, same shapes as the inputs.
+    """
     weight_chunks = _as_weight_chunks(weight_chunks, n_chunk)
     n_active, N = weight_chunks.shape
     if rows is not None:
@@ -245,8 +416,19 @@ def _em_step_gemm_nchunked(X, weight_chunks, w, mu, cov, reg_covar, n_chunk,
 # ----------------------------------------------------------------------
 
 def _init_draw_block(out, generator):
-    """One block of the default init's responsibility draw (a seam the
-    tests spy on to check the draw is identical across chunkings)."""
+    """
+    One block of the default init's responsibility draw.
+
+    One block of the default init's responsibility draw (a seam the
+    tests spy on to check the draw is identical across chunkings).
+
+    Parameters
+    ----------
+    out : torch.Tensor
+        Buffer filled in place with uniform draws.
+    generator : torch.Generator
+        The replicate's generator.
+    """
     out.uniform_(generator=generator)
 
 
@@ -531,7 +713,8 @@ def _kmeans_assign_stats(sl, X, x2, centres, alive, reg_covar, n_chunk):
 def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
                  init_type='random_responsibilities', scale=None, em_chunk=8,
                  n_chunk=None):
-    """Batched GMM parameter initialisation (torch ports of GMM-MI's inits).
+    """
+    Batched GMM parameter initialisation (torch ports of GMM-MI's inits).
 
     init_type:
         'random_responsibilities' : GMM-MI's 'random_sklearn' (default);
@@ -556,6 +739,36 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
     computed from it are bitwise chunk-invariant on CPU and move at
     reduction order on CUDA, and the streamed moments agree with the
     single pass at reduction order.
+
+    Parameters
+    ----------
+    X : torch.Tensor of shape (N, d)
+        Shared data.
+    K : int
+        Number of components (the padded maximum when `active_k` is given).
+    R : int
+        Number of replicates.
+    reg_covar : float
+        Covariance floor.
+    generator : torch.Generator, optional
+        Device-matched RNG; every random draw of the init comes from it.
+    active_k : torch.Tensor of shape (R,), optional
+        Live component count per replicate; None means K for all.
+    init_type : str, default='random_responsibilities'
+        One of the four above.
+    scale : float, optional
+        Mean-push scale of 'randomized_kmeans' (default 1), and the scale
+        of the minmax covariances (as in `estimate`).
+    em_chunk : int, default=8
+        Replicates per batch.
+    n_chunk : int, optional
+        Stream the samples in chunks of this size (rounded to draw blocks).
+
+    Returns
+    -------
+    w, mu, cov : torch.Tensor
+        Initial weights (R, K), means (R, K, d) and covariances
+        (R, K, d, d).
     """
     N, d = X.shape
     dev, dt = X.device, X.dtype
@@ -636,7 +849,28 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
 
 
 def _m_step(X, resp, s, reg_covar):
-    """Weighted M-step.  X:(R,N,d), resp:(R,N,K), s:(R,N) sample weights."""
+    """
+    Weighted M-step on the legacy (broadcast) kernels.
+
+    Weighted M-step.  X:(R,N,d), resp:(R,N,K), s:(R,N) sample weights.
+
+    Parameters
+    ----------
+    X : torch.Tensor of shape (R, N, d)
+        Samples, per replicate (typically an expand() view).
+    resp : torch.Tensor of shape (R, N, K)
+        Responsibilities.
+    s : torch.Tensor of shape (R, N)
+        Sample weights.
+    reg_covar : float
+        Covariance floor.
+
+    Returns
+    -------
+    w, mu, cov : torch.Tensor
+        Updated weights (R, K), means (R, K, d) and covariances
+        (R, K, d, d).
+    """
     wr = resp * s.unsqueeze(-1)                           # (R,N,K)
     Nk = wr.sum(1)                                        # (R,K)
     dead = Nk < 1e-10
@@ -659,7 +893,8 @@ def _m_step(X, resp, s, reg_covar):
 @_full_precision
 def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, em_chunk=8,
            n_chunk=None):
-    """Weighted EM over a leading replicate dimension, in replicate chunks.
+    """
+    Weighted EM over a leading replicate dimension, in replicate chunks.
 
     Replicates (CV fits, bootstrap realisations) are independent, so they are
     processed in chunks of `em_chunk` purely to bound peak memory; results do
@@ -679,13 +914,15 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
         only its own (chunk, n_samples) rows.
     w, mu, cov : torch.Tensor
         Initial mixture parameters, shapes (R, K), (R, K, d), (R, K, d, d).
-    reg_covar, threshold_fit, max_iter
+    reg_covar, threshold_fit : float
+        As in `estimate`.
+    max_iter : int
         As in `estimate`.
     em_chunk : int, default=8
         Replicates per batch; a CUDA out-of-memory error halves it and
         retries (with a RuntimeWarning). Bitwise chunk-invariant on CPU
         except em_chunk=1 with a one-component model at float32; on CUDA
-        see `estimate`, Notes, "Reproducibility".
+        see docs/estimate_notes.md, "Reproducibility".
     n_chunk : int, optional
         As in `estimate`.
 
@@ -751,16 +988,48 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
 
 def _em_step_nchunked(X, weight_chunks, w, mu, chol, logw, reg_covar,
                       n_chunk, rows=None):
-    """One EM iteration accumulated over sample chunks (streaming M-step).
+    """
+    One EM iteration on the legacy kernels, streamed over sample chunks.
+
+    One EM iteration accumulated over sample chunks (streaming M-step).
 
     Accumulates N_k, sum resp*(x - mu_old) and sum resp*(x - mu_old)(..)^T
-    per sample-chunk; shifting the moments by the incoming means is algebraically
-    identical to accumulating resp*x / resp*xx^T but avoids the fp32
-    cancellation of the origin-moment form when |mu|^2 >> var.  As in the
-    GEMM path, the cross-chunk accumulators run at float64 and the finished
-    diagonal is clamped back to the reg_covar floor, which float32 rounding
-    of the shifted moments can otherwise undercut. `weight_chunks` and
-    `rows` as in _em_step_gemm_nchunked."""
+    per sample-chunk; shifting the moments by the incoming means is
+    algebraically identical to accumulating resp*x / resp*xx^T but avoids
+    the fp32 cancellation of the origin-moment form when |mu|^2 >> var.  As
+    in the GEMM path, the cross-chunk accumulators run at float64 and the
+    finished diagonal is clamped back to the reg_covar floor, which float32
+    rounding of the shifted moments can otherwise undercut. `weight_chunks`
+    and `rows` as in _em_step_gemm_nchunked.
+
+    Parameters
+    ----------
+    X : torch.Tensor of shape (N, d)
+        Shared data.
+    weight_chunks : _WeightChunks or torch.Tensor
+        Sample weights, an accessor or a dense (R, N) tensor.
+    w, mu : torch.Tensor
+        Weights (n_active, K) and means (n_active, K, d) of the replicates
+        taking part.
+    chol : torch.Tensor of shape (n_active, K, d, d)
+        Cholesky factors of their covariances.
+    logw : torch.Tensor of shape (n_active, K)
+        Log weights, -inf for dead components.
+    reg_covar : float
+        Covariance floor.
+    n_chunk : int
+        Samples per chunk.
+    rows : torch.Tensor, optional
+        Replicate rows of the accessor taking part; None for all.
+
+    Returns
+    -------
+    ll : torch.Tensor of shape (n_active,)
+        Weighted mean per-sample log-likelihood of the incoming parameters.
+    w, mu, cov : torch.Tensor
+        Parameters after the M-step, shapes (n_active, K), (n_active, K, d),
+        (n_active, K, d, d).
+    """
     weight_chunks = _as_weight_chunks(weight_chunks, n_chunk)
     n_active, N = weight_chunks.shape
     if rows is not None:
@@ -815,9 +1084,23 @@ _REROUTE_TOL_NATS = 1e-3
 
 
 def _reroute_danger(w, mu, cov):
-    """Per-component danger statistic (R,K): (|mu_k|^2 + 1) / min_j diag
+    """
+    Per-component danger statistic of the kernel-reroute detector.
+
+    Per-component danger statistic (R,K): (|mu_k|^2 + 1) / min_j diag
     cov_k, zeroed for dead components, at float64; the estimated
-    log-density residue is u x this."""
+    log-density residue is u x this.
+
+    Parameters
+    ----------
+    w, mu, cov : torch.Tensor
+        Mixture parameters, shapes (R, K), (R, K, d), (R, K, d, d).
+
+    Returns
+    -------
+    torch.Tensor of shape (R, K)
+        The statistic, float64.
+    """
     dmin = torch.diagonal(cov, dim1=-2, dim2=-1).double().amin(-1)   # (R,K)
     dgr = (mu.double().pow(2).sum(-1) + 1.0) \
         / dmin.clamp_min(torch.finfo(torch.float64).tiny)
@@ -825,8 +1108,25 @@ def _reroute_danger(w, mu, cov):
 
 
 def _reroute_trips(w, mu, cov, repaired=None):
-    """(R,) bool: replicates with a component whose GEMM residue would
-    exceed _REROUTE_TOL_NATS at this dtype's unit roundoff."""
+    """
+    Replicates the GEMM kernels cannot evaluate at this dtype's precision.
+
+    (R,) bool: replicates with a component whose GEMM residue would
+    exceed _REROUTE_TOL_NATS at this dtype's unit roundoff.
+
+    Parameters
+    ----------
+    w, mu, cov : torch.Tensor
+        Mixture parameters, shapes (R, K), (R, K, d), (R, K, d, d).
+    repaired : torch.Tensor of shape (R, K), optional
+        Components `_chol` had to repair; they trip at a tenfold lower
+        threshold.
+
+    Returns
+    -------
+    torch.Tensor of shape (R,)
+        Bool, True for the replicates to reroute.
+    """
     u = torch.finfo(cov.dtype).eps / 2.0        # unit roundoff, not eps
     thr = _REROUTE_TOL_NATS / u
     dgr = _reroute_danger(w, mu, cov)                                # (R,K)
@@ -1108,7 +1408,7 @@ class EMResult(NamedTuple):
 
     A tuple, so slicing (`res[:4]`) and positional reads still work.
 
-    Attributes
+    Parameters
     ----------
     w, mu, cov : torch.Tensor
         Fitted parameters, shapes (R, K), (R, K, d), (R, K, d, d).
@@ -1129,7 +1429,8 @@ class EMResult(NamedTuple):
 
 def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500,
                  n_chunk=None):
-    """Weighted EM, batched over replicates.
+    """
+    Weighted EM, batched over replicates.
 
     X: (N,d) shared data; s: (R,N) per-replicate sample weights, or a
     _WeightChunks accessor on the streamed path (n_chunk set), where the
@@ -1147,6 +1448,28 @@ def _em_fit_core(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=
     only), one EM step on the kernels each replicate needs
     (`_em_iteration`), the convergence test, and the compaction of the
     converged replicates (`_compact_converged`).
+
+    Parameters
+    ----------
+    X : torch.Tensor of shape (N, d)
+        Shared data.
+    s : torch.Tensor of shape (R, N) or _WeightChunks
+        Per-replicate sample weights.
+    w, mu, cov : torch.Tensor
+        Initial parameters, shapes (R, K), (R, K, d), (R, K, d, d).
+    reg_covar : float, default=1e-6
+        Covariance floor.
+    threshold_fit : float, default=1e-5
+        Convergence threshold on the change of `ll`.
+    max_iter : int, default=500
+        Maximum EM iterations.
+    n_chunk : int, optional
+        Sample chunk of the streamed path; None for the single pass.
+
+    Returns
+    -------
+    EMResult
+        (w, mu, cov, ll, n_unconverged, n_rerouted), as described above.
     """
     stream = n_chunk is not None
     if isinstance(s, _WeightChunks):
@@ -1264,9 +1587,33 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None, em_chunk=None):
 
 
 def _legacy_score_sum(X, weight_chunks, w, mu, chol, n_chunk, rows=None):
-    """Weighted log-likelihood sums via the centred kernels, float64 acc,
+    """
+    Weighted log-likelihood sums on the centred legacy kernels.
+
+    Weighted log-likelihood sums via the centred kernels, float64 acc,
     over sample chunks of `n_chunk` (None: one chunk, which is bitwise the
-    unchunked evaluation) for the `rows` of the accessor `weight_chunks`."""
+    unchunked evaluation) for the `rows` of the accessor `weight_chunks`.
+
+    Parameters
+    ----------
+    X : torch.Tensor of shape (N, d)
+        Shared data.
+    weight_chunks : _WeightChunks or torch.Tensor
+        Sample weights, an accessor or a dense (R, N) tensor.
+    w, mu : torch.Tensor
+        Weights and means of the rows scored.
+    chol : torch.Tensor
+        Cholesky factors of their covariances.
+    n_chunk : int or None
+        Samples per chunk; None scores all samples at once.
+    rows : torch.Tensor, optional
+        Replicate rows of the accessor to score; None for all.
+
+    Returns
+    -------
+    torch.Tensor of shape (n_rows,)
+        Sum over samples of weight x log-density, float64.
+    """
     weight_chunks = _as_weight_chunks(weight_chunks, n_chunk)
     R, N = weight_chunks.shape
     if rows is not None:
@@ -1285,7 +1632,7 @@ class ValLLResult(NamedTuple):
     """
     Result of `_val_ll_core` for one replicate batch (a tuple).
 
-    Attributes
+    Parameters
     ----------
     values : torch.Tensor
         Weighted mean per-sample log-likelihood per replicate, shape (R,).
@@ -1297,7 +1644,10 @@ class ValLLResult(NamedTuple):
 
 
 def _val_ll_core(X, s_val, w, mu, cov, n_chunk=None):
-    """`val_ll` for one replicate batch; returns a ValLLResult
+    """
+    `val_ll` for one replicate batch.
+
+    `val_ll` for one replicate batch; returns a ValLLResult
     (values, n_rerouted).
 
     The cross-chunk accumulator runs at float64, as in the EM kernels: at
@@ -1308,7 +1658,24 @@ def _val_ll_core(X, s_val, w, mu, cov, n_chunk=None):
     so the scoring stage stays inside the budget em_chunk was sized with
     (a RuntimeWarning per call reports them, as in em_fit). `s_val` is a dense
     (R,N) tensor or a _WeightChunks accessor; either way the weights are
-    read per sample chunk and only the rerouted rows are ever gathered."""
+    read per sample chunk and only the rerouted rows are ever gathered.
+
+    Parameters
+    ----------
+    X : torch.Tensor of shape (N, d)
+        Shared data.
+    s_val : torch.Tensor of shape (R, N) or _WeightChunks
+        Weights selecting the scored samples.
+    w, mu, cov : torch.Tensor
+        Mixture parameters, shapes (R, K), (R, K, d), (R, K, d, d).
+    n_chunk : int, optional
+        Samples per chunk; None scores all samples at once.
+
+    Returns
+    -------
+    ValLLResult
+        (values, n_rerouted).
+    """
     weight_chunks = (
         s_val if isinstance(s_val, _WeightChunks)
         else _WeightChunks(s_val, slice(0, s_val.shape[0]), n_chunk))

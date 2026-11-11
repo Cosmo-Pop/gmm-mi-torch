@@ -48,7 +48,25 @@ from .em import EMResult, ValLLResult, val_ll  # noqa: F401
 # ----------------------------------------------------------------------
 
 def _integrand_MI(pts, w, mu, cov, chol):
-    """log p(x,y) - log p(x) - log p(y) at the sampled points."""
+    """
+    Integrand of the mutual information I(x; y).
+
+    log p(x,y) - log p(x) - log p(y) at the sampled points.
+
+    Parameters
+    ----------
+    pts : torch.Tensor of shape (B, S, d)
+        Monte Carlo samples from each replicate's mixture.
+    w, mu, cov, chol : torch.Tensor
+        Mixture weights (B, K), means (B, K, d), covariances (B, K, d, d)
+        and their Cholesky factors.
+
+    Returns
+    -------
+    torch.Tensor of shape (B, S)
+        The integrand at each sample; its mean over S is the estimate, in
+        nats.
+    """
     joint = gmm_score(pts, w, mu, chol)
     mx = marginal_score(pts, w, mu, cov, [0])
     my = marginal_score(pts, w, mu, cov, [1])
@@ -56,7 +74,25 @@ def _integrand_MI(pts, w, mu, cov, chol):
 
 
 def _integrand_cMI(pts, w, mu, cov, chol):
-    """log p(x,y,z) + log p(z) - log p(x,z) - log p(y,z)."""
+    """
+    Integrand of the conditional mutual information I(x; y | z).
+
+    log p(x,y,z) + log p(z) - log p(x,z) - log p(y,z).
+
+    Parameters
+    ----------
+    pts : torch.Tensor of shape (B, S, d)
+        Monte Carlo samples from each replicate's mixture.
+    w, mu, cov, chol : torch.Tensor
+        Mixture weights (B, K), means (B, K, d), covariances (B, K, d, d)
+        and their Cholesky factors.
+
+    Returns
+    -------
+    torch.Tensor of shape (B, S)
+        The integrand at each sample; its mean over S is the estimate, in
+        nats.
+    """
     d = pts.shape[-1]
     zs = list(range(2, d))
     joint = gmm_score(pts, w, mu, chol)
@@ -67,7 +103,25 @@ def _integrand_cMI(pts, w, mu, cov, chol):
 
 
 def _integrand_TC(pts, w, mu, cov, chol):
-    """log p(x) - sum_i log p(x_i)."""
+    """
+    Integrand of the total correlation.
+
+    log p(x) - sum_i log p(x_i).
+
+    Parameters
+    ----------
+    pts : torch.Tensor of shape (B, S, d)
+        Monte Carlo samples from each replicate's mixture.
+    w, mu, cov, chol : torch.Tensor
+        Mixture weights (B, K), means (B, K, d), covariances (B, K, d, d)
+        and their Cholesky factors.
+
+    Returns
+    -------
+    torch.Tensor of shape (B, S)
+        The integrand at each sample; its mean over S is the estimate, in
+        nats.
+    """
     joint = gmm_score(pts, w, mu, chol)
     marg = sum(marginal_score(pts, w, mu, cov, [i])
                for i in range(pts.shape[-1]))
@@ -75,9 +129,27 @@ def _integrand_TC(pts, w, mu, cov, chol):
 
 
 def _integrand_KL_forward(pts, w, mu, cov, chol):
-    """KL[p(x)||p(y)] between the two 1D marginals (GMM-MI estimate_KL_MC):
+    """
+    Integrand of KL[p(x) || p(y)] between the two 1-D marginals.
+
+    KL[p(x)||p(y)] between the two 1D marginals (GMM-MI estimate_KL_MC):
     E_{x~p(x)}[log p_x(x) - log p_y(x)], with x the first column of the
-    joint samples."""
+    joint samples.
+
+    Parameters
+    ----------
+    pts : torch.Tensor of shape (B, S, d)
+        Monte Carlo samples from each replicate's mixture.
+    w, mu, cov, chol : torch.Tensor
+        Mixture weights (B, K), means (B, K, d), covariances (B, K, d, d)
+        and their Cholesky factors.
+
+    Returns
+    -------
+    torch.Tensor of shape (B, S)
+        The integrand at each sample; its mean over S is the estimate, in
+        nats.
+    """
     x = pts[..., [0]]
     mu_x, cov_x = marginal_params(mu, cov, [0])
     mu_y, cov_y = marginal_params(mu, cov, [1])
@@ -86,7 +158,25 @@ def _integrand_KL_forward(pts, w, mu, cov, chol):
 
 
 def _integrand_KL_reverse(pts, w, mu, cov, chol):
-    """KL[p(y)||p(x)]: E_{y~p(y)}[log p_y(y) - log p_x(y)]."""
+    """
+    Integrand of KL[p(y) || p(x)] between the two 1-D marginals.
+
+    KL[p(y)||p(x)]: E_{y~p(y)}[log p_y(y) - log p_x(y)].
+
+    Parameters
+    ----------
+    pts : torch.Tensor of shape (B, S, d)
+        Monte Carlo samples from each replicate's mixture.
+    w, mu, cov, chol : torch.Tensor
+        Mixture weights (B, K), means (B, K, d), covariances (B, K, d, d)
+        and their Cholesky factors.
+
+    Returns
+    -------
+    torch.Tensor of shape (B, S)
+        The integrand at each sample; its mean over S is the estimate, in
+        nats.
+    """
     y = pts[..., [1]]
     mu_x, cov_x = marginal_params(mu, cov, [0])
     mu_y, cov_y = marginal_params(mu, cov, [1])
@@ -104,7 +194,8 @@ _GAUSSIANISE_TIE_WARN_FRACTION = 0.01
 
 
 def _rank_gaussianise(X, tie_rank='average', generator=None):
-    """Per-variable rank-probit transform: X -> Phi^{-1}(rank / (N+1)).
+    """
+    Per-variable rank-probit transform: X -> Phi^{-1}(rank / (N+1)).
 
     MI, cMI and TC are invariant under per-variable diffeomorphisms, so no
     correction term is needed.  Ranks and quantiles are computed at float64
@@ -128,6 +219,20 @@ def _rank_gaussianise(X, tie_rank='average', generator=None):
                     single probit atom.
     Neither convention makes a GMM fit of heavily tied data reliable; the
     warning below recommends preprocess='none' there.
+
+    Parameters
+    ----------
+    X : torch.Tensor of shape (N, d)
+        The data.
+    tie_rank : {'average', 'random'}, default='average'
+        How tied values are ranked, as above.
+    generator : torch.Generator, optional
+        CPU generator for the random tie order.
+
+    Returns
+    -------
+    torch.Tensor of shape (N, d)
+        The transformed data, in X's dtype and on X's device.
     """
     N = X.shape[0]
     cols, tie_frac = [], []
@@ -185,7 +290,8 @@ def _rank_gaussianise(X, tie_rank='average', generator=None):
 
 
 def _select_and_fit(X, selection, fit):
-    """Component selection and best CV fit for one dataset.
+    """
+    Component selection and best CV fit for one dataset.
 
     The single home of the selection pipeline shared by `estimate` and
     `estimate_categorical` (per-category), so the two cannot drift apart:
@@ -203,6 +309,22 @@ def _select_and_fit(X, selection, fit):
     smaller than the selected/requested k when components died during the
     CV fit (a RuntimeWarning says so for a requested
     fixed_components_number).
+
+    Parameters
+    ----------
+    X : torch.Tensor of shape (N, d)
+        The standardised data, on the working device and dtype.
+    selection : dict
+        The selection knobs, as above.
+    fit : dict
+        The fit settings, as above.
+
+    Returns
+    -------
+    k : int
+        Live component count.
+    params : tuple of torch.Tensor
+        (w, mu, cov) of the best CV fit, shapes (k,), (k, d), (k, d, d).
     """
     N, d = X.shape
     IF = selection['n_inits'] * selection['n_folds']
@@ -290,7 +412,8 @@ def _select_and_fit(X, selection, fit):
 
 
 def _bootstrap_counts(N, B, dtype, device, generator):
-    """Uniform multinomial bootstrap resample counts, shape (B, N).
+    """
+    Uniform multinomial bootstrap resample counts, shape (B, N).
 
     Identical in distribution to index resampling. Up to
     _MULTINOMIAL_MAX_CATEGORIES (torch.multinomial's cap, 2^24) the counts
@@ -310,6 +433,24 @@ def _bootstrap_counts(N, B, dtype, device, generator):
     The uniformity bounds of both paths, the CUDA multinomial's
     float32-resolution weight scatter, the clamp proof and the CPU
     per-replicate seed space: docs/design_notes.md, "Bootstrap resample".
+
+    Parameters
+    ----------
+    N : int
+        Number of samples.
+    B : int
+        Number of bootstrap replicates.
+    dtype : torch.dtype
+        Dtype of the counts.
+    device : str or torch.device
+        Device of the counts.
+    generator : torch.Generator
+        Device-matched RNG.
+
+    Returns
+    -------
+    torch.Tensor of shape (B, N)
+        Resample counts; each row sums to N.
     """
     if N <= _MULTINOMIAL_MAX_CATEGORIES:
         idx = torch.multinomial(
@@ -334,7 +475,25 @@ def _bootstrap_counts(N, B, dtype, device, generator):
 
 
 def _warm_start(w1, mu1, cov1, B):
-    """Expand one CV-selected parameter set to B bootstrap replicates."""
+    """
+    Expand one CV-selected parameter set to B bootstrap replicates.
+
+    Parameters
+    ----------
+    w1 : torch.Tensor of shape (K,)
+        Weights.
+    mu1 : torch.Tensor of shape (K, d)
+        Means.
+    cov1 : torch.Tensor of shape (K, d, d)
+        Covariances.
+    B : int
+        Number of replicates.
+
+    Returns
+    -------
+    w, mu, cov : torch.Tensor
+        Contiguous copies, shapes (B, K), (B, K, d), (B, K, d, d).
+    """
     K, d = mu1.shape
     return (w1.unsqueeze(0).expand(B, K).contiguous(),
             mu1.unsqueeze(0).expand(B, K, d).contiguous(),
@@ -378,7 +537,24 @@ class FittedGMM:
         self.n_components = int(w.shape[0])
 
     def sample(self, n_samples, seed=0):
-        """Draw `n_samples` from the mixture; returns a (n_samples, d) numpy array."""
+        """
+        Draw `n_samples` from the mixture.
+
+        Draw `n_samples` from the mixture; returns a (n_samples, d) numpy
+        array.
+
+        Parameters
+        ----------
+        n_samples : int
+            Number of samples.
+        seed : int, default=0
+            Seed of the sampling generator.
+
+        Returns
+        -------
+        numpy.ndarray of shape (n_samples, d)
+            The samples, in the units of the fitted model.
+        """
         g = torch.Generator(device=self._w.device).manual_seed(seed)
         pts = gmm_sample(self._w.unsqueeze(0), self._mu.unsqueeze(0),
                          self._chol.unsqueeze(0), int(n_samples),
@@ -386,10 +562,24 @@ class FittedGMM:
         return pts[0].cpu().numpy()
 
     def score_samples(self, X):
-        """Mixture log-density at X of shape (n, d); returns a (n,) numpy
+        """
+        Mixture log-density at X.
+
+        Mixture log-density at X of shape (n, d); returns a (n,) numpy
         array. A 1-D X is n points of a 1-D model, or one point of a d-D
         model (sklearn rejects 1-D input); any other shape raises a
-        ValueError naming the expected one."""
+        ValueError naming the expected one.
+
+        Parameters
+        ----------
+        X : array-like of shape (n, d) or (n,)
+            Points, in the units of the fitted model.
+
+        Returns
+        -------
+        numpy.ndarray of shape (n,)
+            Log-density at each point.
+        """
         Xt = torch.as_tensor(_as_array(X), dtype=self._mu.dtype,
                              device=self._mu.device)
         d = self._mu.shape[-1]
@@ -453,7 +643,8 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
              init_type='random_responsibilities',
              scale=None, fixed_components_number=None, metric_method='valid',
              threshold_components=1e-5, patience=1, n_chunk=None):
-    """Estimate an information-theoretic quantity with bootstrap errorbars.
+    """
+    Estimate an information-theoretic quantity with bootstrap errorbars.
 
     One joint GMM is fitted to all columns of `X` (component count chosen by
     cross-validation); every marginal needed by the requested quantity is then
@@ -543,8 +734,9 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         How gaussianise ranks tied values: 'random' breaks each column's ties
         with a seeded random ordering; 'average' is the deterministic scipy
         rankdata convention. See Notes.
-    init_type : {'random_responsibilities', 'minmax', 'kmeans', 'randomized_kmeans'}, default='random_responsibilities'
-        GMM initialisation scheme (torch ports of GMM-MI's initialisations).
+    init_type : str, default='random_responsibilities'
+        GMM initialisation scheme (torch ports of GMM-MI's initialisations):
+        'random_responsibilities', 'minmax', 'kmeans' or 'randomized_kmeans'.
         'random_responsibilities' is cheap and adequate for easy fits; the
         k-means variants are more robust on well-separated multimodal data.
         See Notes for their memory at large N.
@@ -649,109 +841,8 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
 
     Notes
     -----
-    *Selection.* The batched protocol fits every candidate k at once, so
-    no k's evaluation depends on another's: it is robust to initialisation
-    noise and the fast option on GPU. The sequential protocol is cheaper
-    on CPU when it stops early, but a single bad initialisation near a
-    plateau can gate off better models at higher k.
-
-    *Standardisation and regularisation.* The data are standardised
-    internally before fitting: each variable is affinely mapped to zero
-    mean and unit variance (the KL quantities use a single map shared by
-    both columns, under which KL is invariant). All estimated quantities
-    are exactly invariant under these maps, and the `return_fit` model is
-    transformed back (only through this affine map: with
-    preprocess='gaussianise' the model stays in rank-probit space), so the
-    standardisation is unobservable except through `reg_covar` (a
-    scale-free floor), the `scale` argument of the minmax/randomized
-    k-means initialisers (in standardised units), and the absence of
-    float32 failures on unstandardised data. For the KL quantities the
-    shared map makes the `reg_covar` floor relative to the two columns'
-    POOLED variance: with strongly mismatched marginal scales, use a
-    smaller reg_covar so the narrow marginal is not over-regularised.
-    Smaller values of reg_covar perturb the estimate less but risk failed
-    Cholesky factorisations; a component whose factorisation still fails
-    receives escalating diagonal regularisation automatically (with a
-    RuntimeWarning) instead of aborting the fit.
-
-    The standardisation (and the rank transform) run at float64 BEFORE the
-    cast to the working dtype, so float32 runs are safe on data with large
-    offsets (MJDs, timestamps): the cast sees already-centred values. This
-    costs a one-off float64 copy of X at entry. Input that is itself
-    float32 cannot be un-quantised; pass float64 (or raw) data where
-    offsets are large relative to the spread. The entry transient is that
-    float64 copy plus the standardisation's reductions and the finiteness
-    mask (about two to three times the float64 size of X, more under
-    gaussianise), on the input's device for tensor input.
-
-    *Preprocessing.* 'gaussianise' maps each variable to
-    Phi^{-1}(rank / (N + 1)). MI, cMI and TC are invariant under
-    per-variable diffeomorphisms, so this changes only the difficulty of
-    the density estimation: heavy tails and monotone nonlinearities that
-    would require many components (or defeat the fit entirely) are
-    removed. It is rejected (ValueError) for the KL quantities, which are
-    not invariant under marginal transforms. With return_fit=True the
-    returned model describes the rank-probit-transformed data, not the
-    original units (the rank transform has no parametric inverse); a
-    RuntimeWarning says so. tie_rank='random' breaks each column's ties
-    with a seeded random ordering, drawn independently per column from
-    seed + 40_000: the MI estimand is exactly unchanged — the original
-    values are recoverable from the tie-broken ones — and the transformed
-    marginals are exactly Gaussian, but the GMM estimate is biased low when
-    ties are shared between columns (joint zero-inflation).
-    tie_rank='average' gives a tied block a single probit atom, which can
-    fabricate MI between independent heavily tied columns. A RuntimeWarning
-    fires when more than 1% of a column's samples sit in tied blocks of
-    three or more, because no tie convention makes the GMM fit of heavily
-    tied data reliable — prefer preprocess='none' there.
-
-    *Initialisation.* The default and the k-means inits run their
-    statistics over the full N per replicate unless `n_chunk` is set, in
-    which case they stream over sample chunks like the EM stage; without
-    n_chunk at very large N they bind on memory before EM (a readable
-    error on CUDA) — set n_chunk or use 'minmax', which allocates nothing
-    of that size.
-
-    *Chunking and memory.* On CUDA, 'auto' sizes each stage's batch to
-    fill half of the free device memory from the measured peak-memory
-    models (per replicate, in units of N_eff x itemsize with
-    N_eff = min(N, n_chunk): max(K+6, 2K+3) plus a small block term for the
-    default GEMM kernels, (4d+4)K + 4 for the legacy kernels, and
-    (4d+3)K + 12 for the initialisation stage of the default and k-means
-    inits, over the full N or the streamed init chunk, which gets its own
-    batch; mc_samples x itemsize x max((3d+2)K + d + 7, d^2 + 4d + 6) for
-    mc_chunk), capped at the stage's replicate count, with no replicate
-    floor, and capped by torch.cuda.set_per_process_memory_fraction when
-    one is set. A CUDA out-of-memory error during EM halves the chunk and
-    retries, with a RuntimeWarning. With `n_chunk` the per-replicate
-    weights are read one sample chunk at a time, so the only N-sized
-    tensors are the caller's own (the (n_bootstrap, N) resample counts are
-    held once per stage; the CV masks are views of one (n_folds, N) pair).
-    The initialisation streams over n_chunk rounded to whole 2^14-sample
-    draw blocks, at least one (so with n_chunk < 2^14 the init chunk
-    exceeds n_chunk by less than one block). Streamed results agree with
-    the single-pass path to floating-point reduction order (ulp-level at
-    float64, not bitwise).
-
-    *Reproducibility.* Fixed-seed results are bitwise reproducible on CPU,
-    including with 'auto' chunk sizing: at float64 no chunk size changes
-    them; at float32 they are also bitwise except em_chunk=1 with a
-    one-component model, where the M-step's single-row tail product takes
-    a different BLAS path (3e-8 in a measured MI).
-    Each bootstrap replicate draws its MC samples from its own seeded
-    stream, so the samples are independent of `mc_chunk` and of the
-    out-of-memory retry on every device. On CUDA, `em_chunk` and `mc_chunk`
-    change the matmul reduction order at either dtype, so same-seed runs
-    agree to floating-point noise unless both are pinned to integers and no
-    out-of-memory retry occurs (the retry halves the batch whatever the
-    pinning; 'auto' tracks the free memory). At float64 the differences
-    stay at reduction-order level (1e-14 to 1e-12 in the fitted means in
-    two measured cases); at float32 the blocked M-step folds the batch's
-    replicates into one GEMM whose summation order follows the batch size,
-    and on knife-edge data that can move the selected k (measured: k=5 vs
-    6, MI 0.4741 vs 0.4745 against an errorbar of 0.008). A CPU run is the
-    bit-reproducible setting (with the float32 exception above); on CUDA,
-    float64 is far less sensitive.
+    On selection, standardisation, preprocessing, initialisation, memory and
+    reproducibility: docs/estimate_notes.md in the repository.
     """
     X = torch.as_tensor(_as_array(X)).detach()
     if dtype not in (torch.float32, torch.float64):
@@ -900,7 +991,7 @@ class CategoryFit(NamedTuple):
     """
     Bootstrap fits of one category in `estimate_categorical` (a tuple).
 
-    Attributes
+    Parameters
     ----------
     w, mu, cov : torch.Tensor
         Fitted parameters over the B bootstrap replicates, shapes (B, K),
@@ -981,7 +1072,8 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
                          fixed_components_number=None, metric_method='valid',
                          threshold_components=1e-5, patience=1,
                          category_weights='empirical', n_chunk=None):
-    """Estimate MI between a continuous variable and a categorical variable.
+    """
+    Estimate MI between a continuous variable and a categorical variable.
 
     Port of GMM-MI's fit_categorical/estimate_categorical semantics
     (Appendix B of Piras et al. 2023): a 1D GMM p(x|c) is fitted per
@@ -1006,24 +1098,40 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         numpy's unique (categories in sorted label order). Non-finite
         (NaN/inf) and missing (None/NaN) labels are rejected — torch.unique
         would otherwise make every NaN its own category.
-    protocol, n_bootstrap, mc_samples
+    protocol : {'batched', 'sequential'}, default='batched'
+        As in `estimate`, applied per category.
+    n_bootstrap, mc_samples : int
         As in `estimate`, applied per category.
     max_components : int, default=10
         Largest number of components considered per category's 1D fit.
-    n_folds, n_inits
+    n_folds, n_inits : int
         As in `estimate`, applied per category.
     reg_covar : float, default=1e-6
         As in `estimate`; X is standardised once over all categories, so the
         floor is relative to the variance of X as a whole.
-    threshold_fit, max_iter, seed
+    threshold_fit : float, default=1e-5
+        As in `estimate`.
+    max_iter, seed : int
         As in `estimate`.
     return_k : bool, default=False
         If True, also return the selected component count per category.
-    device, dtype, em_chunk, mc_chunk
+    device : str or torch.device, default='cpu'
         As in `estimate`.
-    init_type, scale, fixed_components_number, metric_method
+    dtype : torch.dtype, default=torch.float64
+        As in `estimate`.
+    em_chunk, mc_chunk : int or 'auto'
+        As in `estimate`.
+    init_type : str, default='random_responsibilities'
         As in `estimate`, applied per category.
-    threshold_components, patience
+    scale : float, optional
+        As in `estimate`, applied per category.
+    fixed_components_number : int, optional
+        As in `estimate`, applied per category.
+    metric_method : {'valid', 'aic', 'bic'}, default='valid'
+        As in `estimate`, applied per category.
+    threshold_components : float, default=1e-5
+        As in `estimate`, applied per category.
+    patience : int, default=1
         As in `estimate`, applied per category.
     category_weights : {'empirical', 'uniform'}, default='empirical'
         'empirical' sets pi_c = N_c / N from the observed category counts —

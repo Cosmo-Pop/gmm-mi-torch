@@ -14,7 +14,8 @@ from .constants import LOG2PI
 # ----------------------------------------------------------------------
 
 def _chol(cov, return_repaired=False):
-    """Cholesky of (R,K,d,d) covariances; returns (chol, cov).
+    """
+    Cholesky of (R,K,d,d) covariances; returns (chol, cov).
 
     The returned covariance is the matrix that was actually factorised, and
     every caller uses it in place of its input, so cov == chol @ chol^T is
@@ -31,6 +32,23 @@ def _chol(cov, return_repaired=False):
     With return_repaired=True, a third element is returned: the (R,K) bool
     mask of components that needed escalation or a non-finite reset — the
     kernel-reroute detector uses it as corroborating evidence.
+
+    Parameters
+    ----------
+    cov : torch.Tensor of shape (R, K, d, d)
+        Covariances.
+    return_repaired : bool, default=False
+        Also return the mask of repaired components.
+
+    Returns
+    -------
+    chol : torch.Tensor of shape (R, K, d, d)
+        Lower Cholesky factors.
+    cov : torch.Tensor of shape (R, K, d, d)
+        The matrices actually factorised.
+    repaired : torch.Tensor of shape (R, K)
+        Bool mask of escalated or reset components; only with
+        return_repaired=True.
     """
     d = cov.shape[-1]
     eye = torch.eye(d, dtype=cov.dtype, device=cov.device)
@@ -81,9 +99,24 @@ def _chol(cov, return_repaired=False):
 
 
 def log_gauss(X, mu, chol):
-    """Component-wise Gaussian log-densities.
+    """
+    Component-wise Gaussian log-densities.
 
     X: (R,N,d), mu: (R,K,d), chol: (R,K,d,d) lower.  Returns (R,N,K).
+
+    Parameters
+    ----------
+    X : torch.Tensor of shape (R, N, d)
+        Points, per replicate.
+    mu : torch.Tensor of shape (R, K, d)
+        Component means.
+    chol : torch.Tensor of shape (R, K, d, d)
+        Lower Cholesky factors of the component covariances.
+
+    Returns
+    -------
+    torch.Tensor of shape (R, N, K)
+        log N(x_n | mu_k, chol_k chol_k^T).
     """
     diff = X.unsqueeze(2) - mu.unsqueeze(1)               # (R,N,K,d)
     eye = torch.eye(chol.shape[-1], dtype=chol.dtype, device=chol.device)
@@ -96,11 +129,13 @@ def log_gauss(X, mu, chol):
 
 
 def gmm_score(X, w, mu, chol):
-    """Mixture log-density of X under each replicate.
+    """
+    Mixture log-density of X under each replicate.
 
     Parameters
     ----------
     X : torch.Tensor of shape (R, N, d)
+        Points, per replicate.
     w, mu, chol : torch.Tensor
         Mixture weights (R, K), means (R, K, d) and covariance Cholesky
         factors (R, K, d, d); zero-weight (dead) components are skipped.
@@ -108,6 +143,7 @@ def gmm_score(X, w, mu, chol):
     Returns
     -------
     torch.Tensor of shape (R, N)
+        log sum_k w_k N(x_n | mu_k, chol_k chol_k^T).
     """
     logw = torch.where(w > 0, torch.log(w.clamp_min(1e-300)),
                        torch.full_like(w, -torch.inf))
@@ -115,7 +151,8 @@ def gmm_score(X, w, mu, chol):
 
 
 def gmm_sample(w, mu, chol, n_samples, generator=None):
-    """Draw samples from each replicate's mixture.
+    """
+    Draw samples from each replicate's mixture.
 
     Parameters
     ----------
@@ -129,6 +166,7 @@ def gmm_sample(w, mu, chol, n_samples, generator=None):
     Returns
     -------
     torch.Tensor of shape (R, n_samples, d)
+        The samples: a component drawn by weight, then a Gaussian draw.
     """
     R, K, d = mu.shape
     idx = torch.multinomial(w.clamp_min(0), n_samples, replacement=True,
@@ -167,7 +205,8 @@ def marginal_params(mu, cov, idx):
 
 
 def marginal_score(X_full, w, mu, cov, idx):
-    """Log-density of the selected columns under the analytic marginal GMM.
+    """
+    Log-density of the selected columns under the analytic marginal GMM.
 
     Parameters
     ----------
@@ -181,6 +220,7 @@ def marginal_score(X_full, w, mu, cov, idx):
     Returns
     -------
     torch.Tensor of shape (R, N)
+        The marginal mixture's log-density at the selected columns.
     """
     mu_m, cov_m = marginal_params(mu, cov, idx)
     chol_m, _ = _chol(cov_m)

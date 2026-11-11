@@ -78,7 +78,10 @@ class _pinned_precision:
 
 
 def _full_precision(fn):
-    """Pin float32 matmuls to full precision for the duration of a call:
+    """
+    Decorator: run `fn` with float32 matmuls pinned to full precision.
+
+    Pin float32 matmuls to full precision for the duration of a call:
     frameworks that set torch's matmul precision ('high'/'medium' via the
     legacy API, TF32/bf16 via the per-backend fp32_precision settings of
     torch >= 2.9) would silently degrade the GEMM-formulated EM. The pin
@@ -94,7 +97,18 @@ def _full_precision(fn):
     thread-local: concurrent callers in other threads of the same process
     will also run these calls' matmuls at full precision, and the
     save/restore can race with theirs. Use processes, not threads, for
-    parallel estimates (see examples/mi_grid_multigpu.py)."""
+    parallel estimates (see examples/mi_grid_multigpu.py).
+
+    Parameters
+    ----------
+    fn : callable
+        The function to wrap.
+
+    Returns
+    -------
+    callable
+        `fn`, each call of which runs inside `_pinned_precision()`.
+    """
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
         with _pinned_precision():
@@ -103,13 +117,28 @@ def _full_precision(fn):
 
 
 def _entry_precision(fn):
-    """_full_precision plus torch.no_grad() for the public estimators: they
+    """
+    Decorator for the public estimators: full precision and no autograd.
+
+    _full_precision plus torch.no_grad() for the public estimators: they
     return plain floats, so an input tensor carrying requires_grad (model
     latents taken without .detach()) would otherwise build and retain the
     EM autograd graph of every iteration — several times the peak memory —
     and crash FittedGMM's .numpy() calls under return_fit=True. em_fit and
     val_ll keep plain _full_precision: differentiating a log-likelihood
-    with respect to the parameters is legitimate."""
+    with respect to the parameters is legitimate.
+
+    Parameters
+    ----------
+    fn : callable
+        The function to wrap.
+
+    Returns
+    -------
+    callable
+        `fn`, each call of which runs inside `_pinned_precision()` and
+        `torch.no_grad()`.
+    """
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
         with _pinned_precision(), torch.no_grad():
@@ -118,9 +147,25 @@ def _entry_precision(fn):
 
 
 def _check_chunk_arg(value, name):
-    """Validate an `em_chunk` / `mc_chunk` argument: 'auto' is returned as
+    """
+    Validate an `em_chunk` or `mc_chunk` argument.
+
+    Validate an `em_chunk` / `mc_chunk` argument: 'auto' is returned as
     is, anything else coerced to an int >= 1. A float (2.7) fails under the
-    argument's name like every other count."""
+    argument's name like every other count.
+
+    Parameters
+    ----------
+    value : int or str
+        The argument as given: 'auto' or a positive integer.
+    name : str
+        The argument's name, used in the error message.
+
+    Returns
+    -------
+    int or str
+        'auto', or `value` as a plain int >= 1.
+    """
     if isinstance(value, str):
         if value != 'auto':
             raise ValueError(f"{name} must be a positive int or 'auto'; "
@@ -130,11 +175,29 @@ def _check_chunk_arg(value, name):
 
 
 def _index_arg(value, name, minimum=None):
-    """Coerce an integer argument at entry: operator.index accepts numpy
+    """
+    Coerce an integer argument at entry.
+
+    Coerce an integer argument at entry: operator.index accepts numpy
     integers (the natural output of numpy RNGs in seed sweeps) and rejects
     floats, so a malformed count fails here under the argument's own name
     instead of deep inside EM with an opaque torch error after the compute
-    has already been spent."""
+    has already been spent.
+
+    Parameters
+    ----------
+    value : int
+        The argument as given (a Python or numpy integer).
+    name : str
+        The argument's name, used in the error messages.
+    minimum : int, optional
+        Smallest accepted value; None accepts any integer.
+
+    Returns
+    -------
+    int
+        `value` as a plain Python int.
+    """
     try:
         value = operator.index(value)
     except TypeError:
@@ -146,13 +209,28 @@ def _index_arg(value, name, minimum=None):
 
 
 def _as_array(X):
-    """Unwrap array-protocol containers that torch.as_tensor cannot inspect:
+    """
+    Turn an array-protocol container into an array torch can read.
+
+    Unwrap array-protocol containers that torch.as_tensor cannot inspect:
     a pandas DataFrame exposes __array__ but torch's sequence path fails on
     it with "could not determine the shape of object type 'DataFrame'".
     The container converts itself, so no numpy import is needed, and a
     plain ndarray returns itself (no copy). Read-only arrays (pandas
     copy-on-write hands those out) are copied so torch.as_tensor does not
-    warn about non-writable memory."""
+    warn about non-writable memory.
+
+    Parameters
+    ----------
+    X : array-like or torch.Tensor
+        The data as given by the caller.
+
+    Returns
+    -------
+    array-like or torch.Tensor
+        The container's array (a writable copy if it was read-only), or `X`
+        itself when it is a tensor or has no __array__.
+    """
     if not isinstance(X, torch.Tensor) and hasattr(X, '__array__'):
         X = X.__array__()
         if getattr(getattr(X, 'flags', None), 'writeable', True) is False:
@@ -165,11 +243,41 @@ def _validate_entry_args(seed, n_bootstrap, mc_samples, max_components,
                          fixed_components_number, reg_covar,
                          threshold_components, threshold_fit=1e-5,
                          patience=1, n_chunk=None, mc_chunk='auto'):
-    """Entry validation shared by estimate and estimate_categorical, so the
+    """
+    Validate the arguments shared by `estimate` and `estimate_categorical`.
+
+    Entry validation shared by estimate and estimate_categorical, so the
     two cannot drift apart. Returns the integer arguments coerced to plain
     Python ints (torch.Generator.manual_seed and torch factory sizes reject
     numpy integers and floats). mc_chunk is only checked here: its 'auto'
-    sizing needs the selected k, so the caller resolves it later."""
+    sizing needs the selected k, so the caller resolves it later.
+
+    Parameters
+    ----------
+    seed, n_bootstrap, mc_samples, max_components : int
+        As in `estimate`.
+    n_folds, n_inits, max_iter : int
+        As in `estimate`.
+    fixed_components_number : int or None
+        As in `estimate`.
+    reg_covar, threshold_components : float
+        As in `estimate`.
+    threshold_fit : float, default=1e-5
+        As in `estimate`.
+    patience : int, default=1
+        As in `estimate`.
+    n_chunk : int, optional
+        As in `estimate`.
+    mc_chunk : int or str, default='auto'
+        As in `estimate`; checked, not resolved.
+
+    Returns
+    -------
+    tuple
+        (seed, n_bootstrap, mc_samples, max_components, n_folds, n_inits,
+        max_iter, fixed_components_number, patience, n_chunk) as plain
+        Python ints (fixed_components_number and n_chunk may be None).
+    """
     seed = _index_arg(seed, 'seed')
     if abs(seed) > 1 << 62:
         raise ValueError(f"|seed| must be <= 2**62 so the internal stream "
