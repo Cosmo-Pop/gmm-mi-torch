@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.10.0 (2026-11-11)
+
+Readability, phase 3 of scoping/readability-proposal-2026-11-04.md (items
+3.6, 3.7 and 3.8, with the owner's rulings of 2026-11-11 for 3.7). Names,
+layout and documentation only, no behaviour change: no formula, constant,
+default, random stream, error or warning text moved, and every public
+function keeps its name, arguments and results.
+
+- The package is split into modules (3.7): `constants`, `precision`,
+  `chunking`, `gaussian`, `em`, `selection` and `estimator`, one stage
+  each, every statement moved verbatim. `gmm_mi_torch.estimate`,
+  `estimate_categorical` and `FittedGMM` are where they were, and
+  `gmm_mi_torch.estimator` still provides every public name it defined
+  (`em_fit`, `val_ll`, `select_batched`, `select_sequential`, the Gaussian
+  helpers, `LOG2PI`, `EMResult`, `ValLLResult`). Private (underscore)
+  names now live in, and must be imported from, the module that defines
+  them; a script that assigned one of them on `gmm_mi_torch.estimator`
+  at run time (for example `_EM_KERNEL`) now changes nothing, because
+  each module holds its own binding (the supported kernel switch, the
+  `GMM_MI_TORCH_EM_KERNEL` environment variable, is unchanged). Any
+  warning attributed to a frame inside the package now names that frame's
+  module (for example `gmm_mi_torch.em` or `gmm_mi_torch.selection`, not
+  `gmm_mi_torch.estimator`); text, category and count are unchanged, so
+  only a warnings filter keyed on the module name is affected.
+- Long comment blocks move to the design notes (3.6): the 24 blocks of
+  more than three lines are in docs/design_notes.md, "Notes moved from the
+  code", verbatim; the code keeps one line per block naming what follows
+  and the note.
+- Docstrings (3.8): every function, class and public method has numpydoc
+  Parameters and Returns sections (two constructors are documented on
+  their classes; a few dunder methods and inner wrappers have none). `estimate`'s Notes move verbatim to
+  docs/estimate_notes.md, so `help(estimate)` is 100 lines shorter.
+- Also in this release: inside the EM step kernels the weight accessor
+  and the active-replicate count are named `weight_chunks` and `n_active`,
+  as at their call sites (commit f35a213, after v0.9.0); and, after the
+  landed read, a docstring tidy (commit 23dd559): the one-line summaries
+  added in 3.8 no longer repeat the sentence after them, grouped
+  Parameters entries with defaults say ", optional", and `weight_chunks`
+  in two EM helpers is described as used only on the streamed path.
+
+Proof of no behaviour change, at each commit: for 3.6 the syntax tree
+with docstrings is identical and every moved block is found verbatim in
+the notes; for 3.7 every statement is identical in its new module, every
+name resolves, the import-time kernel switch behaves as before, and the
+earlier releases (v0.7.2, v0.8.0 and, in the landed read, v0.9.0) and the
+new code agree bitwise on CPU and CUDA with both kernels;
+for 3.8 the syntax tree without docstrings is identical, every lost word
+of an old docstring is on an exact list, and `numpydoc.validate` passes
+its structure and completeness checks on all 84 objects. The landed read
+by a session that did not write the code
+(scoping/review-findings-readability-phase3-2026-11-11.md, verdict TAG)
+confirmed this with its own syntax-tree, binding and bitwise checks. The v0.7.0
+reference sets compare with 0 mismatches on both kernels and the seven
+public signatures equal v0.9.0's at every commit. Test matrix (passed /
+skipped, 133 tests): CPU fp64 131 / 2, CPU fp64 legacy 129 / 4, CUDA fp32
+132 / 1, CUDA fp32 legacy 130 / 3 at every commit. The walkthrough
+notebook and the multi-GPU example re-run clean.
+
 ## 0.9.0 (2026-11-11)
 
 Readability, phase 2 of scoping/readability-proposal-2026-11-04.md (items
