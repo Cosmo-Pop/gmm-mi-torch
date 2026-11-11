@@ -806,10 +806,11 @@ def _gauss_coef(w, mu, cov):
 
 
 def _estep_gemm(F, s, w, mu, cov):
-    """Responsibilities (Ra,N,K) and weighted mean log-likelihood (Ra,)."""
+    """Responsibilities (n_active,N,K) and weighted mean log-likelihood
+    (n_active,)."""
     coef, const = _gauss_coef(w, mu, cov)
     lj = torch.matmul(F.unsqueeze(0), coef.transpose(1, 2))
-    lj += const.unsqueeze(1)                               # (Ra,N,K)
+    lj += const.unsqueeze(1)                               # (n_active,N,K)
     m = lj.amax(-1, keepdim=True)
     lj.sub_(m).exp_()
     Z = lj.sum(-1, keepdim=True)
@@ -916,27 +917,28 @@ def _mstep_gemm(F, resp, s, reg_covar, d):
                                F.dtype)
 
 
-def _em_step_gemm_nchunked(X, wc, w, mu, cov, reg_covar, n_chunk, rows=None):
+def _em_step_gemm_nchunked(X, weight_chunks, w, mu, cov, reg_covar, n_chunk,
+                           rows=None):
     """One GEMM EM iteration streamed over sample chunks (float64 moments).
-    `wc` is a _WeightChunks accessor (a dense (R,N) tensor is wrapped);
-    with `rows`, only those replicates take part, read one sample chunk at
-    a time (an up-front s[rows] would be an (R,N) copy — N/n_chunk units
-    of the streamed budget)."""
-    wc = _as_weight_chunks(wc, n_chunk)
-    Ra, N = wc.shape
+    `weight_chunks` is a _WeightChunks accessor (a dense (R,N) tensor is
+    wrapped); with `rows`, only those replicates take part, read one sample
+    chunk at a time (an up-front s[rows] would be an (R,N) copy —
+    N/n_chunk units of the streamed budget)."""
+    weight_chunks = _as_weight_chunks(weight_chunks, n_chunk)
+    n_active, N = weight_chunks.shape
     if rows is not None:
-        Ra = rows.numel()
+        n_active = rows.numel()
     d = X.shape[-1]
     K = w.shape[-1]
     dt, dev = X.dtype, X.device
     coef, const = _gauss_coef(w, mu, cov)
     q = coef.shape[-1]
-    S = torch.zeros(Ra, K, q, dtype=torch.float64, device=dev)
-    Nk = torch.zeros(Ra, K, dtype=torch.float64, device=dev)
-    ll_sum = torch.zeros(Ra, dtype=torch.float64, device=dev)
+    S = torch.zeros(n_active, K, q, dtype=torch.float64, device=dev)
+    Nk = torch.zeros(n_active, K, dtype=torch.float64, device=dev)
+    ll_sum = torch.zeros(n_active, dtype=torch.float64, device=dev)
     for i in range(0, N, n_chunk):
         Fc = _features(X[i:i+n_chunk])
-        sc = wc.rows(i, n_chunk, rows)
+        sc = weight_chunks.rows(i, n_chunk, rows)
         lj = torch.matmul(Fc.unsqueeze(0), coef.transpose(1, 2))
         lj += const.unsqueeze(1)
         m = lj.amax(-1, keepdim=True)
@@ -951,7 +953,9 @@ def _em_step_gemm_nchunked(X, wc, w, mu, cov, reg_covar, n_chunk, rows=None):
         # features would otherwise be assembled while these are still
         # bound (two feature blocks at once)
         del lj, wr, Fc
-    tot = wc.totals() if rows is None else wc.totals()[rows]   # float64
+    # float64
+    tot = (weight_chunks.totals() if rows is None
+           else weight_chunks.totals()[rows])
     ll = (ll_sum / tot).to(dt)
     w_new, mu_new, cov_new = _mstep_from_moments(S, Nk, tot, reg_covar, d, dt)
     return ll, w_new, mu_new, cov_new
@@ -1476,8 +1480,8 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
     return tuple(torch.cat([o[j] for o in outs]) for j in range(4))
 
 
-def _em_step_nchunked(X, wc, w, mu, chol, logw, reg_covar, n_chunk,
-                      rows=None):
+def _em_step_nchunked(X, weight_chunks, w, mu, chol, logw, reg_covar,
+                      n_chunk, rows=None):
     """One EM iteration accumulated over sample chunks (streaming M-step).
 
     Accumulates N_k, sum resp*(x - mu_old) and sum resp*(x - mu_old)(..)^T
@@ -1486,35 +1490,39 @@ def _em_step_nchunked(X, wc, w, mu, chol, logw, reg_covar, n_chunk,
     cancellation of the origin-moment form when |mu|^2 >> var.  As in the
     GEMM path, the cross-chunk accumulators run at float64 and the finished
     diagonal is clamped back to the reg_covar floor, which float32 rounding
-    of the shifted moments can otherwise undercut. `wc` and `rows` as in
-    _em_step_gemm_nchunked."""
-    wc = _as_weight_chunks(wc, n_chunk)
-    Ra, N = wc.shape
+    of the shifted moments can otherwise undercut. `weight_chunks` and
+    `rows` as in _em_step_gemm_nchunked."""
+    weight_chunks = _as_weight_chunks(weight_chunks, n_chunk)
+    n_active, N = weight_chunks.shape
     if rows is not None:
-        Ra = rows.numel()
+        n_active = rows.numel()
     d = X.shape[-1]
     K = w.shape[-1]
     dt, dev = X.dtype, X.device
     eye = torch.eye(d, dtype=torch.float64, device=dev)
-    Nk = torch.zeros(Ra, K, dtype=torch.float64, device=dev)
-    Sd = torch.zeros(Ra, K, d, dtype=torch.float64, device=dev)
-    Sdd = torch.zeros(Ra, K, d, d, dtype=torch.float64, device=dev)
-    ll_sum = torch.zeros(Ra, dtype=torch.float64, device=dev)
+    Nk = torch.zeros(n_active, K, dtype=torch.float64, device=dev)
+    Sd = torch.zeros(n_active, K, d, dtype=torch.float64, device=dev)
+    Sdd = torch.zeros(n_active, K, d, d, dtype=torch.float64, device=dev)
+    ll_sum = torch.zeros(n_active, dtype=torch.float64, device=dev)
     for i in range(0, N, n_chunk):
         Xc = X[i:i+n_chunk]
         nc = Xc.shape[0]
-        sc = wc.rows(i, n_chunk, rows)
-        logjoint = logw.unsqueeze(1) + log_gauss(Xc.expand(Ra, nc, d),
-                                                 mu, chol)       # (Ra,nc,K)
+        sc = weight_chunks.rows(i, n_chunk, rows)
+        # logjoint: (n_active,nc,K)
+        logjoint = logw.unsqueeze(1) + log_gauss(Xc.expand(n_active, nc, d),
+                                                 mu, chol)
         ll_n = torch.logsumexp(logjoint, dim=-1)
         resp = torch.exp(logjoint - ll_n.unsqueeze(-1))
         wr = resp * sc.unsqueeze(-1)
         ll_sum += (sc * ll_n).sum(1).double()
         Nk += wr.sum(1).double()
-        diff = Xc.view(1, nc, 1, d) - mu.unsqueeze(1)            # (Ra,nc,K,d)
+        # diff: (n_active,nc,K,d)
+        diff = Xc.view(1, nc, 1, d) - mu.unsqueeze(1)
         Sd += torch.einsum('rnk,rnkd->rkd', wr, diff).double()
         Sdd += torch.einsum('rnk,rnki,rnkj->rkij', wr, diff, diff).double()
-    tot = wc.totals() if rows is None else wc.totals()[rows]   # float64
+    # float64
+    tot = (weight_chunks.totals() if rows is None
+           else weight_chunks.totals()[rows])
     ll = (ll_sum / tot).to(dt)
     dead = Nk < 1e-10
     Nk_safe = Nk.clamp_min(1e-10)
@@ -1589,10 +1597,11 @@ def _check_reroute(w, mu, cov, legacy_mask):
     Parameters
     ----------
     w, mu, cov : torch.Tensor
-        Parameters of the active replicates, shapes (Ra, K), (Ra, K, d),
-        (Ra, K, d, d).
+        Parameters of the active replicates, shapes (n_active, K),
+        (n_active, K, d), (n_active, K, d, d).
     legacy_mask : torch.Tensor
-        Sticky per-replicate reroute mask over the active set, shape (Ra,).
+        Sticky per-replicate reroute mask over the active set, shape
+        (n_active,).
 
     Returns
     -------
@@ -1630,17 +1639,18 @@ def _em_step_mixed(X, F, weights_active, weight_chunks, w, mu, cov,
     F : torch.Tensor or None
         Quadratic features of `X` (single-pass GEMM path), else None.
     weights_active : torch.Tensor or None
-        Dense weights of the active replicates, shape (Ra, N), on the
+        Dense weights of the active replicates, shape (n_active, N), on the
         single-pass path; None on the streamed path.
     weight_chunks : _WeightChunks or None
         The streamed path's weight accessor; None on the single-pass path.
     w, mu, cov : torch.Tensor
-        Parameters of the active replicates, shapes (Ra, K), (Ra, K, d),
-        (Ra, K, d, d).
+        Parameters of the active replicates, shapes (n_active, K),
+        (n_active, K, d), (n_active, K, d, d).
     legacy_mask : torch.Tensor
-        Rerouted replicates among the active ones, shape (Ra,).
+        Rerouted replicates among the active ones, shape (n_active,).
     active_idx : torch.Tensor
-        Indices of the active replicates in the accessor's rows, shape (Ra,).
+        Indices of the active replicates in the accessor's rows, shape
+        (n_active,).
     reg_covar : float
         Covariance floor.
     n_chunk : int or None
@@ -1652,7 +1662,7 @@ def _em_step_mixed(X, F, weights_active, weight_chunks, w, mu, cov,
     -------
     ll : torch.Tensor
         Weighted mean per-sample log-likelihood of the incoming parameters,
-        shape (Ra,).
+        shape (n_active,).
     w, mu, cov : torch.Tensor
         Parameters after the M-step, same shapes as the inputs.
     """
@@ -1726,17 +1736,18 @@ def _em_iteration(X, F, weights_active, weight_chunks, w, mu, cov,
     F : torch.Tensor or None
         Quadratic features of `X` (single-pass GEMM path), else None.
     weights_active : torch.Tensor or None
-        Dense weights of the active replicates, shape (Ra, N), on the
+        Dense weights of the active replicates, shape (n_active, N), on the
         single-pass path; None on the streamed path.
     weight_chunks : _WeightChunks or None
         The streamed path's weight accessor; None on the single-pass path.
     w, mu, cov : torch.Tensor
-        Parameters of the active replicates, shapes (Ra, K), (Ra, K, d),
-        (Ra, K, d, d).
+        Parameters of the active replicates, shapes (n_active, K),
+        (n_active, K, d), (n_active, K, d, d).
     legacy_mask : torch.Tensor
-        Rerouted replicates among the active ones, shape (Ra,).
+        Rerouted replicates among the active ones, shape (n_active,).
     active_idx : torch.Tensor
-        Indices of the active replicates in the accessor's rows, shape (Ra,).
+        Indices of the active replicates in the accessor's rows, shape
+        (n_active,).
     active_rows : torch.Tensor or None
         `active_idx`, or None while no replicate has converged (all rows).
     gemm : bool
@@ -1754,7 +1765,7 @@ def _em_iteration(X, F, weights_active, weight_chunks, w, mu, cov,
     -------
     ll : torch.Tensor
         Weighted mean per-sample log-likelihood of the incoming parameters,
-        shape (Ra,).
+        shape (n_active,).
     w, mu, cov : torch.Tensor
         Parameters after the M-step, same shapes as the inputs.
     """
@@ -1765,7 +1776,7 @@ def _em_iteration(X, F, weights_active, weight_chunks, w, mu, cov,
             w, mu, cov = _mstep_gemm(F, resp, weights_active, reg_covar,
                                      X.shape[-1])
             # release the consumed responsibilities as soon as the M-step
-            # has used them (they are the (Ra,N,K) peak)
+            # has used them (they are the (n_active,N,K) peak)
             del resp
         else:
             ll, w, mu, cov = _em_step_gemm_nchunked(
@@ -1806,18 +1817,18 @@ def _compact_converged(done, ll, active_idx, weights_active, w, mu, cov,
     Parameters
     ----------
     done : torch.Tensor
-        Converged replicates among the active ones, shape (Ra,) bool.
+        Converged replicates among the active ones, shape (n_active,) bool.
     ll : torch.Tensor
-        This iteration's log-likelihoods, shape (Ra,).
+        This iteration's log-likelihoods, shape (n_active,).
     active_idx : torch.Tensor
-        Indices of the active replicates in the output rows, shape (Ra,).
+        Indices of the active replicates in the output rows, shape (n_active,).
     weights_active : torch.Tensor or None
         Dense weights of the active replicates (single-pass path); None on
         the streamed path, whose weights are addressed through `active_idx`.
     w, mu, cov : torch.Tensor
         Parameters of the active replicates.
     legacy_mask : torch.Tensor
-        Rerouted replicates among the active ones, shape (Ra,).
+        Rerouted replicates among the active ones, shape (n_active,).
     w_out, mu_out, cov_out, ll_out : torch.Tensor
         Results for all R replicates; the converged rows are written in
         place.
@@ -2007,12 +2018,12 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None, em_chunk=None):
     return vals[0] if len(vals) == 1 else torch.cat(vals)
 
 
-def _legacy_score_sum(X, wc, w, mu, chol, n_chunk, rows=None):
+def _legacy_score_sum(X, weight_chunks, w, mu, chol, n_chunk, rows=None):
     """Weighted log-likelihood sums via the centred kernels, float64 acc,
     over sample chunks of `n_chunk` (None: one chunk, which is bitwise the
-    unchunked evaluation) for the `rows` of the accessor `wc`."""
-    wc = _as_weight_chunks(wc, n_chunk)
-    R, N = wc.shape
+    unchunked evaluation) for the `rows` of the accessor `weight_chunks`."""
+    weight_chunks = _as_weight_chunks(weight_chunks, n_chunk)
+    R, N = weight_chunks.shape
     if rows is not None:
         R = rows.numel()
     n = N if n_chunk is None else n_chunk
@@ -2021,7 +2032,7 @@ def _legacy_score_sum(X, wc, w, mu, chol, n_chunk, rows=None):
         Xc = X[i:i+n]
         nc = Xc.shape[0]
         ll_n = gmm_score(Xc.expand(R, nc, X.shape[-1]), w, mu, chol)
-        acc = acc + (wc.rows(i, n, rows) * ll_n).sum(1).double()
+        acc = acc + (weight_chunks.rows(i, n, rows) * ll_n).sum(1).double()
     return acc
 
 
