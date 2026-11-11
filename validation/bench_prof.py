@@ -1,5 +1,6 @@
 import torch, time, numpy as np
 import gmm_mi_torch.estimator as E
+from gmm_mi_torch import em, gaussian
 from torch.profiler import profile, ProfilerActivity
 N=20000; rho=0.3
 X=np.random.default_rng(0).multivariate_normal([0,0],[[1,rho],[rho,1]],N)
@@ -7,14 +8,14 @@ X[:,1]=np.sign(X[:,1])*np.abs(X[:,1])**1.5
 Xt=torch.as_tensor(X,dtype=torch.float32,device='cuda')
 Ra=300
 g=torch.Generator(device='cuda').manual_seed(0)
-w,mu,cov=E._init_params(Xt,20,Ra,1e-6,generator=g,em_chunk=Ra)
+w,mu,cov=em._init_params(Xt,20,Ra,1e-6,generator=g,em_chunk=Ra)
 s=torch.ones(Ra,N,device='cuda')
 def step():
-    chol=E._chol(cov)[0]; logw=torch.log(w.clamp_min(1e-300))
+    chol=gaussian._chol(cov)[0]; logw=torch.log(w.clamp_min(1e-300))
     Xr=Xt.expand(Ra,N,2)
     lj=logw.unsqueeze(1)+E.log_gauss(Xr,mu,chol)
     ll_n=torch.logsumexp(lj,-1); resp=torch.exp(lj-ll_n.unsqueeze(-1))
-    return E._m_step(Xr,resp,s,1e-6)
+    return em._m_step(Xr,resp,s,1e-6)
 step(); torch.cuda.synchronize()
 with profile(activities=[ProfilerActivity.CUDA]) as prof:
     for _ in range(3): step()

@@ -10,7 +10,31 @@ import pytest
 import torch
 
 import gmm_mi_torch.estimator
+from gmm_mi_torch import chunking, constants, em, gaussian, precision, selection
 from gmm_mi_torch import estimate, estimate_categorical
+
+_PACKAGE_MODULES = (constants, precision, chunking, gaussian, em, selection,
+                    gmm_mi_torch.estimator)
+
+
+def _patch_everywhere(monkeypatch, name, value):
+    """monkeypatch.setattr(module, name, value) on every gmm_mi_torch module
+    that binds `name`. Since the module split (0.10.0) a name is bound in
+    the module that defines it and in each module that imports it; patching
+    all of them reaches whichever binding the code under test reads, as one
+    patch did when everything lived in estimator.py."""
+    mods = [m for m in _PACKAGE_MODULES if hasattr(m, name)]
+    assert mods, name
+    for m in mods:
+        monkeypatch.setattr(m, name, value)
+
+
+def _set_everywhere(name, value):
+    """`_patch_everywhere` for the tests that assign and restore by hand."""
+    mods = [m for m in _PACKAGE_MODULES if hasattr(m, name)]
+    assert mods, name
+    for m in mods:
+        setattr(m, name, value)
 
 SIGMAS = 3
 
@@ -396,7 +420,7 @@ def test_bootstrap_large_n_fallback(monkeypatch):
     X = rng.multivariate_normal([0, 0], cov, 5000)
     analytic_mi = -0.5 * np.log(1 - rho ** 2)
     m_mn, s_mn = estimate(X, 'MI', protocol='batched', max_components=3, seed=1)
-    monkeypatch.setattr(gmm_mi_torch.estimator, '_MULTINOMIAL_MAX_CATEGORIES', 8)
+    _patch_everywhere(monkeypatch, '_MULTINOMIAL_MAX_CATEGORIES', 8)
     m_ri, s_ri = estimate(X, 'MI', protocol='batched', max_components=3, seed=1)
     assert abs(analytic_mi - m_mn) <= SIGMAS * s_mn
     assert abs(analytic_mi - m_ri) <= SIGMAS * s_ri
@@ -458,8 +482,8 @@ def test_auto_chunk_sizing(monkeypatch):
     # bound when memory was tight, exactly where it over-requested, and its
     # fixed_bytes-blind cap still opened with a guaranteed-OOM attempt.
     E = gmm_mi_torch.estimator
-    assert E._auto_chunk(100, 10**6, 'cpu') == 8
-    assert E._auto_chunk(3, 10**6, 'cpu') == 3
+    assert chunking._auto_chunk(100, 10**6, 'cpu') == 8
+    assert chunking._auto_chunk(3, 10**6, 'cpu') == 3
     state = {'free': 2 * 10**9, 'total': 4 * 10**9, 'reserved': 0,
              'allocated': 0, 'frac': 1.0}
     monkeypatch.setattr(torch.cuda, 'mem_get_info',
@@ -476,31 +500,31 @@ def test_auto_chunk_sizing(monkeypatch):
     monkeypatch.setattr(torch.cuda, 'get_per_process_memory_fraction',
                         frac_getter)
     monkeypatch.setattr(torch.cuda, 'current_device', lambda: 0)
-    assert E._auto_chunk(1000, 10**7, 'cuda') == 100
-    assert E._auto_chunk(1000, 10**9, 'cuda') == 1          # no floor
-    assert E._auto_chunk(1000, 10**10, 'cuda') == 1
-    assert E._auto_chunk(20, 10**6, 'cuda') == 20
+    assert chunking._auto_chunk(1000, 10**7, 'cuda') == 100
+    assert chunking._auto_chunk(1000, 10**9, 'cuda') == 1          # no floor
+    assert chunking._auto_chunk(1000, 10**10, 'cuda') == 1
+    assert chunking._auto_chunk(20, 10**6, 'cuda') == 20
     # the tight regime with a fixed term (K=1, d=8: features ~12 replicates'
     # worth): the first attempt stays inside the budget fraction
     bpi, fixed = 5_700_000, 67_100_000
     for free in (30, 36, 44, 60):
         state['free'] = free * bpi
-        n = E._auto_chunk(1000, bpi, 'cuda', fixed_bytes=fixed)
+        n = chunking._auto_chunk(1000, bpi, 'cuda', fixed_bytes=fixed)
         assert n >= 1 and n * bpi + fixed <= 0.5 * state['free'] + bpi
     state['free'] = 2 * 10**9
     # cached-but-free blocks count as allocatable
     state.update(free=10**9, reserved=1.5 * 10**9, allocated=5 * 10**8)
-    assert E._auto_chunk(1000, 10**7, 'cuda') == 100
+    assert chunking._auto_chunk(1000, 10**7, 'cuda') == 100
     # a per-process memory fraction caps what the process may allocate
     state.update(free=3 * 10**9, reserved=0, allocated=2 * 10**8, frac=0.25)
-    assert E._auto_chunk(1000, 10**7, 'cuda') == 40     # (0.25*4e9 - 2e8)/2/1e7
+    assert chunking._auto_chunk(1000, 10**7, 'cuda') == 40     # (0.25*4e9 - 2e8)/2/1e7
     # unindexed 'cuda' and torch.device('cuda') resolve the current device
-    assert E._auto_chunk(1000, 10**7, torch.device('cuda')) == 40
+    assert chunking._auto_chunk(1000, 10**7, torch.device('cuda')) == 40
     state['frac'] = 1.0
     with pytest.raises(ValueError):
-        E._resolve_chunk('big', 10, 1, 'cpu')
+        chunking._resolve_chunk('big', 10, 1, 'cpu')
     with pytest.raises(ValueError):
-        E._resolve_chunk(0, 10, 1, 'cpu')
+        chunking._resolve_chunk(0, 10, 1, 'cpu')
 
 
 def test_em_chunk_parity_fp64():
@@ -543,7 +567,7 @@ def test_chunk_oom_fallback(monkeypatch):
     # the result is unchanged and a RuntimeWarning is raised (CPU-only test;
     # the error is injected)
     E = gmm_mi_torch.estimator
-    orig = E._em_fit_core
+    orig = em._em_fit_core
     calls = []
 
     def flaky(X, s, *args, **kwargs):
@@ -555,10 +579,10 @@ def test_chunk_oom_fallback(monkeypatch):
     rng = np.random.default_rng(0)
     X = torch.as_tensor(rng.multivariate_normal([0, 0], [[1.0, 0.6], [0.6, 1.0]], 2000))
     g = torch.Generator().manual_seed(0)
-    w0, mu0, cov0 = E._init_params(X, 3, 16, 1e-6, generator=g)
+    w0, mu0, cov0 = em._init_params(X, 3, 16, 1e-6, generator=g)
     s = torch.ones(16, X.shape[0], dtype=X.dtype)
     ref = E.em_fit(X, s, w0, mu0, cov0, em_chunk=4)
-    monkeypatch.setattr(E, '_em_fit_core', flaky)
+    _patch_everywhere(monkeypatch, '_em_fit_core', flaky)
     with pytest.warns(RuntimeWarning):
         out = E.em_fit(X, s, w0, mu0, cov0, em_chunk=16)
     assert calls[:3] == [16, 8, 4]
@@ -635,7 +659,7 @@ def test_chol_escalation_recovers():
     cov = torch.tensor([[[[1.0, 1.0 + 1e-6], [1.0 + 1e-6, 1.0]]]],
                        dtype=torch.float64)
     with pytest.warns(RuntimeWarning):
-        L, cov_r = E._chol(cov)
+        L, cov_r = gaussian._chol(cov)
     assert torch.isfinite(L).all()
     assert torch.allclose(cov_r, L @ L.transpose(-2, -1), atol=1e-12)
     assert not torch.equal(cov_r, cov)
@@ -648,25 +672,25 @@ def test_gemm_step_matches_legacy_step_fp64():
     torch.manual_seed(0)
     X = torch.randn(1500, 3, dtype=torch.float64)
     g = torch.Generator().manual_seed(0)
-    w, mu, cov = E._init_params(X, 4, 6, 1e-6, generator=g)
+    w, mu, cov = em._init_params(X, 4, 6, 1e-6, generator=g)
     s = torch.rand(6, 1500, dtype=torch.float64) + 0.5
-    chol, cov = E._chol(cov)
+    chol, cov = gaussian._chol(cov)
     logw = torch.log(w.clamp_min(1e-300))
     Xr = X.expand(6, 1500, 3)
     lj = logw.unsqueeze(1) + E.log_gauss(Xr, mu, chol)
     ll_n = torch.logsumexp(lj, -1)
     resp_l = torch.exp(lj - ll_n.unsqueeze(-1))
     ll_l = (s * ll_n).sum(1) / s.sum(1)
-    wl, mul, covl = E._m_step(Xr, resp_l.clone(), s, 1e-6)
-    F = E._features(X)
-    resp_g, ll_g = E._estep_gemm(F, s, w, mu, cov)
+    wl, mul, covl = em._m_step(Xr, resp_l.clone(), s, 1e-6)
+    F = em._features(X)
+    resp_g, ll_g = em._estep_gemm(F, s, w, mu, cov)
     assert (resp_g - resp_l).abs().max() < 1e-12
     assert (ll_g - ll_l).abs().max() < 1e-12
-    wg, mug, covg = E._mstep_gemm(F, resp_g, s, 1e-6, 3)
+    wg, mug, covg = em._mstep_gemm(F, resp_g, s, 1e-6, 3)
     assert (wg - wl).abs().max() < 1e-12
     assert (mug - mul).abs().max() < 1e-12
     assert (covg - covl).abs().max() < 1e-12
-    ll_c, wc, muc, covc = E._em_step_gemm_nchunked(X, s, w, mu, cov, 1e-6, 400)
+    ll_c, wc, muc, covc = em._em_step_gemm_nchunked(X, s, w, mu, cov, 1e-6, 400)
     assert (ll_c - ll_g).abs().max() < 1e-12
     assert (covc - covg).abs().max() < 1e-12
 
@@ -687,10 +711,10 @@ def test_gemm_legacy_estimate_parity_fp64(monkeypatch):
     ]:
         out = {}
         for kernel in ('gemm', 'legacy'):
-            monkeypatch.setattr(E, '_EM_KERNEL', kernel)
+            _patch_everywhere(monkeypatch, '_EM_KERNEL', kernel)
             out[kernel] = estimate(X, quantity, n_bootstrap=10, return_k=True,
                                    dtype=torch.float64, **kw)
-        monkeypatch.setattr(E, '_EM_KERNEL', 'gemm')
+        _patch_everywhere(monkeypatch, '_EM_KERNEL', 'gemm')
         mg, sg, kg = out['gemm']
         ml, sl, kl = out['legacy']
         assert kg == kl
@@ -707,7 +731,7 @@ def test_mstep_covariance_floor():
     m1, M2 = 1.0, 1.0 - 2e-6            # variance -2e-6 before regularisation
     S = torch.tensor([[[m1, M2]]], dtype=torch.float64) * 100.0
     ssum = torch.tensor([100.0])
-    w, mu, cov = E._mstep_from_moments(S, Nk, ssum, 1e-6, 1, torch.float64)
+    w, mu, cov = em._mstep_from_moments(S, Nk, ssum, 1e-6, 1, torch.float64)
     assert cov[0, 0, 0, 0].item() >= 1e-6
 
 
@@ -720,12 +744,12 @@ def test_chol_corrupted_component_recovers():
     neg = torch.tensor([[[[-1.59e-6, -7.6e-8], [-7.6e-8, 1.03e-6]]]],
                        dtype=torch.float64)
     with pytest.warns(RuntimeWarning):
-        L, _ = E._chol(neg)
+        L, _ = gaussian._chol(neg)
     assert torch.isfinite(L).all()
     nan = torch.tensor([[[[float('nan'), 0.0], [0.0, 1.0]]]],
                        dtype=torch.float64)
     with pytest.warns(RuntimeWarning):
-        L, nan_r = E._chol(nan)
+        L, nan_r = gaussian._chol(nan)
     assert torch.isfinite(L).all()
     assert torch.isfinite(nan_r).all()
 
@@ -744,7 +768,7 @@ def test_chol_write_back_invariant_and_warning_counts():
                        dtype=torch.float64)
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter('always')
-        L, cov_r = E._chol(cov)
+        L, cov_r = gaussian._chol(cov)
     msgs = [str(w.message) for w in rec
             if issubclass(w.category, RuntimeWarning)]
     assert any('1 non-finite' in m for m in msgs), msgs
@@ -765,7 +789,7 @@ def test_mc_integrand_consistent_after_repair():
     E = gmm_mi_torch.estimator
     cov = torch.tensor([[[[-0.5, 0.0], [0.0, 1.0]]]], dtype=torch.float64)
     with pytest.warns(RuntimeWarning):
-        chol, cov_r = E._chol(cov)
+        chol, cov_r = gaussian._chol(cov)
     w = torch.ones(1, 1, dtype=torch.float64)
     mu = torch.zeros(1, 1, 2, dtype=torch.float64)
     g = torch.Generator().manual_seed(0)
@@ -783,10 +807,10 @@ def test_legacy_nchunk_mstep_covariance_floor():
     X = torch.tensor([[1.0], [1.0 + 1e-3]] * 50, dtype=torch.float32)
     w = torch.ones(1, 1, dtype=torch.float32)
     mu = torch.tensor([[[-30.0]]], dtype=torch.float32)
-    chol, _ = E._chol(torch.ones(1, 1, 1, 1, dtype=torch.float32))
+    chol, _ = gaussian._chol(torch.ones(1, 1, 1, 1, dtype=torch.float32))
     logw = torch.zeros(1, 1, dtype=torch.float32)
     s = torch.ones(1, X.shape[0], dtype=torch.float32)
-    _, _, _, cov2 = E._em_step_nchunked(X, s, w, mu, chol, logw, 1e-6, 16)
+    _, _, _, cov2 = em._em_step_nchunked(X, s, w, mu, chol, logw, 1e-6, 16)
     assert cov2[0, 0, 0, 0].item() >= np.float32(1e-6) * (1 - 1e-6)
 
 
@@ -805,17 +829,17 @@ def test_sequential_patience_reset_exhaustion_and_nan(monkeypatch):
 
     # improve@1, flat@2, improve@3, flat@4+: patience=2 must survive the
     # single miss at k=2 and select k=3 (the old counter returned k=2)
-    monkeypatch.setattr(E, '_cv_fit_for_k',
-                        scripted([1.0, 1.0, 2.0, 2.0, 2.0]))
+    _patch_everywhere(monkeypatch, '_cv_fit_for_k',
+                                scripted([1.0, 1.0, 2.0, 2.0, 2.0]))
     k, params, _ = E.select_sequential(X, max_components=5, patience=2)
     assert k == 3 and params[0] == 'w3'
     # exhaustion without an early stop: the best-scoring k wins, not
     # max_components
-    monkeypatch.setattr(E, '_cv_fit_for_k', scripted([1.0, 2.0, 1.5]))
+    _patch_everywhere(monkeypatch, '_cv_fit_for_k', scripted([1.0, 2.0, 1.5]))
     k, params, _ = E.select_sequential(X, max_components=3, patience=5)
     assert k == 2 and params[0] == 'w2'
     # all-NaN metrics: a clear error instead of history[0]
-    monkeypatch.setattr(E, '_cv_fit_for_k', scripted([float('nan')] * 3))
+    _patch_everywhere(monkeypatch, '_cv_fit_for_k', scripted([float('nan')] * 3))
     with pytest.raises(RuntimeError, match='metric'):
         E.select_sequential(X, max_components=3, patience=1)
 
@@ -824,17 +848,17 @@ def test_seed_controls_cv_folds(monkeypatch):
     # review finding: the seed was never forwarded to _cv_masks (hardcoded
     # 42) although the docstring promises seed controls the CV splits
     E = gmm_mi_torch.estimator
-    t0, v0 = E._cv_masks(100, 2, 1, torch.float64, seed=0)
-    t1, v1 = E._cv_masks(100, 2, 1, torch.float64, seed=1)
+    t0, v0 = selection._cv_masks(100, 2, 1, torch.float64, seed=0)
+    t1, v1 = selection._cv_masks(100, 2, 1, torch.float64, seed=1)
     assert not torch.equal(v0, v1)
     seen = []
-    orig = E._cv_masks
+    orig = selection._cv_masks
 
     def spy(N, n_folds, n_inits, dtype, seed=42, **kw):
         seen.append(seed)
         return orig(N, n_folds, n_inits, dtype, seed=seed, **kw)
 
-    monkeypatch.setattr(E, '_cv_masks', spy)
+    _patch_everywhere(monkeypatch, '_cv_masks', spy)
     rng = np.random.default_rng(0)
     X = rng.normal(size=(300, 2))
     for s in (7, 8):
@@ -1007,7 +1031,7 @@ def test_val_ll_empty_fold_minus_inf():
     torch.manual_seed(0)
     X = torch.randn(50, 2, dtype=torch.float64)
     g = torch.Generator().manual_seed(0)
-    w, mu, cov = E._init_params(X, 2, 2, 1e-6, generator=g)
+    w, mu, cov = em._init_params(X, 2, 2, 1e-6, generator=g)
     s = torch.ones(2, 50, dtype=torch.float64)
     s[1] = 0.0
     v = E.val_ll(X, s, w, mu, cov)
@@ -1072,8 +1096,8 @@ def test_categorical_bootstrap_large_n_fallback(monkeypatch):
     X = rng.normal(2.0 * Y, 1.0)
     common = dict(max_components=3, n_bootstrap=20, mc_samples=20_000, seed=1)
     m_mn, s_mn = estimate_categorical(X, Y, **common)
-    monkeypatch.setattr(gmm_mi_torch.estimator,
-                        '_MULTINOMIAL_MAX_CATEGORIES', 8)
+    _patch_everywhere(monkeypatch,
+           '_MULTINOMIAL_MAX_CATEGORIES', 8)
     m_ri, s_ri = estimate_categorical(X, Y, **common)
     combined = (s_mn ** 2 + s_ri ** 2) ** 0.5
     assert abs(m_mn - m_ri) <= SIGMAS * combined
@@ -1092,7 +1116,7 @@ def test_selection_slices_dead_padding(monkeypatch):
         seen_K.append(w.shape[1])
         return orig(X, s, w, mu, cov, *args, **kwargs)
 
-    monkeypatch.setattr(E, 'em_fit', spy)
+    _patch_everywhere(monkeypatch, 'em_fit', spy)
     rng = np.random.default_rng(0)
     cov = np.array([[1.0, 0.6], [0.6, 1.0]])
     X = rng.multivariate_normal([0, 0], cov, 2000)
@@ -1112,13 +1136,13 @@ def test_val_ll_replicate_chunking_and_oom_fallback(monkeypatch):
     torch.manual_seed(0)
     X = torch.randn(500, 2, dtype=torch.float64)
     g = torch.Generator().manual_seed(0)
-    w, mu, cov = E._init_params(X, 3, 12, 1e-6, generator=g)
+    w, mu, cov = em._init_params(X, 3, 12, 1e-6, generator=g)
     s = torch.rand(12, 500, dtype=torch.float64)
     ref = E.val_ll(X, s, w, mu, cov)
     assert torch.allclose(ref, E.val_ll(X, s, w, mu, cov, em_chunk=5),
                           atol=1e-12)
     calls = []
-    orig = E._val_ll_core
+    orig = em._val_ll_core
 
     def flaky(X, s_val, *args, **kwargs):
         calls.append(s_val.shape[0])
@@ -1126,7 +1150,7 @@ def test_val_ll_replicate_chunking_and_oom_fallback(monkeypatch):
             raise torch.cuda.OutOfMemoryError("synthetic")
         return orig(X, s_val, *args, **kwargs)
 
-    monkeypatch.setattr(E, '_val_ll_core', flaky)
+    _patch_everywhere(monkeypatch, '_val_ll_core', flaky)
     with pytest.warns(RuntimeWarning):
         out = E.val_ll(X, s, w, mu, cov, em_chunk=12)
     assert calls[:3] == [12, 6, 3]
@@ -1140,9 +1164,9 @@ def test_init_params_oom_fallback(monkeypatch):
     torch.manual_seed(0)
     X = torch.randn(1000, 2, dtype=torch.float64)
     g = torch.Generator().manual_seed(0)
-    ref = E._init_params(X, 3, 16, 1e-6, generator=g, em_chunk=4)
+    ref = em._init_params(X, 3, 16, 1e-6, generator=g, em_chunk=4)
     calls = []
-    orig = E._m_step
+    orig = em._m_step
 
     def flaky(Xr, resp, s, reg):
         calls.append(resp.shape[0])
@@ -1150,10 +1174,10 @@ def test_init_params_oom_fallback(monkeypatch):
             raise torch.cuda.OutOfMemoryError("synthetic")
         return orig(Xr, resp, s, reg)
 
-    monkeypatch.setattr(E, '_m_step', flaky)
+    _patch_everywhere(monkeypatch, '_m_step', flaky)
     g = torch.Generator().manual_seed(0)
     with pytest.warns(RuntimeWarning):
-        out = E._init_params(X, 3, 16, 1e-6, generator=g, em_chunk=16)
+        out = em._init_params(X, 3, 16, 1e-6, generator=g, em_chunk=16)
     assert calls[:3] == [16, 8, 4]
     for a, b in zip(ref, out):
         assert torch.equal(a, b)
@@ -1169,24 +1193,24 @@ def test_full_precision_pinned_at_kernel_boundary(monkeypatch):
     # probe reads whichever settings the pin actually drives.
     E = gmm_mi_torch.estimator
     seen = []
-    orig = E._em_fit_core
+    orig = em._em_fit_core
 
     def pinned_state():
-        if E._FP32_KNOBS is not None:
-            return tuple(k.fp32_precision for k in E._FP32_KNOBS)
+        if precision._FP32_KNOBS is not None:
+            return tuple(k.fp32_precision for k in precision._FP32_KNOBS)
         return torch.get_float32_matmul_precision()
 
-    target = ('ieee',) * 3 if E._FP32_KNOBS is not None else 'highest'
+    target = ('ieee',) * 3 if precision._FP32_KNOBS is not None else 'highest'
 
     def probe(*args, **kwargs):
         seen.append(pinned_state())
         return orig(*args, **kwargs)
 
-    monkeypatch.setattr(E, '_em_fit_core', probe)
+    _patch_everywhere(monkeypatch, '_em_fit_core', probe)
     torch.manual_seed(0)
     X = torch.randn(300, 2, dtype=torch.float32)
     g = torch.Generator().manual_seed(0)
-    w, mu, cov = E._init_params(X, 2, 2, 1e-6, generator=g)
+    w, mu, cov = em._init_params(X, 2, 2, 1e-6, generator=g)
     s = torch.ones(2, 300, dtype=torch.float32)
     prev = torch.get_float32_matmul_precision()
     try:
@@ -1209,7 +1233,7 @@ def test_entry_points_survive_new_fp32_api():
     # the caller's settings exactly (the legacy-setter restore also used to
     # rewrite the mkldnn backend a CUDA-only caller never touched).
     E = gmm_mi_torch.estimator
-    if E._FP32_KNOBS is None:
+    if precision._FP32_KNOBS is None:
         pytest.skip('torch < 2.9: no fp32_precision API')
     rng = np.random.default_rng(0)
     X = rng.multivariate_normal([0, 0], [[1, .6], [.6, 1]], 300)
@@ -1253,17 +1277,17 @@ def test_full_precision_tf32_gemm_result_cuda(monkeypatch):
         return (a @ a - ref).abs().max().item()
 
     seen = []
-    orig = E._em_fit_core
+    orig = em._em_fit_core
 
     def probe(*args, **kwargs):
         seen.append(gemm_err())
         return orig(*args, **kwargs)
 
-    monkeypatch.setattr(E, '_em_fit_core', probe)
+    _patch_everywhere(monkeypatch, '_em_fit_core', probe)
     torch.manual_seed(0)
     X = torch.randn(400, 2, dtype=torch.float32, device='cuda')
     g = torch.Generator(device='cuda').manual_seed(0)
-    w, mu, cov = E._init_params(X, 2, 2, 1e-6, generator=g)
+    w, mu, cov = em._init_params(X, 2, 2, 1e-6, generator=g)
     s = torch.ones(2, 400, dtype=torch.float32, device='cuda')
 
     # (a) legacy API: 'high' = TF32 matmuls
@@ -1281,7 +1305,7 @@ def test_full_precision_tf32_gemm_result_cuda(monkeypatch):
         torch.set_float32_matmul_precision(prev)
 
     # (b) per-backend API (torch >= 2.9)
-    if E._FP32_KNOBS is not None:
+    if precision._FP32_KNOBS is not None:
         saved = torch.backends.cuda.matmul.fp32_precision
         try:
             torch.backends.cuda.matmul.fp32_precision = 'tf32'
@@ -1342,7 +1366,7 @@ def test_return_k_reports_live_components(monkeypatch):
     # returned had 5, with no warning. k must report the live count, and a
     # requested fixed_components_number that lost components must warn.
     E = gmm_mi_torch.estimator
-    orig = E._cv_fit_for_k
+    orig = selection._cv_fit_for_k
 
     def kill_one(*args, **kwargs):
         metric, (w, mu, cov) = orig(*args, **kwargs)
@@ -1351,7 +1375,7 @@ def test_return_k_reports_live_components(monkeypatch):
         w = w / w.sum()
         return metric, (w, mu, cov)
 
-    monkeypatch.setattr(E, '_cv_fit_for_k', kill_one)
+    _patch_everywhere(monkeypatch, '_cv_fit_for_k', kill_one)
     rng = np.random.default_rng(0)
     X = rng.multivariate_normal([0, 0], [[1, .6], [.6, 1]], 400)
     with pytest.warns(RuntimeWarning, match='died during the CV fit'):
@@ -1399,13 +1423,13 @@ def test_requires_grad_input_detached(monkeypatch):
         rng.multivariate_normal([0, 0], [[1, .6], [.6, 1]], 500)
     ).requires_grad_(True)
     grad_seen = []
-    orig = E._em_fit_core
+    orig = em._em_fit_core
 
     def probe(*args, **kwargs):
         grad_seen.append(torch.is_grad_enabled())
         return orig(*args, **kwargs)
 
-    monkeypatch.setattr(E, '_em_fit_core', probe)
+    _patch_everywhere(monkeypatch, '_em_fit_core', probe)
     m, s, fit = estimate(Xg, 'MI', max_components=2, n_bootstrap=2,
                          mc_samples=2000, return_fit=True)
     assert np.isfinite(m) and np.isfinite(fit.weights_).all()
@@ -1447,7 +1471,7 @@ def test_entry_pipeline_runs_at_float64(monkeypatch):
         seen.append(X.dtype)
         return orig(X, *args, **kwargs)
 
-    monkeypatch.setattr(E, '_rank_gaussianise', spy)
+    _patch_everywhere(monkeypatch, '_rank_gaussianise', spy)
     rng = np.random.default_rng(0)
     X = rng.multivariate_normal([0, 0], [[1, .6], [.6, 1]], 500)
     estimate(X, 'MI', preprocess='gaussianise', dtype=torch.float32,
@@ -1575,7 +1599,7 @@ def test_mc_oom_retry_stream_invariant(monkeypatch):
             raise torch.cuda.OutOfMemoryError('synthetic')
         return orig(pts, w, mu, chol)
 
-    monkeypatch.setattr(E, 'gmm_score', flaky)
+    _patch_everywhere(monkeypatch, 'gmm_score', flaky)
     with pytest.warns(RuntimeWarning, match='retrying'):
         out = estimate(X, 'MI', **common)
     assert out == ref
@@ -1614,7 +1638,7 @@ def test_max_iter_exhaustion_warns():
     torch.manual_seed(0)
     X = torch.randn(400, 2, dtype=torch.float64)
     g = torch.Generator().manual_seed(0)
-    w0, mu0, cov0 = E._init_params(X, 3, 4, 1e-6, generator=g)
+    w0, mu0, cov0 = em._init_params(X, 3, 4, 1e-6, generator=g)
     s = torch.ones(4, 400, dtype=torch.float64)
     with pytest.warns(RuntimeWarning, match='did not converge'):
         E.em_fit(X, s, w0, mu0, cov0, max_iter=1)
@@ -1695,7 +1719,7 @@ def test_reroute_zero_inflated_fp32():
             warnings.simplefilter('always')
             m32, s32 = estimate(X, 'MI', dtype=torch.float32, seed=seed, **kw)
         assert abs(m32 - m64) <= 3 * (s32 ** 2 + s64 ** 2) ** 0.5 + 0.01, seed
-        if E._EM_KERNEL == 'gemm':
+        if constants._EM_KERNEL == 'gemm':
             assert any('legacy kernels' in str(r.message) for r in rec), seed
 
 
@@ -1711,7 +1735,7 @@ def test_reroute_matches_legacy_fp32(monkeypatch):
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)
         for kernel in ('gemm', 'legacy'):
-            monkeypatch.setattr(E, '_EM_KERNEL', kernel)
+            _patch_everywhere(monkeypatch, '_EM_KERNEL', kernel)
             out[kernel] = estimate(X, 'MI', **kw)
     (mg, sg), (ml, sl) = out['gemm'], out['legacy']
     assert abs(mg - ml) <= 3 * (sg ** 2 + sl ** 2) ** 0.5 + 0.01
@@ -1765,14 +1789,14 @@ def test_reroute_never_fires_at_fp64(monkeypatch):
     # reg_covar, the detector must never trip at float64
     E = gmm_mi_torch.estimator
     trips = []
-    orig = E._reroute_trips
+    orig = em._reroute_trips
 
     def spy(w, mu, cov, repaired=None):
         out = orig(w, mu, cov, repaired=repaired)
         trips.append(int(out.sum()))
         return out
 
-    monkeypatch.setattr(E, '_reroute_trips', spy)
+    _patch_everywhere(monkeypatch, '_reroute_trips', spy)
     X = _three_component_data(N=6000)
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)
@@ -1967,7 +1991,7 @@ def test_init_draw_chunk_invariant():
     # construction — on CUDA too, where chunked draws from ONE Philox
     # generator would differ with the chunking
     E = gmm_mi_torch.estimator
-    orig = E._m_step
+    orig = em._m_step
     devices = ['cpu'] + (['cuda'] if torch.cuda.is_available() else [])
     for dev in devices:
         X = torch.randn(600, 2, generator=torch.Generator().manual_seed(0),
@@ -1980,13 +2004,13 @@ def test_init_draw_chunk_invariant():
             def spy(Xr, resp, s, reg, seen=seen):
                 seen.append(resp.clone())
                 return orig(Xr, resp, s, reg)
-            E._m_step = spy
+            _set_everywhere('_m_step', spy)
             try:
                 g = torch.Generator(device=dev).manual_seed(11)
-                outs.append(E._init_params(X, 3, 12, 1e-6, generator=g,
-                                           active_k=ak, em_chunk=chunk))
+                outs.append(em._init_params(X, 3, 12, 1e-6, generator=g,
+                                            active_k=ak, em_chunk=chunk))
             finally:
-                E._m_step = orig
+                _set_everywhere('_m_step', orig)
             draws.append(torch.cat(seen))
         for dr, o in zip(draws[1:], outs[1:]):
             # the normalised draw is bitwise chunk-invariant everywhere; the
@@ -2017,12 +2041,12 @@ def test_init_draw_is_chunked_on_device():
     R, N, K = 64, 20000, 8
     X = torch.randn(N, 2, device='cuda', dtype=torch.float32)
     g = torch.Generator(device='cuda').manual_seed(0)
-    E._init_params(X, K, 8, 1e-6, generator=g, em_chunk=8)   # warm-up
+    em._init_params(X, K, 8, 1e-6, generator=g, em_chunk=8)   # warm-up
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
-    E._init_params(X, K, R, 1e-6, generator=g, em_chunk=8)
+    em._init_params(X, K, R, 1e-6, generator=g, em_chunk=8)
     torch.cuda.synchronize()
     peak = torch.cuda.max_memory_allocated() - base
     draw = R * N * K * 4
@@ -2050,8 +2074,8 @@ def test_cv_masks_are_expand_views(monkeypatch):
     def spy_vl(X, s, *a, **k):
         seen.append(s)
         return orig_vl(X, s, *a, **k)
-    monkeypatch.setattr(E, 'em_fit', spy_em)
-    monkeypatch.setattr(E, 'val_ll', spy_vl)
+    _patch_everywhere(monkeypatch, 'em_fit', spy_em)
+    _patch_everywhere(monkeypatch, 'val_ll', spy_vl)
     X = torch.randn(N, 2, dtype=torch.float64,
                     generator=torch.Generator().manual_seed(0))
     E.select_batched(X, max_components=K, n_folds=F, n_inits=I,
@@ -2064,11 +2088,11 @@ def test_cv_masks_are_expand_views(monkeypatch):
     s = seen[0]
     dense = s.reshape(-1, N)
     for sl in (slice(0, 5), slice(5, 10), slice(20, 25), slice(22, 40)):
-        assert torch.equal(E._rows(s, sl), dense[sl])
+        assert torch.equal(chunking._rows(s, sl), dense[sl])
     # and the kernels give bitwise the same answer on the view and the copy
     g = torch.Generator().manual_seed(1)
-    w0, mu0, cov0 = E._init_params(X, 2, K * I * F, 1e-6, generator=g,
-                                   init_type='minmax')
+    w0, mu0, cov0 = em._init_params(X, 2, K * I * F, 1e-6, generator=g,
+                                    init_type='minmax')
     ov = E.em_fit(X, s, w0, mu0, cov0, em_chunk=7, max_iter=5)
     od = E.em_fit(X, dense, w0, mu0, cov0, em_chunk=7, max_iter=5)
     for a, b in zip(ov, od):
@@ -2091,7 +2115,7 @@ def _moment_inputs(R, N, K, d, dtype, device):
     scale = (10 * torch.arange(R).view(R, 1, 1) + torch.arange(K).view(1, 1, K)
              + 1).to(dtype)
     wr = (torch.rand(R, N, K, dtype=dtype, generator=g) + 0.5) * scale
-    return wr.to(device), gmm_mi_torch.estimator._features(X)
+    return wr.to(device), em._features(X)
 
 
 def test_moment_gemm_float32_block_bound():
@@ -2106,17 +2130,17 @@ def test_moment_gemm_float32_block_bound():
         for R, N, K, d in _moment_cases():
             wr, F = _moment_inputs(R, N, K, d, torch.float32, dev)
             ref = torch.einsum('rnk,nq->rkq', wr.double(), F.double())
-            bound = (E._MSTEP_BLOCK * 2.0 ** -24
+            bound = (constants._MSTEP_BLOCK * 2.0 ** -24
                      * torch.einsum('rnk,nq->rkq', wr.abs().double(),
                                     F.abs().double()) + 1e-12 * ref.abs())
-            with E._pinned_precision():
-                S = E._moment_gemm(wr, F)
+            with precision._pinned_precision():
+                S = em._moment_gemm(wr, F)
             assert S.dtype == torch.float64 and S.shape == (R, K, d + d * (d + 1) // 2)
             assert ((S - ref).abs() <= bound).all(), (dev, R, N, K, d)
             wr64, F64 = _moment_inputs(R, N, K, d, torch.float64, dev)
             ref64 = torch.einsum('rnk,nq->rkq', wr64, F64)
-            with E._pinned_precision():
-                S64 = E._moment_gemm(wr64, F64)
+            with precision._pinned_precision():
+                S64 = em._moment_gemm(wr64, F64)
             assert ((S64 - ref64).abs() <= 1e-13 * ref64.abs().max()).all()
 
 
@@ -2132,13 +2156,13 @@ def test_moment_gemm_peak_on_device():
     R, K, d = 16, 2, 8
     for N in (65536, 65636):          # block-exact, and with a tail
         wr, F = _moment_inputs(R, N, K, d, torch.float32, 'cuda')
-        with E._pinned_precision():
-            E._moment_gemm(wr, F)
+        with precision._pinned_precision():
+            em._moment_gemm(wr, F)
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
             base = torch.cuda.memory_allocated()
-            E._moment_gemm(wr, F)
+            em._moment_gemm(wr, F)
             torch.cuda.synchronize()
         peak = torch.cuda.max_memory_allocated() - base
         assert peak <= 1.75 * R * N * K * 4, (N, peak / (R * N * K * 4))
@@ -2150,38 +2174,39 @@ def test_byte_models_and_fixed_cost():
     # the measured-peak comparison itself is the bench script's job.
     E = gmm_mi_torch.estimator
     f32 = torch.float32
-    em = [E._em_bytes_per_replicate(1000, K, 2, f32) for K in (1, 2, 3, 20)]
+    em = [chunking._em_bytes_per_replicate(1000, K, 2, f32) for K in (1, 2, 3, 20)]
     assert all(b > a for a, b in zip(em, em[1:]))
-    if E._EM_KERNEL == 'gemm':
+    if constants._EM_KERNEL == 'gemm':
         # small K is dominated by the (R,N) temporaries, not by 3K
-        assert E._em_bytes_per_replicate(1000, 1, 2, f32) >= 1000 * 4 * 7
-        assert E._em_bytes_per_replicate(1000, 1, 2, f32) < 1000 * 4 * 9
-        assert E._em_fixed_bytes(1000, 8, f32) == 2 * 1000 * 44 * 4
-        assert E._em_fixed_bytes(1000, 8, f32, n_chunk=100) == 2 * 100 * 44 * 4
+        assert chunking._em_bytes_per_replicate(1000, 1, 2, f32) >= 1000 * 4 * 7
+        assert chunking._em_bytes_per_replicate(1000, 1, 2, f32) < 1000 * 4 * 9
+        assert chunking._em_fixed_bytes(1000, 8, f32) == 2 * 1000 * 44 * 4
+        assert chunking._em_fixed_bytes(1000, 8, f32, n_chunk=100) == 2 * 100 * 44 * 4
     else:
-        assert E._em_fixed_bytes(1000, 8, f32) == 0
+        assert chunking._em_fixed_bytes(1000, 8, f32) == 0
     # n_chunk caps the per-replicate term; the init stage ignores it and
     # carries the broadcast (4d+2)K legacy peak over the full N
-    assert E._em_bytes_per_replicate(10**6, 3, 2, f32, n_chunk=1000) \
-        == E._em_bytes_per_replicate(1000, 3, 2, f32)
-    init = E._init_bytes_per_replicate(1000, 20, 8, f32, 'random_responsibilities')
+    assert chunking._em_bytes_per_replicate(10**6, 3, 2, f32, n_chunk=1000) \
+        == chunking._em_bytes_per_replicate(1000, 3, 2, f32)
+    init = chunking._init_bytes_per_replicate(1000, 20, 8, f32,
+                                              'random_responsibilities')
     assert init >= 1000 * 4 * (34 * 20)
-    assert E._init_bytes_per_replicate(1000, 20, 8, f32, 'kmeans') == init
-    assert E._init_bytes_per_replicate(1000, 20, 8, f32, 'minmax') \
-        == E._em_bytes_per_replicate(1000, 20, 8, f32)
+    assert chunking._init_bytes_per_replicate(1000, 20, 8, f32, 'kmeans') == init
+    assert chunking._init_bytes_per_replicate(1000, 20, 8, f32, 'minmax') \
+        == chunking._em_bytes_per_replicate(1000, 20, 8, f32)
     # the MC model is bounded below by gmm_sample's (S,d,d) gather at K=1
-    assert E._mc_bytes_per_replicate(1000, 1, 8, f32) >= 1000 * 4 * 98
-    assert E._mc_bytes_per_replicate(1000, 20, 8, f32) >= 1000 * 4 * (25 * 20)
+    assert chunking._mc_bytes_per_replicate(1000, 1, 8, f32) >= 1000 * 4 * 98
+    assert chunking._mc_bytes_per_replicate(1000, 20, 8, f32) >= 1000 * 4 * (25 * 20)
     # a stage's fixed allocation comes off the budget before the division
     saved = torch.cuda.mem_get_info
     torch.cuda.mem_get_info = lambda dev=None: (2 * 10**9, 4 * 10**9)
     try:
-        n0 = E._auto_chunk(1000, 10**7, 'cuda')
-        n1 = E._auto_chunk(1000, 10**7, 'cuda', fixed_bytes=5 * 10**8)
+        n0 = chunking._auto_chunk(1000, 10**7, 'cuda')
+        n1 = chunking._auto_chunk(1000, 10**7, 'cuda', fixed_bytes=5 * 10**8)
         assert n1 == n0 - 50
-        assert E._resolve_chunk('auto', 1000, 10**7, 'cuda',
-                                fixed_bytes=5 * 10**8) == n1
-        assert E._resolve_chunk(7, 1000, 10**7, 'cuda', fixed_bytes=10**12) == 7
+        assert chunking._resolve_chunk('auto', 1000, 10**7, 'cuda',
+                                       fixed_bytes=5 * 10**8) == n1
+        assert chunking._resolve_chunk(7, 1000, 10**7, 'cuda', fixed_bytes=10**12) == 7
     finally:
         torch.cuda.mem_get_info = saved
 
@@ -2193,7 +2218,7 @@ def test_init_stage_sized_apart_from_em():
     # smaller than the EM batch; an integer em_chunk is honoured by both
     E = gmm_mi_torch.estimator
     seen = {}
-    orig_init, orig_em = E._init_params, E.em_fit
+    orig_init, orig_em = em._init_params, E.em_fit
 
     def spy_init(*a, **k):
         seen['init'] = k['em_chunk']
@@ -2202,8 +2227,9 @@ def test_init_stage_sized_apart_from_em():
     def spy_em(*a, **k):
         seen.setdefault('em', k['em_chunk'])
         return orig_em(*a, **k)
-    saved = (E._init_params, E.em_fit, torch.cuda.mem_get_info)
-    E._init_params, E.em_fit = spy_init, spy_em
+    saved = (em._init_params, E.em_fit, torch.cuda.mem_get_info)
+    _set_everywhere('_init_params', spy_init)
+    _set_everywhere('em_fit', spy_em)
     torch.cuda.mem_get_info = lambda dev=None: (10**9, 10**9)
     try:
         X = torch.randn(20000, 2, dtype=torch.float32)
@@ -2230,7 +2256,7 @@ def test_init_stage_sized_apart_from_em():
                 dict(reg_covar=1e-6, threshold_fit=1e-5, max_iter=2,
                      em_chunk='auto', n_chunk=None,
                      init_type='random_responsibilities', scale=None, seed=0))
-            if E._EM_KERNEL == 'gemm':
+            if constants._EM_KERNEL == 'gemm':
                 assert seen['init'] < seen['em'], seen
             else:
                 # the legacy EM model ((4d+4)K) is the larger one there, so
@@ -2248,7 +2274,9 @@ def test_init_stage_sized_apart_from_em():
                  init_type='minmax', scale=None, seed=0))
         assert seen == {'init': 5, 'em': 5}
     finally:
-        E._init_params, E.em_fit, torch.cuda.mem_get_info = saved
+        _set_everywhere('_init_params', saved[0])
+        _set_everywhere('em_fit', saved[1])
+        torch.cuda.mem_get_info = saved[2]
 
 
 def test_partition_rows_gathered_per_chunk_bitwise():
@@ -2258,13 +2286,13 @@ def test_partition_rows_gathered_per_chunk_bitwise():
     # result must be bitwise the per-replicate (unpartitioned) answer at
     # every em_chunk and n_chunk, and identical to the up-front gather.
     E = gmm_mi_torch.estimator
-    if E._EM_KERNEL != 'gemm':
+    if constants._EM_KERNEL != 'gemm':
         pytest.skip('partition exists only under the GEMM kernels')
     g = torch.Generator().manual_seed(0)
     X = torch.randn(3000, 2, dtype=torch.float32, generator=g)
     X = (X - X.mean(0)) / X.std(0)
-    w0, mu0, cov0 = E._init_params(X, 2, 6, 1e-6, generator=g,
-                                   init_type='minmax')
+    w0, mu0, cov0 = em._init_params(X, 2, 6, 1e-6, generator=g,
+                                    init_type='minmax')
     # collapse one component far from the origin in half the replicates
     mu0[::2, 0] = 4.0
     cov0[::2, 0] = 1e-6 * torch.eye(2)
@@ -2322,7 +2350,7 @@ def test_bootstrap_counts_stream_and_transients(monkeypatch):
         return out
     monkeypatch.setattr(torch, 'randint', spy_ri)
     monkeypatch.setattr(torch, 'rand', spy_rand)
-    monkeypatch.setattr(E, '_MULTINOMIAL_MAX_CATEGORIES', 8)
+    _patch_everywhere(monkeypatch, '_MULTINOMIAL_MAX_CATEGORIES', 8)
     g = torch.Generator().manual_seed(7)
     got = E._bootstrap_counts(N, B, torch.float32, 'cpu', g)
     assert torch.equal(got.sum(1), torch.full((B,), float(N)))
@@ -2343,7 +2371,7 @@ def test_large_n_bootstrap_draw_is_uniform(monkeypatch):
     # ~0.5 GB per device). One function, not parametrised, so the test
     # counts hold on CPU-only hosts.
     E = gmm_mi_torch.estimator
-    monkeypatch.setattr(E, '_MULTINOMIAL_MAX_CATEGORIES', 8)
+    _patch_everywhere(monkeypatch, '_MULTINOMIAL_MAX_CATEGORIES', 8)
     N, B = 10_000_000, 8
     m = (1 << 32) % N
     se = math.sqrt(1 / (B * m) + 1 / (B * (N - m)))     # Poisson(1) counts
@@ -2369,7 +2397,7 @@ def test_large_n_bootstrap_draw_mechanism(monkeypatch):
     # fails at u = 0.5 and at nextafter(1, 0); N=12 is the non-power-of-two
     # case, the only one where the product rounds at all (downwards).
     E = gmm_mi_torch.estimator
-    monkeypatch.setattr(E, '_MULTINOMIAL_MAX_CATEGORIES', 8)
+    _patch_everywhere(monkeypatch, '_MULTINOMIAL_MAX_CATEGORIES', 8)
     top = math.nextafter(1.0, 0.0)                      # 1 - 2^-53
     cases = {
         16: [0.0, 1.0, top, 0.5, 15 / 16, 1 / 16, 1 / 16 - 2.0 ** -56, 0.999],
@@ -2401,7 +2429,7 @@ def test_oom_retry_releases_after_handler(monkeypatch):
             raise torch.cuda.OutOfMemoryError('synthetic')
         return torch.arange(sl.start, sl.stop)
     with pytest.warns(RuntimeWarning):
-        out = torch.cat(E._run_chunked(8, 8, fn))
+        out = torch.cat(chunking._run_chunked(8, 8, fn))
     assert torch.equal(out, torch.arange(8))
     assert states == [None, None]
 
@@ -2449,12 +2477,12 @@ def test_degenerate_sample_sizes_raise_or_warn():
                      n_bootstrap=0, mc_samples=100)
     # exact arithmetic of the floor: N - ceil(N / n_folds) >= d + 1
     with pytest.raises(ValueError, match='smallest training fold'):
-        E._validate_folds(5, 2, d=2)          # 5 - 3 = 2 < 3
+        selection._validate_folds(5, 2, d=2)          # 5 - 3 = 2 < 3
     with warnings.catch_warnings():
         warnings.simplefilter('error')
-        E._validate_folds(200, 2, d=2)        # silent at N >= 100
+        selection._validate_folds(200, 2, d=2)        # silent at N >= 100
     with pytest.warns(RuntimeWarning, match='finite-sample bias'):
-        E._validate_folds(6, 2, d=2)          # 6 - 3 = 3 >= 3: passes, warns
+        selection._validate_folds(6, 2, d=2)          # 6 - 3 = 3 >= 3: passes, warns
     with pytest.warns(RuntimeWarning, match='finite-sample bias'):
         m, s = estimate(rng.normal(size=(60, 2)), 'MI', max_components=2,
                         n_bootstrap=2, mc_samples=500)
@@ -2585,7 +2613,7 @@ def test_precision_pin_preserves_knob_inheritance():
     # 'none' state, generic-only, explicit child != parent, intermediate
     # level explicit, nested pins.
     E = gmm_mi_torch.estimator
-    if E._FP32_KNOBS is None:
+    if precision._FP32_KNOBS is None:
         pytest.skip('per-backend fp32_precision knobs need torch >= 2.9')
     C = torch._C
     levels = (('generic', 'all'), ('cuda', 'all'), ('cuda', 'matmul'),
@@ -2604,14 +2632,14 @@ def test_precision_pin_preserves_knob_inheritance():
     try:
         # 0. fresh process: 'none' everywhere, restored as 'none'
         reset()
-        with E._pinned_precision():
+        with precision._pinned_precision():
             assert cuda_mm() == 'ieee' and mk_mm() == 'ieee'
         assert C._get_fp32_precision_getter('cuda', 'matmul') == 'none'
         assert C._get_fp32_precision_getter('generic', 'all') == 'none'
         # 1. generic only: children follow a later generic change
         reset()
         torch.backends.fp32_precision = 'tf32'
-        with E._pinned_precision():
+        with precision._pinned_precision():
             pass
         torch.backends.fp32_precision = 'ieee'
         assert cuda_mm() == 'ieee' and mk_mm() == 'ieee'
@@ -2620,7 +2648,7 @@ def test_precision_pin_preserves_knob_inheritance():
         torch.backends.fp32_precision = 'ieee'
         torch.backends.cuda.matmul.fp32_precision = 'tf32'
         torch.backends.mkldnn.matmul.fp32_precision = 'bf16'
-        with E._pinned_precision():
+        with precision._pinned_precision():
             pass
         assert cuda_mm() == 'tf32' and mk_mm() == 'bf16'
         torch.backends.fp32_precision = 'tf32'
@@ -2629,7 +2657,7 @@ def test_precision_pin_preserves_knob_inheritance():
         #    child keeps following it
         reset()
         C._set_fp32_precision_setter('cuda', 'all', 'tf32')
-        with E._pinned_precision():
+        with precision._pinned_precision():
             assert C._get_fp32_precision_getter('cuda', 'all') == 'tf32'
             assert cuda_mm() == 'ieee'
         assert cuda_mm() == 'tf32'
@@ -2638,8 +2666,8 @@ def test_precision_pin_preserves_knob_inheritance():
         # 4. nested pins under a generic-only setting
         reset()
         torch.backends.fp32_precision = 'tf32'
-        with E._pinned_precision():
-            with E._pinned_precision():
+        with precision._pinned_precision():
+            with precision._pinned_precision():
                 assert cuda_mm() == 'ieee'
             assert cuda_mm() == 'ieee'
         assert cuda_mm() == 'tf32'
@@ -2664,7 +2692,7 @@ def test_weight_chunks_accessor():
     for s, R_all in ((s4, 30), (base, 6), (dense, 30)):
         for sl in (slice(0, R_all), slice(1, R_all - 1),
                    slice(R_all - 3, R_all + 5)):       # past the end: clipped
-            wc = E._WeightChunks(s, sl, n_chunk=128)
+            wc = chunking._WeightChunks(s, sl, n_chunk=128)
             ref = s.reshape(-1, N)[sl]
             assert wc.shape == tuple(ref.shape)
             for i, n in ((0, 128), (128, 128), (896, 128), (0, N)):
@@ -2676,7 +2704,7 @@ def test_weight_chunks_accessor():
                 blk = wc.rows(128, 64)
                 assert blk.data_ptr() == s[sl.start, 128:].data_ptr()  # a view
     # a dense tensor passed where an accessor is expected is wrapped
-    wc = E._as_weight_chunks(dense[:4], 100)
+    wc = chunking._as_weight_chunks(dense[:4], 100)
     assert wc.shape == (4, N) and torch.equal(wc.rows(0, N), dense[:4])
 
 
@@ -2692,10 +2720,10 @@ def test_streamed_compaction_bitwise_with_nd_weights():
     N = 2400
     X = torch.randn(N, 2, generator=g, dtype=torch.float64)
     X = (X - X.mean(0)) / X.std(0)
-    train, val = E._cv_masks(N, 2, 3, torch.float64)        # (3, 2, N)
+    train, val = selection._cv_masks(N, 2, 3, torch.float64)        # (3, 2, N)
     R = 6
-    w0, mu0, cov0 = E._init_params(X, 2, R, 1e-6, generator=g,
-                                   init_type='minmax')
+    w0, mu0, cov0 = em._init_params(X, 2, R, 1e-6, generator=g,
+                                    init_type='minmax')
     mu0[::2, 0] = 4.0
     cov0[::2, 0] = 1e-6 * torch.eye(2, dtype=torch.float64)
     dense_t, dense_v = train.reshape(R, N), val.reshape(R, N)
@@ -2726,12 +2754,12 @@ def test_streamed_path_holds_no_full_weight_copies():
     E = gmm_mi_torch.estimator
     N, R, K, nc = 400_000, 32, 3, 4096
     X = torch.randn(N, 2, device='cuda', dtype=torch.float32)
-    train, val = E._cv_masks(N, 2, 16, torch.float32, device='cuda')
+    train, val = selection._cv_masks(N, 2, 16, torch.float32, device='cuda')
     g = torch.Generator(device='cuda').manual_seed(0)
-    w, mu, cov = E._init_params(X, K, R, 1e-6, generator=g,
-                                init_type='minmax', em_chunk=R)
-    model = (R * E._em_bytes_per_replicate(N, K, 2, torch.float32, nc)
-             + E._em_fixed_bytes(N, 2, torch.float32, nc))
+    w, mu, cov = em._init_params(X, K, R, 1e-6, generator=g,
+                                 init_type='minmax', em_chunk=R)
+    model = (R * chunking._em_bytes_per_replicate(N, K, 2, torch.float32, nc)
+             + chunking._em_fixed_bytes(N, 2, torch.float32, nc))
     E.em_fit(X, train, w, mu, cov, em_chunk=R, max_iter=2, n_chunk=nc)
     for fn in (lambda: E.em_fit(X, train, w, mu, cov, em_chunk=R, max_iter=6,
                                 n_chunk=nc),
@@ -2754,21 +2782,21 @@ def test_val_ll_streams_rerouted_replicates():
     # chunk helper, values at reduction order against the unchunked
     # evaluation (CPU), and the peak under the em budget (CUDA).
     E = gmm_mi_torch.estimator
-    if E._EM_KERNEL != 'gemm':
+    if constants._EM_KERNEL != 'gemm':
         pytest.skip('the reroute partition exists only under the GEMM kernels')
-    assert E._legacy_sample_chunk(20000, 5, 4, torch.float32) \
-        == E._legacy_sample_chunk(20000, 5, 4, torch.float64)
+    assert chunking._legacy_sample_chunk(20000, 5, 4, torch.float32) \
+        == chunking._legacy_sample_chunk(20000, 5, 4, torch.float64)
     g = torch.Generator().manual_seed(0)
     X = torch.randn(6000, 2, generator=g, dtype=torch.float32)
     X = (X - X.mean(0)) / X.std(0)
-    w, mu, cov = E._init_params(X, 3, 8, 1e-6, generator=g, init_type='minmax')
+    w, mu, cov = em._init_params(X, 3, 8, 1e-6, generator=g, init_type='minmax')
     mu[::2, 0] = 4.0
     cov[::2, 0] = 1e-6 * torch.eye(2)
     s = torch.rand(8, 6000, generator=g) + 0.5
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)
         got = E.val_ll(X, s, w, mu, cov, em_chunk=8)
-        chol, _ = E._chol(cov)
+        chol, _ = gaussian._chol(cov)
         ref = (E.gmm_score(X.expand(8, 6000, 2), w, mu, chol) * s).sum(1) \
             / s.sum(1)
         assert torch.allclose(got, ref, rtol=1e-5, atol=1e-6)
@@ -2779,13 +2807,13 @@ def test_val_ll_streams_rerouted_replicates():
         N, R, K, d = 20000, 16, 20, 8
         Xc = torch.randn(N, d, device='cuda', dtype=torch.float32)
         gc = torch.Generator(device='cuda').manual_seed(0)
-        w, mu, cov = E._init_params(Xc, K, R, 1e-6, generator=gc,
-                                    init_type='minmax', em_chunk=R)
+        w, mu, cov = em._init_params(Xc, K, R, 1e-6, generator=gc,
+                                     init_type='minmax', em_chunk=R)
         mu[:, 0] = 4.0
         cov[:, 0] = 1e-6 * torch.eye(d, device='cuda')
         ones = torch.ones(R, N, device='cuda')
-        model = (R * E._em_bytes_per_replicate(N, K, d, torch.float32)
-                 + E._em_fixed_bytes(N, d, torch.float32))
+        model = (R * chunking._em_bytes_per_replicate(N, K, d, torch.float32)
+                 + chunking._em_fixed_bytes(N, d, torch.float32))
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', RuntimeWarning)
             E.val_ll(Xc, ones, w, mu, cov, em_chunk=R)
@@ -2808,7 +2836,7 @@ def test_init_streams_with_n_chunk_same_draw():
     # CUDA (pinned through the _init_draw_block seam); the streamed
     # parameters agree with the single pass at reduction order.
     E = gmm_mi_torch.estimator
-    orig = E._init_draw_block
+    orig = em._init_draw_block
     for dev in ['cpu'] + (['cuda'] if torch.cuda.is_available() else []):
         for dt, tol in ((torch.float64, 1e-12), (torch.float32, 2e-4)):
             X = torch.randn(50_003, 3, generator=torch.Generator().manual_seed(0),
@@ -2821,13 +2849,13 @@ def test_init_streams_with_n_chunk_same_draw():
                 def spy(out, gen, seen=seen):
                     orig(out, gen)
                     seen.append(out.detach().clone().flatten())
-                E._init_draw_block = spy
+                _set_everywhere('_init_draw_block', spy)
                 try:
                     g = torch.Generator(device=dev).manual_seed(11)
-                    out = E._init_params(X, 3, 12, 1e-6, generator=g,
-                                         active_k=ak, em_chunk=12, n_chunk=nc)
+                    out = em._init_params(X, 3, 12, 1e-6, generator=g,
+                                          active_k=ak, em_chunk=12, n_chunk=nc)
                 finally:
-                    E._init_draw_block = orig
+                    _set_everywhere('_init_draw_block', orig)
                 runs[nc] = (out, torch.cat(seen))
             params0, draw0 = runs[None]
             for nc in (2000, 20000):
@@ -2842,8 +2870,8 @@ def test_init_streams_with_n_chunk_same_draw():
             # em_chunk-invariance of the streamed init (bitwise: same
             # chunk sums in the same order per replicate)
             g = torch.Generator(device=dev).manual_seed(11)
-            out5 = E._init_params(X, 3, 12, 1e-6, generator=g, active_k=ak,
-                                  em_chunk=5, n_chunk=20000)
+            out5 = em._init_params(X, 3, 12, 1e-6, generator=g, active_k=ak,
+                                   em_chunk=5, n_chunk=20000)
             for a, b in zip(out5, runs[20000][0]):
                 if dev == 'cpu':
                     assert torch.equal(a, b), dt
@@ -2852,19 +2880,20 @@ def test_init_streams_with_n_chunk_same_draw():
             # k-means: identical labels in both passes, parameters at
             # reduction order
             g = torch.Generator(device=dev).manual_seed(3)
-            k0 = E._init_params(X, 3, 6, 1e-6, generator=g, init_type='kmeans')
+            k0 = em._init_params(X, 3, 6, 1e-6, generator=g, init_type='kmeans')
             g = torch.Generator(device=dev).manual_seed(3)
-            k1 = E._init_params(X, 3, 6, 1e-6, generator=g, init_type='kmeans',
-                                n_chunk=7000)
+            k1 = em._init_params(X, 3, 6, 1e-6, generator=g, init_type='kmeans',
+                                 n_chunk=7000)
             for a, b in zip(k0, k1):
                 assert torch.allclose(a, b, rtol=tol, atol=tol), (dev, dt)
-    assert E._init_sample_chunk(10**6, 2000) == E._INIT_DRAW_BLOCK
-    assert E._init_sample_chunk(10**6, 40000) == 2 * E._INIT_DRAW_BLOCK
-    assert E._init_sample_chunk(5000, 40000) == 5000
-    assert E._init_bytes_per_replicate(10**6, 20, 8, torch.float32,
-                                       'random_responsibilities', 2000) \
-        == E._init_bytes_per_replicate(E._INIT_DRAW_BLOCK, 20, 8, torch.float32,
-                                       'random_responsibilities')
+    assert chunking._init_sample_chunk(10**6, 2000) == constants._INIT_DRAW_BLOCK
+    assert chunking._init_sample_chunk(10**6, 40000) == 2 * constants._INIT_DRAW_BLOCK
+    assert chunking._init_sample_chunk(5000, 40000) == 5000
+    assert chunking._init_bytes_per_replicate(10**6, 20, 8, torch.float32,
+                                              'random_responsibilities', 2000) \
+        == chunking._init_bytes_per_replicate(constants._INIT_DRAW_BLOCK, 20, 8,
+                                              torch.float32,
+                                              'random_responsibilities')
 
 
 def test_init_hopeless_case_raises_readably():
@@ -2918,18 +2947,18 @@ def test_streamed_init_peak_under_model():
     X = torch.randn(N, d, device='cuda', dtype=torch.float32)
     for init in ('random_responsibilities', 'kmeans'):
         g = torch.Generator(device='cuda').manual_seed(0)
-        E._init_params(X, K, 2, 1e-6, generator=g, init_type=init, em_chunk=2,
-                       n_chunk=nc)
+        em._init_params(X, K, 2, 1e-6, generator=g, init_type=init, em_chunk=2,
+                        n_chunk=nc)
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         base = torch.cuda.memory_allocated()
         g = torch.Generator(device='cuda').manual_seed(0)
-        E._init_params(X, K, R, 1e-6, generator=g, init_type=init, em_chunk=R,
-                       n_chunk=nc)
+        em._init_params(X, K, R, 1e-6, generator=g, init_type=init, em_chunk=R,
+                        n_chunk=nc)
         torch.cuda.synchronize()
         peak = torch.cuda.max_memory_allocated() - base
-        model = R * E._init_bytes_per_replicate(N, K, d, torch.float32, init, nc)
+        model = R * chunking._init_bytes_per_replicate(N, K, d, torch.float32, init, nc)
         # v0.5.0 ran this over the full N: 24x this model's sample chunk
         assert peak <= model, (init, peak / model)
 
@@ -2966,8 +2995,8 @@ def test_entry_coercions_count_like_arguments():
         estimate_categorical(X[:, 0], (X[:, 1] > 0).astype(int), n_chunk=1e2,
                              max_components=1, n_bootstrap=0, mc_samples=100)
     # bool is an int (operator.index(True) == 1), as for every other count
-    assert E._resolve_chunk(True, 10, 1, 'cpu', name='mc_chunk') == 1
-    assert E._resolve_chunk(np.int64(3), 10, 1, 'cpu') == 3
+    assert chunking._resolve_chunk(True, 10, 1, 'cpu', name='mc_chunk') == 1
+    assert chunking._resolve_chunk(np.int64(3), 10, 1, 'cpu') == 3
 
 
 def test_mc_chunk_validated_at_entry(monkeypatch):
@@ -2981,7 +3010,7 @@ def test_mc_chunk_validated_at_entry(monkeypatch):
     def spy(*args, **kwargs):
         calls.append(1)
         raise AssertionError('_select_and_fit reached')
-    monkeypatch.setattr(E, '_select_and_fit', spy)
+    _patch_everywhere(monkeypatch, '_select_and_fit', spy)
     rng = np.random.default_rng(0)
     X = rng.normal(size=(300, 2))
     Y = (X[:, 1] > 0).astype(int)
@@ -3018,7 +3047,7 @@ def test_selection_masks_single_nonfinite_metric(monkeypatch):
             return out
         return spy
     ref = E.select_batched(X, max_components=4, init_type='minmax', seed=3)
-    monkeypatch.setattr(E, 'val_ll', poison(2, only_once=True))
+    _patch_everywhere(monkeypatch, 'val_ll', poison(2, only_once=True))
     k, params, hist = E.select_batched(X, max_components=4, init_type='minmax',
                                        seed=3)
     assert k == ref[0] and math.isnan(hist[2][0])     # k=2 masked, same answer
@@ -3040,11 +3069,11 @@ def test_selection_masks_single_nonfinite_metric(monkeypatch):
             return out
         return spy
     for mm in ('aic', 'bic'):
-        monkeypatch.setattr(E, 'val_ll', poison_all(1))
+        _patch_everywhere(monkeypatch, 'val_ll', poison_all(1))
         k2, _, hist2 = E.select_batched(X, max_components=4, init_type='minmax',
                                         seed=3, metric_method=mm)
         assert k2 != 1 and math.isnan(hist2[1][0])
-    monkeypatch.setattr(E, 'val_ll', orig)
+    _patch_everywhere(monkeypatch, 'val_ll', orig)
     # sequential: a NaN at k=1 is skipped without consuming patience
     calls = {'n': 0}
 
@@ -3055,7 +3084,7 @@ def test_selection_masks_single_nonfinite_metric(monkeypatch):
             out = out.clone()
             out[0] = float('nan')
         return out
-    monkeypatch.setattr(E, 'val_ll', spy_seq)
+    _patch_everywhere(monkeypatch, 'val_ll', spy_seq)
     with pytest.warns(RuntimeWarning, match='k=1 skipped'):
         k3, _, hist3 = E.select_sequential(X, max_components=3, patience=1,
                                            init_type='minmax', seed=3)
@@ -3142,7 +3171,7 @@ def test_collapsed_component_offdiagonal_bound():
     # legacy centred kernel completes the same case with nothing to repair
     # (no warning at all, on CPU and CUDA), so the completion assertions
     # above are the whole test there (v0.6.1's legacy legs failed here).
-    if E._EM_KERNEL == 'gemm':
+    if constants._EM_KERNEL == 'gemm':
         assert any('regularisation' in str(w.message) for w in rec)
     # d=3 at the helper level: with residue signs (+,+,-) the pairwise bound
     # leaves lambda_min ~ -reg, but the matrix is then within the
@@ -3153,24 +3182,24 @@ def test_collapsed_component_offdiagonal_bound():
     raw = C.clone()
     torch.diagonal(raw, dim1=-2, dim2=-1).clamp_(min=reg3)   # the old clamp
     with pytest.raises(RuntimeError, match='raise reg_covar'):
-        E._chol(raw)
-    bounded = E._restore_floor(C.clone(), reg3)
+        gaussian._chol(raw)
+    bounded = em._restore_floor(C.clone(), reg3)
     assert torch.linalg.cholesky_ex(bounded)[1].item() != 0   # still indefinite
     with pytest.warns(RuntimeWarning, match='extra diagonal regularisation'):
-        L, cov_rep = E._chol(bounded)
+        L, cov_rep = gaussian._chol(bounded)
     assert torch.linalg.cholesky_ex(cov_rep)[1].item() == 0
     # the helper: a clamped 2x2 with a large residue becomes factorisable,
     # an unclamped healthy matrix is untouched bitwise
     reg = 1e-9
     bad = torch.tensor([[[[reg * 0.5, 2e-6], [2e-6, reg * 0.5]]]],
                        dtype=torch.float32)
-    fixed = E._restore_floor(bad.clone(), reg)
+    fixed = em._restore_floor(bad.clone(), reg)
     assert torch.linalg.cholesky_ex(fixed)[1].item() == 0
     healthy = torch.tensor([[[[1.0, 0.3], [0.3, 2.0]]]], dtype=torch.float32)
-    assert torch.equal(E._restore_floor(healthy.clone(), reg), healthy)
+    assert torch.equal(em._restore_floor(healthy.clone(), reg), healthy)
     with pytest.raises(RuntimeError, match='raise reg_covar'):
-        E._chol(torch.tensor([[[[1e-12, 1e-3], [1e-3, 1e-12]]]],
-                             dtype=torch.float32))
+        gaussian._chol(torch.tensor([[[[1e-12, 1e-3], [1e-3, 1e-12]]]],
+                                    dtype=torch.float32))
 
 
 # ----------------------------------------------------------------------
@@ -3187,11 +3216,11 @@ def _hoist_data(N=600, d=2, seed=0):
 
 def test_hoisted_draw_init_blocks():
     E = gmm_mi_torch.estimator
-    B0 = E._INIT_DRAW_BLOCK
+    B0 = constants._INIT_DRAW_BLOCK
     c, K, seeds = 2, 2, (11, 12)
     n = 2 * B0 + 5
     full = torch.full((c, n, K), -1.0, dtype=torch.float64)
-    assert E._draw_init_blocks(
+    assert em._draw_init_blocks(
         full, [torch.Generator().manual_seed(s) for s in seeds]) is None
     assert ((full >= 0) & (full < 1)).all()
     # row j is replicate j's own stream, drawn block by block
@@ -3204,8 +3233,8 @@ def test_hoisted_draw_init_blocks():
     gens = [torch.Generator().manual_seed(s) for s in seeds]
     head = torch.empty(c, B0, K, dtype=torch.float64)
     tail = torch.empty(c, n - B0, K, dtype=torch.float64)
-    E._draw_init_blocks(head, gens)
-    E._draw_init_blocks(tail, gens)
+    em._draw_init_blocks(head, gens)
+    em._draw_init_blocks(tail, gens)
     assert torch.equal(torch.cat([head, tail], 1), full)
 
 
@@ -3213,11 +3242,11 @@ def test_hoisted_normalise_responsibilities():
     E = gmm_mi_torch.estimator
     r = torch.rand(2, 5, 3, dtype=torch.float64,
                    generator=torch.Generator().manual_seed(0))
-    out = E._normalise_responsibilities(r.clone(), None)
+    out = em._normalise_responsibilities(r.clone(), None)
     assert out.shape == (2, 5, 3)
     assert torch.allclose(out.sum(-1), torch.ones(2, 5, dtype=torch.float64))
     buf = r.clone()
-    out = E._normalise_responsibilities(buf, torch.tensor([3, 2]))
+    out = em._normalise_responsibilities(buf, torch.tensor([3, 2]))
     assert out is buf                                        # in place
     assert (out[1, :, 2] == 0).all() and (out[0] > 0).all()
     assert torch.allclose(out.sum(-1), torch.ones(2, 5, dtype=torch.float64))
@@ -3228,23 +3257,23 @@ def test_hoisted_init_mstep_random():
     X = _hoist_data()
     R, K, d = 4, 3, X.shape[1]
     seeds = list(range(100, 100 + R))
-    w, mu, cov = E._init_mstep_random(slice(0, R), X, seeds, None, K, 1e-6,
-                                      None)
+    w, mu, cov = em._init_mstep_random(slice(0, R), X, seeds, None, K, 1e-6,
+                                       None)
     assert w.shape == (R, K) and mu.shape == (R, K, d)
     assert cov.shape == (R, K, d, d)
     assert torch.allclose(w.sum(-1), torch.ones(R, dtype=torch.float64))
     # a sub-slice is the matching rows of the full call
-    part = E._init_mstep_random(slice(1, 3), X, seeds, None, K, 1e-6, None)
+    part = em._init_mstep_random(slice(1, 3), X, seeds, None, K, 1e-6, None)
     for a, b in zip((w, mu, cov), part):
         assert torch.allclose(a[1:3], b, rtol=0, atol=1e-12)
     # dead components (active_k) get zero weight; the streamed two-pass
     # path agrees with the single pass
     ak = torch.tensor([3, 2, 1, 3])
-    w1, mu1, cov1 = E._init_mstep_random(slice(0, R), X, seeds, ak, K, 1e-6,
-                                         None)
+    w1, mu1, cov1 = em._init_mstep_random(slice(0, R), X, seeds, ak, K, 1e-6,
+                                          None)
     assert (w1[1, 2:] == 0).all() and (w1[2, 1:] == 0).all()
-    w2, mu2, cov2 = E._init_mstep_random(slice(0, R), X, seeds, ak, K, 1e-6,
-                                         E._INIT_DRAW_BLOCK)
+    w2, mu2, cov2 = em._init_mstep_random(slice(0, R), X, seeds, ak, K, 1e-6,
+                                          constants._INIT_DRAW_BLOCK)
     for a, b in ((w1, w2), (mu1, mu2), (cov1, cov2)):
         assert torch.allclose(a, b, rtol=0, atol=1e-10)
 
@@ -3257,7 +3286,7 @@ def test_hoisted_hard_assignments():
                       dtype=torch.float64)                       # (1,3,2)
     al = torch.tensor([[True, True, False]])
     big = torch.finfo(torch.float64).max
-    oh = E._hard_assignments(Xc, (Xc ** 2).sum(-1), Cc, al, big)
+    oh = em._hard_assignments(Xc, (Xc ** 2).sum(-1), Cc, al, big)
     assert oh.shape == (1, 3, 3) and oh.dtype == torch.float64
     assert torch.equal(oh.sum(-1), torch.ones(1, 3, dtype=torch.float64))
     # the dead third centre (nearest to the third sample) is never chosen
@@ -3273,7 +3302,7 @@ def test_hoisted_finish_kmeans_params():
     cov = 2.0 * eye.expand(1, 3, d, d).clone()
     Nk = torch.tensor([[5.0, 0.0, 3.0]], dtype=torch.float64)    # one empty
     al = torch.tensor([[True, True, False]])                     # one dead
-    w2, mu2, cov2 = E._finish_kmeans_params(w, mu, cov, Nk, al, eye)
+    w2, mu2, cov2 = em._finish_kmeans_params(w, mu, cov, Nk, al, eye)
     assert w2.shape == (1, 3) and mu2.shape == (1, 3, d)
     assert cov2.shape == (1, 3, d, d)
     assert torch.equal(w2, torch.tensor([[1.0, 0.0, 0.0]],
@@ -3291,17 +3320,17 @@ def test_hoisted_kmeans_assign_stats():
     alive = torch.ones(R, K, dtype=torch.bool)
     alive[2, 1] = False
     x2 = (X ** 2).sum(-1)
-    w, mu, cov = E._kmeans_assign_stats(slice(0, R), X, x2, C, alive, 1e-6,
-                                        None)
+    w, mu, cov = em._kmeans_assign_stats(slice(0, R), X, x2, C, alive, 1e-6,
+                                         None)
     assert w.shape == (R, K) and mu.shape == (R, K, d)
     assert cov.shape == (R, K, d, d)
     assert torch.allclose(w.sum(-1), torch.ones(R, dtype=torch.float64))
     assert w[2, 1] == 0
-    part = E._kmeans_assign_stats(slice(1, 3), X, x2, C, alive, 1e-6, None)
+    part = em._kmeans_assign_stats(slice(1, 3), X, x2, C, alive, 1e-6, None)
     for a, b in zip((w, mu, cov), part):
         assert torch.allclose(a[1:3], b, rtol=0, atol=1e-12)
-    streamed = E._kmeans_assign_stats(slice(0, R), X, x2, C, alive, 1e-6,
-                                      E._INIT_DRAW_BLOCK)
+    streamed = em._kmeans_assign_stats(slice(0, R), X, x2, C, alive, 1e-6,
+                                       constants._INIT_DRAW_BLOCK)
     for a, b in zip((w, mu, cov), streamed):
         assert torch.allclose(a, b, rtol=0, atol=1e-10)
 
@@ -3320,7 +3349,7 @@ def test_hoisted_mc_stage():
     E = gmm_mi_torch.estimator
     B = 4
     w, mu, cov = _hoist_mixtures(B, 2, 2, seed=3)
-    chol, cov = E._chol(cov)
+    chol, cov = gaussian._chol(cov)
     kw = dict(w=w, mu=mu, cov=cov, chol=chol, quantity='MI',
               mc_samples=500, seed=7, n_replicates=B)
     full = E._mc_stage(slice(0, B), **kw)
@@ -3343,7 +3372,7 @@ def test_hoisted_mc_stage_categorical():
     for ci in range(C):
         w, mu, cov = _hoist_mixtures(B, 2, 1, seed=10 + ci)
         mu = mu + 3.0 * ci
-        chol, cov = E._chol(cov)
+        chol, cov = gaussian._chol(cov)
         fits.append(E.CategoryFit(w, mu, cov, chol))
     pi = torch.tensor([0.4, 0.6], dtype=torch.float64)
     kw = dict(fits=fits, pi=pi, logpi=torch.log(pi), mc_samples=400,

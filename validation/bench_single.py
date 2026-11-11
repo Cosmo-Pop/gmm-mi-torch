@@ -1,6 +1,7 @@
 import torch, time, numpy as np
 from gmm_mi_torch import estimate
-from gmm_mi_torch.estimator import select_batched, em_fit, _chol, gmm_sample, _INTEGRANDS
+from gmm_mi_torch.estimator import select_batched, em_fit, gmm_sample, _INTEGRANDS
+from gmm_mi_torch.gaussian import _chol
 N=20000; rho=0.3
 X=np.random.default_rng(0).multivariate_normal([0,0],[[1,rho],[rho,1]],N)
 X[:,1]=np.sign(X[:,1])*np.abs(X[:,1])**1.5

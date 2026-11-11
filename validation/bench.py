@@ -12,8 +12,9 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from gmm_mi_torch.estimator import (select_batched, em_fit, _chol,
-                                    gmm_sample, _INTEGRANDS)
+from gmm_mi_torch.estimator import (select_batched, em_fit, gmm_sample,
+                                    _INTEGRANDS)
+from gmm_mi_torch.gaussian import _chol
 
 
 def make_data(N=20000, seed=0):
