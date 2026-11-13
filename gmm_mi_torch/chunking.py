@@ -158,23 +158,8 @@ def _em_fixed_bytes(N, d, dtype, n_chunk=None):
     Memory an EM or val_ll stage allocates once, whatever the replicate chunk.
 
     The (N_eff, q) quadratic features of the GEMM path (the whole (N, q) in the
-    single-pass path, one sample chunk's in the streamed).
-
-    Parameters
-    ----------
-    N : int
-        Number of samples.
-    d : int
-        Number of variables.
-    dtype : torch.dtype
-        Working dtype.
-    n_chunk : int, optional
-        Sample chunk of the streamed path; None for the single pass.
-
-    Returns
-    -------
-    int
-        Bytes (0 for the legacy kernels).
+    single-pass path, one sample chunk's in the streamed); 0 for the legacy
+    kernels.
     """
     if _EM_KERNEL != 'gemm':
         return 0
@@ -190,18 +175,6 @@ def _init_sample_chunk(N, n_chunk=None):
 
     n_chunk rounded down to a whole number of draw blocks (at least one block),
     capped at N; None (single pass) is the full N.
-
-    Parameters
-    ----------
-    N : int
-        Number of samples.
-    n_chunk : int, optional
-        The caller's sample chunk; None for the single pass.
-
-    Returns
-    -------
-    int
-        Samples per chunk of the initialisation.
     """
     if n_chunk is None:
         return N
@@ -214,28 +187,8 @@ def _init_bytes_per_replicate(N, K, d, dtype, init_type, n_chunk=None):
 
     The default and k-means inits run the broadcast M-step / assignment
     statistics over the full N without n_chunk, and over sample chunks of
-    _init_sample_chunk(N, n_chunk) with it; minmax allocates nothing of note.
-
-    Parameters
-    ----------
-    N : int
-        Number of samples.
-    K : int
-        Number of components.
-    d : int
-        Number of variables.
-    dtype : torch.dtype
-        Working dtype.
-    init_type : str
-        As in `estimate`.
-    n_chunk : int, optional
-        Sample chunk of the streamed path; None for the single pass.
-
-    Returns
-    -------
-    int
-        Bytes per replicate (the EM model for minmax, which is followed by
-        EM within the same budget).
+    _init_sample_chunk(N, n_chunk) with it. minmax allocates nothing of note,
+    so its figure is the EM model's (EM follows within the same budget).
     """
     if init_type == 'minmax':
         return _em_bytes_per_replicate(N, K, d, dtype, n_chunk)
@@ -247,46 +200,16 @@ def _init_bytes_per_replicate(N, K, d, dtype, init_type, n_chunk=None):
 
 def _mc_bytes_per_replicate(mc_samples, K, d, dtype):
     """
-    Peak memory per Monte Carlo integration replicate.
+    Peak memory per Monte Carlo integration replicate, in bytes.
 
     From the model in the design notes (_AUTO_CHUNK_MEM_FRACTION).
-
-    Parameters
-    ----------
-    mc_samples : int
-        Monte Carlo samples per replicate.
-    K : int
-        Number of components.
-    d : int
-        Number of variables.
-    dtype : torch.dtype
-        Working dtype.
-
-    Returns
-    -------
-    int
-        Bytes per replicate.
     """
     return int(1.03 * mc_samples * dtype.itemsize
                * max((3 * d + 2) * K + d + 7, d * d + 4 * d + 6))
 
 
 def _n_rows(s):
-    """
-    Replicate count of a per-replicate weight tensor.
-
-    Its leading dims (all but the sample axis) form the replicate axis.
-
-    Parameters
-    ----------
-    s : torch.Tensor of shape (..., n_samples)
-        Per-replicate weights.
-
-    Returns
-    -------
-    int
-        The product of the leading dims.
-    """
+    """Replicate count: product of the leading dims of `s` (..., n_samples)."""
     return s.shape[:-1].numel()
 
 
@@ -418,19 +341,8 @@ def _as_weight_chunks(s, n_chunk=None):
     Accept a dense weight tensor where a `_WeightChunks` accessor is expected.
 
     For direct callers of the streamed steps: a dense (R, N) tensor becomes a
-    view-only accessor over all of its rows.
-
-    Parameters
-    ----------
-    s : torch.Tensor of shape (R, N) or _WeightChunks
-        Weights, or an accessor (returned as it is).
-    n_chunk : int, optional
-        Sample chunk of the accessor's `totals()`.
-
-    Returns
-    -------
-    _WeightChunks
-        The accessor.
+    view-only accessor over all of its rows (with `n_chunk` the sample chunk of
+    its `totals()`); an accessor is returned as it is.
     """
     if isinstance(s, _WeightChunks):
         return s
@@ -443,26 +355,8 @@ def _legacy_sample_chunk(N, K, d, dtype, n_chunk=None):
 
     Their (4d+4)K-per-sample broadcast peak must fit three quarters of the GEMM
     budget the replicate chunk was sized with (the partition's chunk-sized
-    gathers take the rest). Shared by em_fit and val_ll so the two cannot drift
-    apart.
-
-    Parameters
-    ----------
-    N : int
-        Number of samples.
-    K : int
-        Number of components.
-    d : int
-        Number of variables.
-    dtype : torch.dtype
-        Working dtype.
-    n_chunk : int, optional
-        Sample chunk of the streamed path; None for the single pass.
-
-    Returns
-    -------
-    int
-        Samples per legacy chunk, at least 1.
+    gathers take the rest); at least 1. Shared by em_fit and val_ll so the two
+    cannot drift apart.
     """
     return max(1, int(0.75 * _em_bytes_per_replicate(N, K, d, dtype, n_chunk))
                // (K * dtype.itemsize * (4 * d + 4)))

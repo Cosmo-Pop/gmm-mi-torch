@@ -100,16 +100,6 @@ def _full_precision(fn):
     will also run these calls' matmuls at full precision, and the
     save/restore can race with theirs. Use processes, not threads, for
     parallel estimates (see examples/mi_grid_multigpu.py).
-
-    Parameters
-    ----------
-    fn : callable
-        The function to wrap.
-
-    Returns
-    -------
-    callable
-        `fn`, each call of which runs inside `_pinned_precision()`.
     """
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
@@ -129,17 +119,6 @@ def _entry_precision(fn):
     .numpy() calls under return_fit=True. em_fit and val_ll keep plain
     _full_precision: differentiating a log-likelihood with respect to the
     parameters is legitimate.
-
-    Parameters
-    ----------
-    fn : callable
-        The function to wrap.
-
-    Returns
-    -------
-    callable
-        `fn`, each call of which runs inside `_pinned_precision()` and
-        `torch.no_grad()`.
     """
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
@@ -217,18 +196,8 @@ def _as_array(X):
     The container converts itself, so no numpy import is needed, and a
     plain ndarray returns itself (no copy). Read-only arrays (pandas
     copy-on-write hands those out) are copied so torch.as_tensor does not
-    warn about non-writable memory.
-
-    Parameters
-    ----------
-    X : array-like or torch.Tensor
-        The data as given by the caller.
-
-    Returns
-    -------
-    array-like or torch.Tensor
-        The container's array (a writable copy if it was read-only), or `X`
-        itself when it is a tensor or has no __array__.
+    warn about non-writable memory. A tensor, or anything without __array__,
+    is returned as it is.
     """
     if not isinstance(X, torch.Tensor) and hasattr(X, '__array__'):
         X = X.__array__()

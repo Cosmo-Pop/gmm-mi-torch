@@ -474,25 +474,7 @@ def _bootstrap_counts(N, B, dtype, device, generator):
 
 
 def _warm_start(w1, mu1, cov1, B):
-    """
-    Expand one CV-selected parameter set to B bootstrap replicates.
-
-    Parameters
-    ----------
-    w1 : torch.Tensor of shape (K,)
-        Weights.
-    mu1 : torch.Tensor of shape (K, d)
-        Means.
-    cov1 : torch.Tensor of shape (K, d, d)
-        Covariances.
-    B : int
-        Number of replicates.
-
-    Returns
-    -------
-    w, mu, cov : torch.Tensor
-        Contiguous copies, shapes (B, K), (B, K, d), (B, K, d, d).
-    """
+    """Copy parameters (K,), (K, d), (K, d, d) to B bootstrap replicates."""
     K, d = mu1.shape
     return (w1.unsqueeze(0).expand(B, K).contiguous(),
             mu1.unsqueeze(0).expand(B, K, d).contiguous(),
