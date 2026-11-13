@@ -116,7 +116,7 @@ def log_gauss(X, mu, chol):
     Returns
     -------
     torch.Tensor of shape (R, N, K)
-        log N(x_n | mu_k, chol_k chol_k^T).
+        Log-density log N(x_n | mu_k, chol_k chol_k^T).
     """
     diff = X.unsqueeze(2) - mu.unsqueeze(1)               # (R,N,K,d)
     eye = torch.eye(chol.shape[-1], dtype=chol.dtype, device=chol.device)
@@ -143,7 +143,7 @@ def gmm_score(X, w, mu, chol):
     Returns
     -------
     torch.Tensor of shape (R, N)
-        log sum_k w_k N(x_n | mu_k, chol_k chol_k^T).
+        Log-density log sum_k w_k N(x_n | mu_k, chol_k chol_k^T).
     """
     logw = torch.where(w > 0, torch.log(w.clamp_min(1e-300)),
                        torch.full_like(w, -torch.inf))

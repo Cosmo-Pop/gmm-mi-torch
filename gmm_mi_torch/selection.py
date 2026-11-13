@@ -16,7 +16,7 @@ from .em import _init_params, em_fit, val_ll
 
 # CV fold assignment uses the caller's seed plus this fixed offset, keeping
 # the fold stream decoupled from the init streams (seed + K) and the
-# bootstrap stream (seed + 10_000).
+# bootstrap stream (seed + _BOOTSTRAP_SEED_OFFSET).
 _CV_MASK_SEED_OFFSET = 30_000
 
 
@@ -167,11 +167,10 @@ def _cv_fit_for_k(X, K, n_folds, n_inits, fit, init_chunk=None):
     """
     CV fits for a single k, batched over inits x folds.
 
-    CV fits for a single k, batched over inits x folds. `fit` is the
-    dict of fit settings (keys reg_covar, threshold_fit, max_iter,
+    `fit` is the dict of fit settings (keys reg_covar, threshold_fit, max_iter,
     em_chunk, n_chunk, init_type, scale, seed; em_chunk an integer here).
-    `init_chunk` (default fit['em_chunk']) batches the initialisation
-    stage, whose peak per replicate differs from the EM step's (see
+    `init_chunk` (default fit['em_chunk']) batches the initialisation stage,
+    whose peak per replicate differs from the EM step's (see
     _init_bytes_per_replicate).
 
     Parameters

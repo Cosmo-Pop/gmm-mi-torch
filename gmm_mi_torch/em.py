@@ -605,8 +605,9 @@ def _hard_assignments(Xc, x2c, Cc, al, big):
 
 def _finish_kmeans_params(w, mu, cov, Nk, al, eye):
     """
-    Zero the weights of empty or dead components, renormalise, and give
-    them harmless means and covariances.
+    Zero empty or dead components; give them harmless means and covariances.
+
+    The remaining weights are renormalised.
 
     Parameters
     ----------
@@ -634,8 +635,9 @@ def _finish_kmeans_params(w, mu, cov, Nk, al, eye):
 
 def _kmeans_assign_stats(sl, X, x2, centres, alive, reg_covar, n_chunk):
     """
-    k-means init: hard-assignment statistics on the full data for one
-    replicate chunk.
+    Compute k-means hard-assignment statistics for one replicate chunk.
+
+    The statistics use the full data.
 
     The chunk callback of `_init_params`'s 'kmeans' and 'randomized_kmeans'
     inits. Covariances are normalised by N, not by the component counts, as
@@ -1103,7 +1105,7 @@ def _reroute_danger(w, mu, cov):
 
 def _reroute_trips(w, mu, cov, repaired=None):
     """
-    Replicates the GEMM kernels cannot evaluate at this dtype's precision.
+    Find replicates the GEMM kernels cannot evaluate at this dtype's precision.
 
     (R,) bool: replicates with a component whose GEMM residue would
     exceed _REROUTE_TOL_NATS at this dtype's unit roundoff.

@@ -21,11 +21,14 @@ except AttributeError:      # torch < 2.9: legacy API only
 
 
 class _pinned_precision:
-    """Context manager: float32 matmuls at full (ieee) precision inside the
-    block, with any ambient torch.autocast region suspended (an enclosing
-    mixed-precision context would otherwise run the cancellation-critical
-    GEMMs at bf16/fp16, shifting both the estimate and the selected k).
-    The caller's effective settings are restored on exit. Reentrant.
+    """
+    Context manager: full-precision float32 matmuls inside the block.
+
+    Float32 matmuls run at full (ieee) precision inside the block, with any
+    ambient torch.autocast region suspended (an enclosing mixed-precision
+    context would otherwise run the cancellation-critical GEMMs at
+    bf16/fp16, shifting both the estimate and the selected k). The caller's
+    effective settings are restored on exit. Reentrant.
 
     Restore and inheritance (torch >= 2.9): the per-backend getters
     resolve an inherited ('none') knob to its parent's value, and torch
@@ -35,7 +38,8 @@ class _pinned_precision:
     setting therefore keeps following it after the pin. The one case the
     rule cannot tell apart: a child set EXPLICITLY to the same value as
     its parent comes back inherited — the same precision now, and a later
-    change of the parent then moves it too."""
+    change of the parent then moves it too.
+    """
 
     def __enter__(self):
         if _FP32_KNOBS is not None:

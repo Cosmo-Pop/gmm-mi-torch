@@ -15,7 +15,7 @@ from .precision import _check_chunk_arg
 
 def _cuda_free_bytes(dev):
     """
-    Bytes this process can still allocate on a CUDA device.
+    Count the bytes this process can still allocate on a CUDA device.
 
     The driver's free memory plus torch's cached-but-unallocated blocks (ours
     to reuse), capped by torch.cuda.set_per_process_memory_fraction when one is
@@ -292,7 +292,7 @@ def _n_rows(s):
 
 def _rows(s, sl):
     """
-    Rows `sl` of per-replicate weights, along the flattened leading dims.
+    Select rows `sl` of the weights, along the flattened leading dims.
 
     A 2-D `s` is sliced (a view of the caller's tensor); an N-D `s` — typically
     an expand() view whose repeat structure (CV masks tiled over inits and
