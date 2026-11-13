@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+Docstrings only. `_warm_start` and `_n_rows` say again that the tiled
+parameters are contiguous copies and that `s` holds the sample weights.
+Correction to the 0.11.1 entry: the API pages' text was unchanged, but
+their links to source lines moved with the functions.
+
 ## 0.11.1 (2026-11-13)
 
 Docstrings only; the code is that of 0.11.0. Thirteen small private

@@ -474,7 +474,10 @@ def _bootstrap_counts(N, B, dtype, device, generator):
 
 
 def _warm_start(w1, mu1, cov1, B):
-    """Copy parameters (K,), (K, d), (K, d, d) to B bootstrap replicates."""
+    """Tile one parameter set (K,), (K, d), (K, d, d) over B replicates.
+
+    The results are contiguous copies, not expand views.
+    """
     K, d = mu1.shape
     return (w1.unsqueeze(0).expand(B, K).contiguous(),
             mu1.unsqueeze(0).expand(B, K, d).contiguous(),
