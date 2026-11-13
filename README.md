@@ -56,7 +56,7 @@ Z = rng.normal(2.0 * Y, 1.0)
 mi_mean, mi_std = estimate_categorical(Z, Y, max_components=3)
 ```
 
-The full hyperparameter set (selection protocols `'batched'`/`'sequential'`, `metric_method='valid'/'aic'/'bic'`, init types, `preprocess='gaussianise'`, `fixed_components_number`, chunking knobs, …) is documented in the `estimate` and `estimate_categorical` docstrings; parameter names follow GMM-MI where a counterpart exists (`reg_covar`, `threshold_fit`, `threshold_components`, `max_components`, …). `estimate(..., return_fit=True)` additionally returns the selected model for inspection and plotting (`gmm_mi_torch.plotting` has the fitted-ellipse, data-vs-model contour, MI-matrix heatmap and errorbar-validation helpers used in the walkthrough).
+The full hyperparameter set (selection protocols `'batched'`/`'sequential'`, `metric_method='valid'/'aic'/'bic'`, init types, `preprocess='gaussianise'`, `fixed_components_number`, chunking knobs, …) is documented in the `estimate` and `estimate_categorical` docstrings, and guidance on using `estimate` (component selection, standardisation, preprocessing, initialisation, memory and reproducibility) is in [docs/estimate_notes.md](docs/estimate_notes.md); parameter names follow GMM-MI where a counterpart exists (`reg_covar`, `threshold_fit`, `threshold_components`, `max_components`, …). `estimate(..., return_fit=True)` additionally returns the selected model for inspection and plotting (`gmm_mi_torch.plotting` has the fitted-ellipse, data-vs-model contour, MI-matrix heatmap and errorbar-validation helpers used in the walkthrough).
 
 For a guided tour — including the common pitfalls (thresholds, initialisations, hard-boundary data) and how to diagnose them — see [notebooks/walkthrough_and_pitfalls.ipynb](notebooks/walkthrough_and_pitfalls.ipynb), adapted from Davide Piras's GMM-MI walkthrough.
 
@@ -149,7 +149,7 @@ This is also available as a runnable file: [`examples/mi_grid_multigpu.py`](exam
 
 ## Known limitations
 
-Mechanisms and measurements for each are in [docs/design_notes.md](docs/design_notes.md); guidance on using `estimate` (component selection, standardisation, preprocessing, initialisation, memory and reproducibility) is in [docs/estimate_notes.md](docs/estimate_notes.md).
+Mechanisms and measurements for each are in [docs/design_notes.md](docs/design_notes.md).
 
 - **Finite-sample bias.** GMM MI estimates carry a positive finite-sample bias that the bootstrap errorbar does not include; below 100 samples (per dataset, or per category) the estimator warns.
 - **Heavily tied or zero-inflated data.** No tie convention makes the GMM fit of heavily tied data reliable; `preprocess='none'` is the more reliable choice there (under `'gaussianise'`, random tie-ranks bias the estimate low when ties are shared between columns).
