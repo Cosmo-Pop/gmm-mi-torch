@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.11.1 (2026-11-13)
+
+Docstrings only; the code is that of 0.11.0. Thirteen small private
+helpers whose Parameters and Returns sections only restated their argument
+names and summary have a short docstring instead (177 lines fewer); any
+fact those sections held is kept in the prose. Public functions, and
+private helpers whose sections say something the summary does not, keep
+their full numpydoc docstrings, and the API pages in `docs/` are
+unchanged.
+
 ## 0.11.0 (2026-11-13)
 
 Documentation only; the code is that of 0.10.2.
