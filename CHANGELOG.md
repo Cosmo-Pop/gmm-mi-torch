@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.11.0 (2026-11-13)
+
+Documentation only; the code is that of 0.10.2.
+
+- An API reference in `docs/`, one page per module (`estimator.md`,
+  `em.md`, `selection.md`, `gaussian.md`, `plotting.md`), in the form the
+  pop-cosmos documentation uses: for each public function, class and
+  method, its signature, a link to its source line, and its parameters,
+  returns, exceptions and warnings as tables. The pages are generated from
+  the docstrings by `docs/make_api_docs.py` (install the new `docs` extra
+  for numpydoc); `--check` reports a page that is out of date. The README
+  has a Documentation section listing them.
+- The plotting helpers' docstrings are completed for the pages: one
+  undocumented parameter (`create_heatmap`'s `fsize`), `**kwargs`, `str`
+  types, and no "Returns / None" sections on functions that return
+  nothing.
+- Also since the 0.10.2 entry was written: the design notes' "Random
+  streams" table names all six seed offsets (commit 31babc0).
+
 ## 0.10.2 (2026-11-13)
 
 Readability tidy from an overall read of the code against the readability
