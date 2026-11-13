@@ -147,6 +147,22 @@ This is also available as a runnable file: [`examples/mi_grid_multigpu.py`](exam
 - On one GPU this pool degenerates to a single worker and buys nothing over a plain loop; leave `max_workers` at the GPU count, never higher (an `estimate()` call already fills its GPU, so extra workers would only contend for the same devices).
 - Use processes, not threads: the float32 matmul-precision pin is process-global (see Known limitations).
 
+## Documentation
+
+The API reference, one page per module, is generated from the docstrings
+(`python docs/make_api_docs.py`, which needs the `docs` extra):
+
+- [docs/estimator.md](docs/estimator.md): `estimate`, `estimate_categorical`, `FittedGMM`
+- [docs/em.md](docs/em.md): `em_fit`, `val_ll`
+- [docs/selection.md](docs/selection.md): `select_batched`, `select_sequential`
+- [docs/gaussian.md](docs/gaussian.md): Gaussian-mixture helpers (`gmm_score`, `gmm_sample`, `marginal_score`, ...)
+- [docs/plotting.md](docs/plotting.md): plotting helpers
+
+[docs/estimate_notes.md](docs/estimate_notes.md) gives guidance on using `estimate` (component
+selection, standardisation, preprocessing, initialisation, memory and reproducibility), and
+[docs/design_notes.md](docs/design_notes.md) explains why the code is shaped as it is, with the
+measurements behind its constants.
+
 ## Known limitations
 
 Mechanisms and measurements for each are in [docs/design_notes.md](docs/design_notes.md).

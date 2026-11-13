@@ -53,10 +53,6 @@ def set_ticksize(ax, axis='both', which='major', labelsize=20, size=6):
         Font size of the tick label.
     size : int, default=6
         Size of the ticks.
-
-    Returns
-    -------
-    None
     """
     ax.tick_params(axis=axis, which=which, labelsize=labelsize, size=size)
 
@@ -68,20 +64,16 @@ def set_titles(ax, xlabel='', ylabel='', title='', fontsize=30, color='black'):
     ----------
     ax : instance of the axes.Axes class from pyplot
         The panel whose titles need to be set.
-    xlabel : string, default=''
+    xlabel : str, default=''
         The x-label.
-    ylabel : string, default=''
+    ylabel : str, default=''
         The y-label.
-    title : string, default=''
+    title : str, default=''
         The title of the panel.
     fontsize : int, default=30
         Font size of all titles and labels.
-    color : string, default='black'
+    color : str, default='black'
         Color of all titles and labels.
-
-    Returns
-    -------
-    None
     """
     ax.set_xlabel(xlabel, fontsize=fontsize, color=color)
     ax.set_ylabel(ylabel, fontsize=fontsize, color=color)
@@ -99,7 +91,7 @@ def set_legend(ax, fontsize=25, frameon=False, loc='best', handles=None, labels=
         Font size of the legend.
     frameon : bool, default=False
         Whether to frame the legend or not.
-    loc : string, default='best'
+    loc : str, default='best'
         Position of the legend.
     handles : sequence of `.Artist` (see pyplot docs), default=None
         The handles, only used when playing around with the order of the legend (quite rarely),
@@ -107,10 +99,6 @@ def set_legend(ax, fontsize=25, frameon=False, loc='best', handles=None, labels=
     labels : list of str, default=None
         The labels, only used when playing around with the order of the legend (quite rarely),
         and together with handles.
-
-    Returns
-    -------
-    None
     """
     if handles is not None:
         ax.legend(handles, labels, fontsize=fontsize, frameon=frameon, loc=loc)
@@ -193,23 +181,19 @@ def draw_ellipse(mean, covariance, weight, ax=None, fill=False, marker='X',
         The panel where to draw the ellipse.
     fill : bool, default=False
         Whether to fill the contours or not.
-    marker : string, default='X'
+    marker : str, default='X'
         Marker type for the centroid of the ellipse.
     contour_levels : list of integers, default=[2]
         The sigma levels whose contour are going to be drawn.
         The integers can be only 1, 2 and 3.
     weight_size : float, default=1000
         The multiplier for the marker size (also proportional to the weight).
-    label : string, default=None
+    label : str, default=None
         Label associated to the ellipse.
     component_count : int, default=0
         A counter so that the label is printed only for the first component.
-    kwargs : dictionary
+    **kwargs
         The extra keyword arguments to pass to the plotting function.
-
-    Returns
-    -------
-    None
     """
     assert covariance.shape == (2, 2), 'Each covariance matrix must be of shape (2, 2)!'
     # convert covariance to the parameters of the corresponding error ellipse
@@ -373,13 +357,13 @@ def plot_gmm_contours(gmm, ax=None, fill=False, label='', xlabel='X1', ylabel='X
         The panel where to plot the samples.
     fill : bool, default=False
         Whether to fill the contours or not.
-    label : string, default=''
+    label : str, default=''
         The legend label to associate to the contours.
-    xlabel : string, default='X1'
+    xlabel : str, default='X1'
         Label of the x-axis.
-    ylabel : string, default='X2'
+    ylabel : str, default='X2'
         Label of the y-axis.
-    kwargs : dictionary
+    **kwargs
         The extra keyword arguments to pass to the plotting functions.
 
     Returns
@@ -432,20 +416,16 @@ def histogram_estimates(estimates, ax=None, bins=20, alpha=1, title='',
         Number of histogram bins.
     alpha : float, default=1
         Transparency of the histogram line. Must be between 0 and 1.
-    title : string, default=''
+    title : str, default=''
         Title of the panel.
     legendsize : int, default=25
          Font size of the legend.
-    color : string, default='salmon'
+    color : str, default='salmon'
         Histogram color.
     lw : int, default=3
         Line width of the histogram line.  
     histtype : {'bar', 'barstacked', 'step', 'stepfilled'}, default='step'
         The type of histogram to draw.
-        
-    Returns
-    -------
-    None
     """    
     fig, ax = choose_ax(ax)
     estimates = np.asarray(estimates)
@@ -497,16 +477,12 @@ def plot_multivariate_normal(ax=None, mean=0, cov=1, alpha=1, color='black', lw=
         The covariance of the Gaussian distribution.        
     alpha : float, default=2
         Transparency of the line. Must be between 0 and 1.
-    color : string, default='black'
+    color : str, default='black'
         Line color.
     lw : int, default=5
         Line width. 
-    ls : string, default='--'
+    ls : str, default='--'
         Line style. Check pyplot for possible values.
-        
-    Returns
-    -------
-    None
     """
     from scipy.stats import multivariate_normal
     fig, ax = choose_ax(ax)
@@ -541,7 +517,7 @@ def plot_bias_chi2_histogram(estimates, analytic, ax=None, bins=20, alpha=0.5, s
         Whether to display the legend.
     legendsize : int, default=44
          Font size of the legend.
-    color : string, default='grey'
+    color : str, default='grey'
         Histogram color.
     lw : int, default=3
         Line width of the histogram line.  
@@ -549,16 +525,16 @@ def plot_bias_chi2_histogram(estimates, analytic, ax=None, bins=20, alpha=0.5, s
         The type of histogram to draw.
     savefig : bool, default=False
         Whether to save or not the figure as a pdf file (for the paper).
-    savepath : string, default='./'
+    savepath : str, default='./'
         The path where to save the figure. Only used if savefig is True.  
     labelfontsize : int, default=60
         Fontsize of labels and title.
-    labelcolor : string, default='black'
+    labelcolor : str, default='black'
         Color of labels and title.
     hide_ylabel : bool, default=False
         Whether to paint the ylabel white, so that it's hidden.
         Only for the paper.
-    ds : string, default=''
+    ds : str, default=''
         The dataset which is being analysed.
         
     Returns
@@ -611,12 +587,14 @@ def create_heatmap(data, row_labels, col_labels, fsize=30, ax=None,
         A list with the labels for the rows.
     col_labels : list
         A list with the labels for the columns.
+    fsize : int, default=30
+        Font size of the row and column labels.
     ax : `matplotlib.axes.Axes` instance, default=None
         The panel in which the heatmap is plotted. 
         If not provided, use current axes or create a new one.
     cbar_kw : dict, default={}
         Contains the arguments to `matplotlib.Figure.colorbar`.
-    cbarlabel : string, default=""
+    cbarlabel : str, default=""
         The label for the colorbar.
     **kwargs
         All other arguments are forwarded to `imshow`.
@@ -679,7 +657,7 @@ def annotate_heatmap(im, data=None, valfmt="{x:.2f}",
         `matplotlib.ticker.Formatter`.
     save_fig : bool, default=False
         Whether to save the annotated heatmap or not.
-    save_path : string, default=""
+    save_path : str, default=""
         If save_fig is True, the path where to save the figure.
     threshold : float, default=0.01
         All values of MI below this are displayed as 0.

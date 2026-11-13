@@ -22,6 +22,8 @@ test = ["pytest", "numpy>=2.0", "scipy"]
 # gmm_mi_torch.plotting imports these (torch's dependency tree does not
 # guarantee numpy); the estimators themselves need only torch
 plot = ["numpy", "matplotlib", "scipy"]
+# docs/make_api_docs.py, which generates the API pages in docs/
+docs = ["numpydoc"]
 
 [project.urls]
 Homepage = "https://github.com/Cosmo-Pop/gmm-mi-torch"
