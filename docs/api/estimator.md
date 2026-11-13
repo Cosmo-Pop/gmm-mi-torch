@@ -189,13 +189,13 @@ warm-started from the CV-selected parameters.
 
 ### Raises
 
-- `ValueError`: An unknown option, an out-of-range count, threshold, dtype or device, data of the wrong shape or with NaN/inf values, or folds too small for the data; raised before any fitting. The full list: Notes.
-- `TypeError`: A non-integer count, seed, em_chunk or mc_chunk (numpy integers are accepted), or a non-numeric threshold, reg_covar or `scale`.
+- `ValueError`: An unknown option or an invalid combination of options, an out-of-range count or threshold, an unsupported dtype or device, data of the wrong shape or with NaN/inf values, or folds too small for the data; raised before any fitting. The full list: [docs/estimate_notes.md](../estimate_notes.md), "Errors and warnings".
+- `TypeError`: A non-integer count, seed, em_chunk or mc_chunk (numpy integers are accepted), or a non-numeric threshold or reg_covar.
 - `RuntimeError`: On CUDA, when not even one replicate fits in memory (set `n_chunk`) or an out-of-memory error persists at one replicate per batch; when no candidate k yields a finite validation metric; or when a covariance cannot be factorised (raise `reg_covar`, or use float64).
 
 ### Warns
 
-- `RuntimeWarning`: For a result that may need a look: fewer than 100 samples, tied data or return_fit under gaussianise, components that died in a fixed-k fit, a skipped k in the sequential protocol, replicates that hit `max_iter` or finished on the legacy kernels, a CUDA out-of-memory retry, or extra covariance regularisation. The full list, with how often each is issued: Notes.
+- `RuntimeWarning`: For a result that may need a look: fewer than 100 samples, tied data or return_fit under gaussianise, components that died in a fixed-k fit, a skipped k in the sequential protocol, replicates that hit `max_iter` or finished on the legacy kernels, a CUDA out-of-memory retry, or a covariance given extra regularisation or replaced. The full list, with how often each is issued: [docs/estimate_notes.md](../estimate_notes.md), "Errors and warnings".
 
 ### Notes
 
@@ -205,7 +205,7 @@ reproducibility, and the full lists of errors and warnings:
 
 ---
 
-<a href="../../gmm_mi_torch/estimator.py#L932"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L935"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>class</kbd> `CategoryFit`
 
@@ -229,7 +229,7 @@ Bootstrap fits of one category in `estimate_categorical` (a tuple).
 
 ---
 
-<a href="../../gmm_mi_torch/estimator.py#L1008"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L1011"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `estimate_categorical`
 

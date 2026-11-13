@@ -2,10 +2,8 @@
 
 The Notes section of the docstring of `gmm_mi_torch.estimate` up to
 v0.9.0, moved here verbatim in 0.10.0 so that `help(estimate)` stays
-short (the docstring keeps a pointer); the last section, the full lists
-of its errors and warnings, moved here from the docstring in 0.11.2.
-Where `estimate_categorical` says "as in `estimate`", these notes apply
-to it too.
+short (the docstring keeps a pointer). Where `estimate_categorical`
+says "as in `estimate`", these notes apply to it too.
 
 ## Selection
 
@@ -159,7 +157,8 @@ replicate of the first (initialisation or EM) stage fits (set
 after escalating regularisation (raise `reg_covar`, or use float64); or
 when a CUDA out-of-memory error persists at one replicate per batch.
 
-**RuntimeWarning**:
+**RuntimeWarning**, grouped by how often each is issued, so that a long
+run's output can be read:
 
 - Once per call: fewer than 100 samples (a finite-sample bias the
   errorbar does not include); under preprocess='gaussianise', columns
