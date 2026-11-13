@@ -422,6 +422,9 @@ def test_bootstrap_large_n_fallback(monkeypatch):
     m_mn, s_mn = estimate(X, 'MI', protocol='batched', max_components=3, seed=1)
     _patch_everywhere(monkeypatch, '_MULTINOMIAL_MAX_CATEGORIES', 8)
     m_ri, s_ri = estimate(X, 'MI', protocol='batched', max_components=3, seed=1)
+    # the patch took effect: the fallback's resample stream differs from the
+    # multinomial one, so the same-seed estimates are not identical
+    assert m_ri != m_mn
     assert abs(analytic_mi - m_mn) <= SIGMAS * s_mn
     assert abs(analytic_mi - m_ri) <= SIGMAS * s_ri
     combined = (s_mn ** 2 + s_ri ** 2) ** 0.5
@@ -704,17 +707,29 @@ def test_gemm_legacy_estimate_parity_fp64(monkeypatch):
     cov = np.array([[1.0, 0.6], [0.6, 1.0]])
     X2 = rng.multivariate_normal([0, 0], cov, 4000)
     X3 = rng.multivariate_normal([0, 0, 0], np.eye(3), 3000)
+    # the kernel switch took effect: _features is called by the GEMM kernels
+    # only
+    feature_calls = []
+    orig_features = em._features
+
+    def spy_features(X):
+        feature_calls.append(1)
+        return orig_features(X)
+    _patch_everywhere(monkeypatch, '_features', spy_features)
     for X, quantity, kw in [
             (X2, 'MI', dict(protocol='batched', max_components=3)),
             (X2, 'MI', dict(protocol='batched', max_components=3, n_chunk=700)),
             (X3, 'TC', dict(protocol='sequential', max_components=2)),
     ]:
-        out = {}
+        out, n_features = {}, {}
         for kernel in ('gemm', 'legacy'):
             _patch_everywhere(monkeypatch, '_EM_KERNEL', kernel)
+            feature_calls.clear()
             out[kernel] = estimate(X, quantity, n_bootstrap=10, return_k=True,
                                    dtype=torch.float64, **kw)
+            n_features[kernel] = len(feature_calls)
         _patch_everywhere(monkeypatch, '_EM_KERNEL', 'gemm')
+        assert n_features['gemm'] > 0 and n_features['legacy'] == 0, n_features
         mg, sg, kg = out['gemm']
         ml, sl, kl = out['legacy']
         assert kg == kl
@@ -1097,8 +1112,10 @@ def test_categorical_bootstrap_large_n_fallback(monkeypatch):
     common = dict(max_components=3, n_bootstrap=20, mc_samples=20_000, seed=1)
     m_mn, s_mn = estimate_categorical(X, Y, **common)
     _patch_everywhere(monkeypatch,
-           '_MULTINOMIAL_MAX_CATEGORIES', 8)
+                      '_MULTINOMIAL_MAX_CATEGORIES', 8)
     m_ri, s_ri = estimate_categorical(X, Y, **common)
+    # the patch took effect (a different resample stream, as above)
+    assert m_ri != m_mn
     combined = (s_mn ** 2 + s_ri ** 2) ** 0.5
     assert abs(m_mn - m_ri) <= SIGMAS * combined
 
@@ -1731,12 +1748,23 @@ def test_reroute_matches_legacy_fp32(monkeypatch):
     X = _zero_inflated_pair(2)
     kw = dict(n_bootstrap=10, fixed_components_number=2, seed=2,
               mc_samples=20_000, dtype=torch.float32)
-    out = {}
+    # the kernel switch took effect (see test_gemm_legacy_estimate_parity_fp64)
+    feature_calls = []
+    orig_features = em._features
+
+    def spy_features(X):
+        feature_calls.append(1)
+        return orig_features(X)
+    _patch_everywhere(monkeypatch, '_features', spy_features)
+    out, n_features = {}, {}
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)
         for kernel in ('gemm', 'legacy'):
             _patch_everywhere(monkeypatch, '_EM_KERNEL', kernel)
+            feature_calls.clear()
             out[kernel] = estimate(X, 'MI', **kw)
+            n_features[kernel] = len(feature_calls)
+    assert n_features['gemm'] > 0 and n_features['legacy'] == 0, n_features
     (mg, sg), (ml, sl) = out['gemm'], out['legacy']
     assert abs(mg - ml) <= 3 * (sg ** 2 + sl ** 2) ** 0.5 + 0.01
 
@@ -1802,6 +1830,9 @@ def test_reroute_never_fires_at_fp64(monkeypatch):
         warnings.simplefilter('ignore', RuntimeWarning)
         estimate(X, 'MI', protocol='batched', max_components=6,
                  n_bootstrap=5, mc_samples=5000, dtype=torch.float64)
+    # the spy ran: the GEMM kernels consult the detector before every
+    # E-step (the legacy kernels never do, so there it stays empty)
+    assert trips or constants._EM_KERNEL == 'legacy'
     assert sum(trips) == 0
 
 
@@ -2372,6 +2403,15 @@ def test_large_n_bootstrap_draw_is_uniform(monkeypatch):
     # counts hold on CPU-only hosts.
     E = gmm_mi_torch.estimator
     _patch_everywhere(monkeypatch, '_MULTINOMIAL_MAX_CATEGORIES', 8)
+    # the patch took effect: below the real cap only the multinomial path
+    # calls torch.multinomial, and nothing else here does
+    multinomial_calls = []
+    orig_multinomial = torch.multinomial
+
+    def spy_multinomial(*args, **kwargs):
+        multinomial_calls.append(1)
+        return orig_multinomial(*args, **kwargs)
+    monkeypatch.setattr(torch, 'multinomial', spy_multinomial)
     N, B = 10_000_000, 8
     m = (1 << 32) % N
     se = math.sqrt(1 / (B * m) + 1 / (B * (N - m)))     # Poisson(1) counts
@@ -2383,6 +2423,7 @@ def test_large_n_bootstrap_draw_is_uniform(monkeypatch):
         ratio = s[:, :m].double().mean().item() / s[:, m:].double().mean().item()
         assert abs(ratio - 1) <= 4 * se, (dev, (ratio - 1) / se)
         del s
+    assert multinomial_calls == []
 
 
 def test_large_n_bootstrap_draw_mechanism(monkeypatch):
@@ -3021,6 +3062,13 @@ def test_mc_chunk_validated_at_entry(monkeypatch):
         with pytest.raises(exc, match='mc_chunk'):
             estimate_categorical(X[:, 0], Y, mc_chunk=bad, **common)
     assert calls == []
+    # the stand-in is installed: with a valid mc_chunk both estimators reach
+    # it, so the checks above show validation runs before selection
+    with pytest.raises(AssertionError, match='_select_and_fit reached'):
+        estimate(X, 'MI', **common)
+    with pytest.raises(AssertionError, match='_select_and_fit reached'):
+        estimate_categorical(X[:, 0], Y, **common)
+    assert calls == [1, 1]
 
 
 def test_selection_masks_single_nonfinite_metric(monkeypatch):
