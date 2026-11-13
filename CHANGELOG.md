@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.10.2 (2026-11-13)
+
+Readability tidy from an overall read of the code against the readability
+proposal (scoping/review-overall-readability-2026-11-13.md, findings F1-F3).
+No behaviour change: the same random streams, results and messages.
+
+- The README now points to docs/estimate_notes.md, where `estimate`'s
+  guidance on component selection, standardisation, preprocessing,
+  initialisation, memory and reproducibility lives.
+- Two seed offsets written as bare numbers are named constants beside the
+  others: `_BOOTSTRAP_SEED_OFFSET` (10_000, the bootstrap stream) and
+  `_CATEGORY_SEED_STRIDE` (997, the per-category seed of
+  `estimate_categorical`). Same values.
+- Docstrings: eleven small numpydoc style fixes, now checked on every
+  release, and one summary that was repeated. One section banner corrected.
+
+Test matrix (passed / skipped, 133 tests): CPU fp64 131 / 2, CPU fp64
+legacy 129 / 4, CUDA fp32 132 / 1, CUDA fp32 legacy 130 / 3.
+
 ## 0.10.1 (2026-11-13)
 
 Tests only; the package is identical to 0.10.0. Seven tests that patch a
