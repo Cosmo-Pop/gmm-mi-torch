@@ -8,7 +8,7 @@ Documentation only; the code is that of 0.11.1.
   `selection.md`, `gaussian.md`, `plotting.md`), apart from the
   hand-written notes, which stay in `docs/`. Links to the old paths
   (`docs/estimator.md` and so on) no longer resolve.
-- `estimate`'s docstring is shorter (208 lines to 160): Raises and Warns
+- `estimate`'s docstring is shorter (208 lines to 163): Raises and Warns
   give one short entry per exception, and their full lists move word for
   word to a new "Errors and warnings" section of `docs/estimate_notes.md`.
   A few parameter entries lose sentences of general advice.
