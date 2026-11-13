@@ -1,11 +1,21 @@
 # Changelog
 
-## Unreleased
+## 0.11.2 (2026-11-13)
 
-Docstrings only. `_warm_start` and `_n_rows` say again that the tiled
-parameters are contiguous copies and that `s` holds the sample weights.
-Correction to the 0.11.1 entry: the API pages' text was unchanged, but
-their links to source lines moved with the functions.
+Documentation only; the code is that of 0.11.1.
+
+- The API pages move to `docs/api/` (`estimator.md`, `em.md`,
+  `selection.md`, `gaussian.md`, `plotting.md`), apart from the
+  hand-written notes, which stay in `docs/`. Links to the old paths
+  (`docs/estimator.md` and so on) no longer resolve.
+- `estimate`'s docstring is shorter (208 lines to 160): Raises and Warns
+  give one short entry per exception, and their full lists move word for
+  word to a new "Errors and warnings" section of `docs/estimate_notes.md`.
+  A few parameter entries lose sentences of general advice.
+- `_warm_start` and `_n_rows` say again that the tiled parameters are
+  contiguous copies and that `s` holds the sample weights.
+- Correction to the 0.11.1 entry: the API pages' text was unchanged, but
+  their links to source lines moved with the functions.
 
 ## 0.11.1 (2026-11-13)
 
