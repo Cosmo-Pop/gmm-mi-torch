@@ -415,16 +415,9 @@ def _em_step_gemm_nchunked(X, weight_chunks, w, mu, cov, reg_covar, n_chunk,
 
 def _init_draw_block(out, generator):
     """
-    One block of the default init's responsibility draw.
+    Fill `out` in place with uniform draws from `generator`: one init block.
 
     A seam the tests spy on to check the draw is identical across chunkings.
-
-    Parameters
-    ----------
-    out : torch.Tensor
-        Buffer filled in place with uniform draws.
-    generator : torch.Generator
-        The replicate's generator.
     """
     out.uniform_(generator=generator)
 
@@ -445,11 +438,6 @@ def _draw_init_blocks(r, gens):
     gens : list of torch.Generator
         One generator per replicate in the chunk, already advanced to the
         first sample of this block range.
-
-    Returns
-    -------
-    None
-        `r` is filled in place.
     """
     for b in range(0, r.shape[1], _INIT_DRAW_BLOCK):
         for j, g in enumerate(gens):
@@ -1084,16 +1072,6 @@ def _reroute_danger(w, mu, cov):
 
     Shape (R,K): (|mu_k|^2 + 1) / min_j diag cov_k, zeroed for dead components,
     at float64; the estimated log-density residue is u x this.
-
-    Parameters
-    ----------
-    w, mu, cov : torch.Tensor
-        Mixture parameters, shapes (R, K), (R, K, d), (R, K, d, d).
-
-    Returns
-    -------
-    torch.Tensor of shape (R, K)
-        The statistic, float64.
     """
     dmin = torch.diagonal(cov, dim1=-2, dim2=-1).double().amin(-1)   # (R,K)
     dgr = (mu.double().pow(2).sum(-1) + 1.0) \
