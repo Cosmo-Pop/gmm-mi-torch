@@ -1,6 +1,6 @@
 <!-- markdownlint-disable -->
 
-<a href="../gmm_mi_torch/plotting.py"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/plotting.py"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 # <kbd>module</kbd> `plotting.py`
 
@@ -16,7 +16,7 @@ here with matplotlib/scipy so the package needs no chainconsumer install.
 
 ---
 
-<a href="../gmm_mi_torch/plotting.py#L16"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/plotting.py#L16"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `choose_ax`
 
@@ -42,7 +42,7 @@ Select panel where to plot. Normally returns the input panel; if that is None, c
 
 ---
 
-<a href="../gmm_mi_torch/plotting.py#L41"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/plotting.py#L41"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `set_ticksize`
 
@@ -64,7 +64,7 @@ Set the size of the ticks in a panel.
 
 ---
 
-<a href="../gmm_mi_torch/plotting.py#L60"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/plotting.py#L60"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `set_titles`
 
@@ -87,7 +87,7 @@ Set the titles in a panel.
 
 ---
 
-<a href="../gmm_mi_torch/plotting.py#L83"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/plotting.py#L83"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `set_legend`
 
@@ -117,7 +117,7 @@ Set the legend in a panel.
 
 ---
 
-<a href="../gmm_mi_torch/plotting.py#L109"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/plotting.py#L109"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `calculate_ellipse_params`
 
@@ -143,7 +143,7 @@ Given a covariance matrix in 2D, calculate the orientation (angle), height and w
 
 ---
 
-<a href="../gmm_mi_torch/plotting.py#L135"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/plotting.py#L135"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `find_contours`
 
@@ -167,7 +167,7 @@ Associate the user-required sigma levels to the actual size of the error ellipse
 
 ---
 
-<a href="../gmm_mi_torch/plotting.py#L165"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/plotting.py#L165"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `draw_ellipse`
 
@@ -207,7 +207,7 @@ Draw the error ellipse corresponding to a given mean vector and Gaussian covaria
 
 ---
 
-<a href="../gmm_mi_torch/plotting.py#L254"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/plotting.py#L254"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `plot_contours`
 
@@ -258,7 +258,7 @@ gmm-mi-torch (upstream GMM-MI drew these contours with chainconsumer).
 
 ---
 
-<a href="../gmm_mi_torch/plotting.py#L348"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/plotting.py#L348"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `plot_gmm_contours`
 
@@ -296,7 +296,7 @@ Draw the contour ellipses corresponding to a given Gaussian mixture model (GMM).
 
 ---
 
-<a href="../gmm_mi_torch/plotting.py#L380"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/plotting.py#L380"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `calculate_summary_and_significance`
 
@@ -322,7 +322,7 @@ Given an array of estimates, calculate their sample mean, the error on the mean,
 
 ---
 
-<a href="../gmm_mi_torch/plotting.py#L406"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/plotting.py#L406"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `histogram_estimates`
 
@@ -358,7 +358,7 @@ Plot the histogram of an array of estimates, centred on 0.
 
 ---
 
-<a href="../gmm_mi_torch/plotting.py#L444"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/plotting.py#L444"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `swap_leg_handles`
 
@@ -385,7 +385,7 @@ Swap legend handles and labels.
 
 ---
 
-<a href="../gmm_mi_torch/plotting.py#L468"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/plotting.py#L468"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `plot_multivariate_normal`
 
@@ -417,7 +417,7 @@ Plot Gaussian distribution in 1D.
 
 ---
 
-<a href="../gmm_mi_torch/plotting.py#L496"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/plotting.py#L496"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `plot_bias_chi2_histogram`
 
@@ -477,7 +477,7 @@ Plot the histogram of the bias of estimates, centred on 0. Also calculate reduce
 
 ---
 
-<a href="../gmm_mi_torch/plotting.py#L579"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/plotting.py#L579"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `create_heatmap`
 
@@ -518,7 +518,7 @@ Create a heatmap from a numpy array and two lists of labels.
 
 ---
 
-<a href="../gmm_mi_torch/plotting.py#L645"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/plotting.py#L645"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `annotate_heatmap`
 

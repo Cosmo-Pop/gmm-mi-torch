@@ -149,14 +149,14 @@ This is also available as a runnable file: [`examples/mi_grid_multigpu.py`](exam
 
 ## Documentation
 
-The API reference, one page per module, is generated from the docstrings
+The API reference in `docs/api/`, one page per module, is generated from the docstrings
 (`python docs/make_api_docs.py`, which needs the `docs` extra):
 
-- [docs/estimator.md](docs/estimator.md): `estimate`, `estimate_categorical`, `FittedGMM`
-- [docs/em.md](docs/em.md): `em_fit`, `val_ll`
-- [docs/selection.md](docs/selection.md): `select_batched`, `select_sequential`
-- [docs/gaussian.md](docs/gaussian.md): Gaussian-mixture helpers (`gmm_score`, `gmm_sample`, `marginal_score`, ...)
-- [docs/plotting.md](docs/plotting.md): plotting helpers
+- [docs/api/estimator.md](docs/api/estimator.md): `estimate`, `estimate_categorical`, `FittedGMM`
+- [docs/api/em.md](docs/api/em.md): `em_fit`, `val_ll`
+- [docs/api/selection.md](docs/api/selection.md): `select_batched`, `select_sequential`
+- [docs/api/gaussian.md](docs/api/gaussian.md): Gaussian-mixture helpers (`gmm_score`, `gmm_sample`, `marginal_score`, ...)
+- [docs/api/plotting.md](docs/api/plotting.md): plotting helpers
 
 [docs/estimate_notes.md](docs/estimate_notes.md) gives guidance on using `estimate` (component
 selection, standardisation, preprocessing, initialisation, memory and reproducibility), and

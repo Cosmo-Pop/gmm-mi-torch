@@ -1,4 +1,4 @@
-"""Generate the API reference pages in docs/ from the package's docstrings.
+"""Generate the API reference pages in docs/api/ from the package's docstrings.
 
 One Markdown page per module with public names (estimator, em, selection,
 gaussian, plotting), in the layout of the pop-cosmos documentation: a list
@@ -30,9 +30,10 @@ from numpydoc.docscrape import NumpyDocString
 
 DOCS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(DOCS)
+API = os.path.join(DOCS, 'api')                 # the pages; the notes stay in docs/
 sys.path.insert(0, ROOT)
 MODULES = ['estimator', 'em', 'selection', 'gaussian', 'plotting']
-BADGE = ('<a href="../gmm_mi_torch/{module}.py{anchor}"><img align="right" '
+BADGE = ('<a href="../../gmm_mi_torch/{module}.py{anchor}"><img align="right" '
          'style="float:right;" '
          'src="https://img.shields.io/badge/-source-cccccc?style=flat-square">'
          '</a>')
@@ -252,21 +253,27 @@ def page(module):
 
 def link_docs(text):
     """Make a mention of another page in docs/ ("docs/design_notes.md")
-    a link, outside code blocks and inline code."""
+    a link, outside code blocks and inline code: an API page is in the same
+    folder, a notes page one level up."""
+    def link(m):
+        page = m.group(1)
+        target = page if page[:-3] in MODULES else '../' + page
+        return f'[docs/{page}]({target})'
     parts = text.split('```')
     for i in range(0, len(parts), 2):          # even parts: outside fences
-        parts[i] = re.sub(r'(?<![\[(/`\w])docs/([a-z_]+\.md)(?![`\w])', r'[docs/\1](\1)', parts[i])
+        parts[i] = re.sub(r'(?<![\[(/`\w])docs/([a-z_]+\.md)(?![`\w])', link, parts[i])
     return '```'.join(parts)
 
 
 def main():
-    ap = argparse.ArgumentParser(description='Generate (or check) the API pages in docs/.')
+    ap = argparse.ArgumentParser(description='Generate (or check) the API pages in docs/api/.')
     ap.add_argument('--check', action='store_true',
                     help='exit 1 if any page differs from what the docstrings give')
     args = ap.parse_args()
     stale = []
+    os.makedirs(API, exist_ok=True)
     for module in MODULES:
-        path = os.path.join(DOCS, f'{module}.md')
+        path = os.path.join(API, f'{module}.md')
         text = page(module)
         old = open(path).read() if os.path.exists(path) else None
         if args.check:

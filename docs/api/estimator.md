@@ -1,6 +1,6 @@
 <!-- markdownlint-disable -->
 
-<a href="../gmm_mi_torch/estimator.py"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 # <kbd>module</kbd> `estimator.py`
 
@@ -17,13 +17,13 @@ and the Gaussian helpers are the kernels they are built from (in
 environment variable GMM_MI_TORCH_EM_KERNEL ('gemm', the default, or
 'legacy') selects the EM kernels at import; any other value raises
 ValueError. Design notes, memory models and the measurements behind the
-constants: [docs/design_notes.md](design_notes.md).
+constants: [docs/design_notes.md](../design_notes.md).
 
 **On this page:** [`estimate`](#function-estimate) · [`estimate_categorical`](#function-estimate_categorical) · [`FittedGMM`](#class-fittedgmm) · [`CategoryFit`](#class-categoryfit)
 
 ---
 
-<a href="../gmm_mi_torch/estimator.py#L487"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L487"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>class</kbd> `FittedGMM`
 
@@ -50,7 +50,7 @@ supplies.
 | `w`, `mu`, `cov` | `torch.Tensor` | - | Weights (K,), means (K, d) and covariances (K, d, d). |
 | `chol` | `torch.Tensor of shape (K, d, d), optional` | `None` | Lower Cholesky factor of `cov`; computed (and repaired if needed) from `cov` when omitted. |
 
-<a href="../gmm_mi_torch/estimator.py#L523"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L523"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ### <kbd>method</kbd> `sample`
 
@@ -73,7 +73,7 @@ Draw `n_samples` from the mixture.
 |--------------|------|-------------|
 | - | `numpy.ndarray of shape (n_samples, d)` | The samples, in the units of the fitted model. |
 
-<a href="../gmm_mi_torch/estimator.py#L545"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L545"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ### <kbd>method</kbd> `score_samples`
 
@@ -101,7 +101,7 @@ the expected one.
 
 ---
 
-<a href="../gmm_mi_torch/estimator.py#L617"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L617"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `estimate`
 
@@ -200,11 +200,11 @@ warm-started from the CV-selected parameters.
 ### Notes
 
 On selection, standardisation, preprocessing, initialisation, memory and
-reproducibility: [docs/estimate_notes.md](estimate_notes.md) in the repository.
+reproducibility: [docs/estimate_notes.md](../estimate_notes.md) in the repository.
 
 ---
 
-<a href="../gmm_mi_torch/estimator.py#L980"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L980"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>class</kbd> `CategoryFit`
 
@@ -228,7 +228,7 @@ Bootstrap fits of one category in `estimate_categorical` (a tuple).
 
 ---
 
-<a href="../gmm_mi_torch/estimator.py#L1056"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L1056"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `estimate_categorical`
 
