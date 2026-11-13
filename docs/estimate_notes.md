@@ -2,8 +2,10 @@
 
 The Notes section of the docstring of `gmm_mi_torch.estimate` up to
 v0.9.0, moved here verbatim in 0.10.0 so that `help(estimate)` stays
-short (the docstring keeps a pointer). Where `estimate_categorical`
-says "as in `estimate`", these notes apply to it too.
+short (the docstring keeps a pointer); the last section, the full lists
+of its errors and warnings, moved here from the docstring in 0.11.2.
+Where `estimate_categorical` says "as in `estimate`", these notes apply
+to it too.
 
 ## Selection
 
@@ -120,3 +122,63 @@ and on knife-edge data that can move the selected k (measured: k=5 vs
 6, MI 0.4741 vs 0.4745 against an errorbar of 0.008). A CPU run is the
 bit-reproducible setting (with the float32 exception above); on CUDA,
 float64 is far less sensitive.
+
+## Errors and warnings
+
+The full lists behind the docstring's Raises and Warns sections.
+
+**ValueError**, raised before any fitting:
+
+- Unknown options: `quantity`, `protocol`, `preprocess`, `tie_rank`,
+  `metric_method` (or any but 'valid' under protocol='sequential'),
+  `init_type`, or a string `em_chunk` or `mc_chunk` other than 'auto'.
+- Precision and device: a `dtype` other than float32/float64; a
+  `device` that is not 'cpu'/'cuda[:i]', is unavailable or is out of
+  range.
+- Data: `X` not 2-D, with the wrong number of columns, with NaN/inf
+  values, or not representable at `dtype` after standardisation;
+  preprocess='gaussianise' with a KL quantity.
+- Folds: n_folds < 2, more folds than samples, or a smallest training
+  fold of fewer than n_variables + 1 samples.
+- Counts and thresholds: n_bootstrap < 0 or > 2^20; |seed| > 2^62;
+  mc_samples, max_components, n_inits, max_iter,
+  fixed_components_number, patience, n_chunk, em_chunk or mc_chunk
+  below 1; reg_covar or threshold_fit not > 0; threshold_components
+  not >= 0.
+
+**TypeError**: a non-integer count, seed, em_chunk or mc_chunk (numpy
+integers are accepted), or a non-numeric threshold_fit. A non-numeric
+reg_covar or threshold_components fails with Python's own comparison
+TypeError. A non-numeric `scale` fails inside the initialisation with
+float()'s own error (ValueError for a string, TypeError otherwise).
+
+**RuntimeError**: on CUDA, when by the memory model not even one
+replicate of the first (initialisation or EM) stage fits (set
+`n_chunk`); when no candidate k yields a finite validation metric
+(degenerate folds or data); when a covariance cannot be factorised even
+after escalating regularisation (raise `reg_covar`, or use float64); or
+when a CUDA out-of-memory error persists at one replicate per batch.
+
+**RuntimeWarning**:
+
+- Once per call: fewer than 100 samples (a finite-sample bias the
+  errorbar does not include); under preprocess='gaussianise', columns
+  with more than 1% of their samples in tied blocks of three or more;
+  return_fit=True with preprocess='gaussianise' (the model lives in
+  rank-probit space); components of a requested
+  fixed_components_number that died in the CV fit.
+- Once per skipped k: protocol='sequential' met a non-finite
+  validation metric (k skipped without consuming patience).
+- Once per em_fit call (each CV fit, the aic/bic and return_fit
+  refits, the bootstrap), counting replicates: replicates that
+  exhausted `max_iter`; replicates finished on the centred legacy
+  kernels because a component collapsed beyond the GEMM kernels'
+  precision (expected for surplus components during selection at
+  float32). Once per validation-scoring call, likewise, for
+  replicates scored with the legacy kernels.
+- Once per halving: a CUDA out-of-memory error halved a stage's
+  replicate batch and retried.
+- Once per covariance factorisation that needs it, which can repeat
+  across EM iterations and stages, counting components: extra diagonal
+  regularisation; an all-zero or a non-finite covariance replaced
+  by the identity.

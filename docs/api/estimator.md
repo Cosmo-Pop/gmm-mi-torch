@@ -153,14 +153,14 @@ warm-started from the CV-selected parameters.
 | `X` | `array-like of shape (n_samples, n_variables)` | - | The data. Two columns for 'MI' and the KL quantities; at least three for 'cMI' (variables 0 and 1 are X and Y, the rest condition); at least two for 'TC'. |
 | `quantity` | `{'MI', 'cMI', 'TC', 'KL_forward', 'KL_reverse'}` | `'MI'` | 'MI': I(X;Y); 'cMI': I(X;Y\|Z), Z the columns beyond the first two; 'TC': total correlation KL[p(x) \|\| prod_i p(x_i)], zero iff the variables are mutually independent; 'KL_forward': KL[p(x0) \|\| p(x1)] between the two 1D marginals; 'KL_reverse': the opposite order. |
 | `protocol` | `{'batched', 'sequential'}` | `'batched'` | Component selection. 'batched' fits k = 1..max_components at once and picks the smallest k within `threshold_components` of the best validation metric; 'sequential' is GMM-MI's original protocol (increment k, stop early via threshold and patience). See Notes. |
-| `n_bootstrap` | `int` | `50` | Bootstrap realisations for the errorbar, batched per `em_chunk`; more give a smoother distribution and more reliable errorbars, at higher cost. 0 skips the bootstrap (a single fit on the full data). |
-| `mc_samples` | `int` | `100_000` | Number of Monte Carlo samples used to integrate the estimator for each bootstrap replicate. Higher values reduce the MC contribution to the error at linear cost in time. |
-| `max_components` | `int` | `20` | Largest number of GMM components considered in selection. The batched protocol pays for all of them unconditionally, so keep this to a plausible ceiling for the data. |
-| `n_folds` | `int` | `2` | Number of cross-validation folds. Each fold should remain large enough to be representative of the data. |
-| `n_inits` | `int` | `3` | Number of GMM initialisations per fold. Higher values reduce the chance of a local optimum, at proportional cost (batched away on GPU). |
+| `n_bootstrap` | `int` | `50` | Bootstrap realisations for the errorbar, batched per `em_chunk`. 0 skips the bootstrap (a single fit on the full data). |
+| `mc_samples` | `int` | `100_000` | Monte Carlo samples per bootstrap replicate for the integral; more reduce the MC error, at linear cost in time. |
+| `max_components` | `int` | `20` | Largest number of components considered. The batched protocol fits them all, so keep this to a plausible ceiling for the data. |
+| `n_folds` | `int` | `2` | Cross-validation folds; each should stay representative of the data. |
+| `n_inits` | `int` | `3` | Initialisations per fold; more reduce the chance of a local optimum, at proportional cost (batched away on GPU). |
 | `reg_covar` | `float` | `1e-6` | Constant added to every covariance diagonal to prevent singularities, relative to each variable's variance (the data are standardised; see Notes). 1e-6 is safe at float32, where GMM-MI's 1e-15 would regularise nothing. |
-| `threshold_fit` | `float` | `1e-5` | EM convergence threshold on the change in mean per-sample log-likelihood. Smaller values give more converged fits at the cost of more EM iterations; equivalent to `tol` in sklearn GMMs. |
-| `max_iter` | `int` | `500` | Maximum EM iterations per fit. Convergence should normally be reached via `threshold_fit` well before this. |
+| `threshold_fit` | `float` | `1e-5` | EM convergence threshold on the change in mean per-sample log-likelihood (sklearn's `tol`). |
+| `max_iter` | `int` | `500` | Maximum EM iterations per fit. |
 | `seed` | `int` | `0` | Seed controlling initialisations, CV splits, bootstrap resampling, MC integration and gaussianise's tie-breaking. Bitwise reproducible on CPU; on CUDA see Notes, "Reproducibility". |
 | `return_k` | `bool` | `False` | If True, also return the selected number of components. |
 | `return_fit` | `bool` | `False` | If True, also return the selected model as a `FittedGMM` (refitted on the full data, warm-started like the bootstrap replicates from the CV-selected parameters), e.g. for plotting; see Notes for its units. |
@@ -189,22 +189,23 @@ warm-started from the CV-selected parameters.
 
 ### Raises
 
-- `ValueError`: Raised before any fitting.<br><br>Unknown options: `quantity`, `protocol`, `preprocess`, `tie_rank`, `metric_method` (or any but 'valid' under protocol='sequential'), `init_type`, or a string `em_chunk` or `mc_chunk` other than 'auto'.<br><br>Precision and device: a `dtype` other than float32/float64; a `device` that is not 'cpu'/'cuda[:i]', is unavailable or is out of range.<br><br>Data: `X` not 2-D, with the wrong number of columns, with NaN/inf values, or not representable at `dtype` after standardisation; preprocess='gaussianise' with a KL quantity.<br><br>Folds: n_folds < 2, more folds than samples, or a smallest training fold of fewer than n_variables + 1 samples.<br><br>Counts and thresholds: n_bootstrap < 0 or > 2^20; \|seed\| > 2^62; mc_samples, max_components, n_inits, max_iter, fixed_components_number, patience, n_chunk, em_chunk or mc_chunk below 1; reg_covar or threshold_fit not > 0; threshold_components not >= 0.
-- `TypeError`: A non-integer count, seed, em_chunk or mc_chunk (numpy integers are accepted), or a non-numeric threshold_fit. A non-numeric reg_covar or threshold_components fails with Python's own comparison TypeError. A non-numeric `scale` fails inside the initialisation with float()'s own error (ValueError for a string, TypeError otherwise).
-- `RuntimeError`: On CUDA, when by the memory model not even one replicate of the first (initialisation or EM) stage fits (set `n_chunk`); when no candidate k yields a finite validation metric (degenerate folds or data); when a covariance cannot be factorised even after escalating regularisation (raise `reg_covar`, or use float64); or when a CUDA out-of-memory error persists at one replicate per batch.
+- `ValueError`: An unknown option, an out-of-range count, threshold, dtype or device, data of the wrong shape or with NaN/inf values, or folds too small for the data; raised before any fitting. The full list: Notes.
+- `TypeError`: A non-integer count, seed, em_chunk or mc_chunk (numpy integers are accepted), or a non-numeric threshold, reg_covar or `scale`.
+- `RuntimeError`: On CUDA, when not even one replicate fits in memory (set `n_chunk`) or an out-of-memory error persists at one replicate per batch; when no candidate k yields a finite validation metric; or when a covariance cannot be factorised (raise `reg_covar`, or use float64).
 
 ### Warns
 
-- `RuntimeWarning`: Once per call: fewer than 100 samples (a finite-sample bias the errorbar does not include); under preprocess='gaussianise', columns with more than 1% of their samples in tied blocks of three or more; return_fit=True with preprocess='gaussianise' (the model lives in rank-probit space); components of a requested fixed_components_number that died in the CV fit.<br><br>Once per skipped k: protocol='sequential' met a non-finite validation metric (k skipped without consuming patience).<br><br>Once per em_fit call (each CV fit, the aic/bic and return_fit refits, the bootstrap), counting replicates: replicates that exhausted `max_iter`; replicates finished on the centred legacy kernels because a component collapsed beyond the GEMM kernels' precision (expected for surplus components during selection at float32). Once per validation-scoring call, likewise, for replicates scored with the legacy kernels.<br><br>Once per halving: a CUDA out-of-memory error halved a stage's replicate batch and retried.<br><br>Once per covariance factorisation that needs it, which can repeat across EM iterations and stages, counting components: extra diagonal regularisation; an all-zero or a non-finite covariance replaced by the identity.
+- `RuntimeWarning`: For a result that may need a look: fewer than 100 samples, tied data or return_fit under gaussianise, components that died in a fixed-k fit, a skipped k in the sequential protocol, replicates that hit `max_iter` or finished on the legacy kernels, a CUDA out-of-memory retry, or extra covariance regularisation. The full list, with how often each is issued: Notes.
 
 ### Notes
 
-On selection, standardisation, preprocessing, initialisation, memory and
-reproducibility: [docs/estimate_notes.md](../estimate_notes.md) in the repository.
+On selection, standardisation, preprocessing, initialisation, memory,
+reproducibility, and the full lists of errors and warnings:
+[docs/estimate_notes.md](../estimate_notes.md) in the repository.
 
 ---
 
-<a href="../../gmm_mi_torch/estimator.py#L980"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L932"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>class</kbd> `CategoryFit`
 
@@ -228,7 +229,7 @@ Bootstrap fits of one category in `estimate_categorical` (a tuple).
 
 ---
 
-<a href="../../gmm_mi_torch/estimator.py#L1056"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L1008"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `estimate_categorical`
 
@@ -313,7 +314,7 @@ multinomial sampling uncertainty of the category proportions themselves
 
 ### Raises
 
-- `ValueError`: Before any fitting, for: `X` not 1-D or a single column, with NaN/inf values, or not representable at `dtype` after standardisation; `Y` not 1-D, of a different length from `X`, with NaN/inf or missing (None/NaN) labels, or mixing label types that cannot be ordered; a smallest category too small for `n_folds` (as `estimate` checks X, with d = 1); an unknown `category_weights`; and the argument errors listed for `estimate` that apply to this signature.
+- `ValueError`: Before any fitting, for: `X` not 1-D or a single column, with NaN/inf values, or not representable at `dtype` after standardisation; `Y` not 1-D, of a different length from `X`, with NaN/inf or missing (None/NaN) labels, or mixing label types that cannot be ordered; a smallest category too small for `n_folds` (as `estimate` checks X, with d = 1); an unknown `category_weights`; and those of `estimate`'s argument errors that apply to this signature (full list: [docs/estimate_notes.md](../estimate_notes.md), "Errors and warnings").
 - `TypeError`: As in `estimate`.
 - `RuntimeError`: As in `estimate`, for any category's fit.
 
