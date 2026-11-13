@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.10.1 (2026-11-13)
+
+Tests only; the package is identical to 0.10.0. Seven tests that patch a
+module setting or swap in a stand-in to reach a code path now also check
+that the patched path really ran (commit a1157a0; note N6 of the phase 3
+landed read, scoping/review-findings-readability-phase3-2026-11-11.md):
+their assertions held on the default path too, so a patch that stopped
+reaching its target would have gone unnoticed. Disabling each patch makes
+its test fail at the new check. Test matrix (passed / skipped, 133 tests):
+CPU fp64 131 / 2, CPU fp64 legacy 129 / 4, CUDA fp32 132 / 1, CUDA fp32
+legacy 130 / 3.
+
 ## 0.10.0 (2026-11-11)
 
 Readability, phase 3 of scoping/readability-proposal-2026-11-04.md (items
