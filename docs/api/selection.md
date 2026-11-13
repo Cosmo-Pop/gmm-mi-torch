@@ -1,6 +1,6 @@
 <!-- markdownlint-disable -->
 
-<a href="../gmm_mi_torch/selection.py"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/selection.py"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 # <kbd>module</kbd> `selection.py`
 
@@ -11,7 +11,7 @@ batched protocols.
 
 ---
 
-<a href="../gmm_mi_torch/selection.py#L221"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/selection.py#L221"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `select_sequential`
 
@@ -78,7 +78,7 @@ models at higher k.
 
 ---
 
-<a href="../gmm_mi_torch/selection.py#L318"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/selection.py#L318"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `select_batched`
 
