@@ -209,7 +209,10 @@ def _mc_bytes_per_replicate(mc_samples, K, d, dtype):
 
 
 def _n_rows(s):
-    """Replicate count: product of the leading dims of `s` (..., n_samples)."""
+    """Replicate count: the product of the leading dims of `s`.
+
+    `s` holds the sample weights, shape (..., n_samples).
+    """
     return s.shape[:-1].numel()
 
 
