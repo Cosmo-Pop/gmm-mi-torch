@@ -9,8 +9,8 @@ Documentation only; the code is that of 0.10.2.
   pop-cosmos documentation uses: for each public function, class and
   method, its signature, a link to its source line, and its parameters,
   returns, exceptions and warnings as tables. The pages are generated from
-  the docstrings by `docs/make_api_docs.py` (install the new `docs` extra
-  for numpydoc); `--check` reports a page that is out of date. The README
+  the docstrings by `docs/make_api_docs.py` (install the new `docs` extra:
+  `pip install -e '.[docs]'`); `--check` reports a page that is out of date. The README
   has a Documentation section listing them.
 - The plotting helpers' docstrings are completed for the pages: one
   undocumented parameter (`create_heatmap`'s `fsize`), `**kwargs`, `str`

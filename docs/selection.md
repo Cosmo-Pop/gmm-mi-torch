@@ -7,6 +7,8 @@
 Component selection: the cross-validation masks and the sequential and
 batched protocols.
 
+**On this page:** [`select_sequential`](#function-select_sequential) · [`select_batched`](#function-select_batched)
+
 ---
 
 <a href="../gmm_mi_torch/selection.py#L221"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
@@ -19,10 +21,10 @@ select_sequential(
     max_components=20,
     n_folds=2,
     n_inits=3,
-    threshold_components=1e-05,
+    threshold_components=1e-5,
     patience=1,
-    reg_covar=1e-06,
-    threshold_fit=1e-05,
+    reg_covar=1e-6,
+    threshold_fit=1e-5,
     max_iter=500,
     seed=0,
     em_chunk=8,
@@ -49,14 +51,14 @@ models at higher k.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `X` | `torch.Tensor of shape (n_samples, n_variables)` | - | The data, already on the target device/dtype. |
-| `max_components` | `int, default=20` | `20` | Largest k tried if the early stop never triggers. |
+| `max_components` | `int` | `20` | Largest k tried if the early stop never triggers. |
 | `n_folds`, `n_inits` | `int, optional` | `2`, `3` | As in `estimate`. |
-| `threshold_components` | `float, default=1e-5` | `1e-05` | Minimum metric improvement that counts as progress. |
-| `patience` | `int, default=1` | `1` | Number of consecutive non-improving k values tolerated before stopping; the counter resets on every improvement, and the selected k is the best-scoring one. |
-| `reg_covar`, `threshold_fit` | `float, optional` | `1e-06`, `1e-05` | As in `estimate`. |
+| `threshold_components` | `float` | `1e-5` | Minimum metric improvement that counts as progress. |
+| `patience` | `int` | `1` | Number of consecutive non-improving k values tolerated before stopping; the counter resets on every improvement, and the selected k is the best-scoring one. |
+| `reg_covar`, `threshold_fit` | `float, optional` | `1e-6`, `1e-5` | As in `estimate`. |
 | `max_iter`, `seed` | `int, optional` | `500`, `0` | As in `estimate`. |
-| `em_chunk` | `int, default=8` | `8` | As in `estimate`, an integer here. |
-| `init_type` | `str, default='random_responsibilities'` | `'random_responsibilities'` | As in `estimate`. |
+| `em_chunk` | `int` | `8` | As in `estimate`, an integer here. |
+| `init_type` | `str` | `'random_responsibilities'` | As in `estimate`. |
 | `scale` | `float, optional` | `None` | As in `estimate`. |
 | `n_chunk` | `int, optional` | `None` | As in `estimate`. |
 | `init_chunk` | `int, optional` | `None` | Replicates per batch for the initialisation stage (default em_chunk); `estimate` sizes it from the init stage's own memory model. |
@@ -86,9 +88,9 @@ select_batched(
     max_components=20,
     n_folds=2,
     n_inits=3,
-    threshold_components=1e-05,
-    reg_covar=1e-06,
-    threshold_fit=1e-05,
+    threshold_components=1e-5,
+    reg_covar=1e-6,
+    threshold_fit=1e-5,
     max_iter=500,
     seed=0,
     em_chunk=8,
@@ -112,15 +114,15 @@ of the sequential search, and is the fast option on GPU.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `X` | `torch.Tensor of shape (n_samples, n_variables)` | - | The data, already on the target device/dtype. |
-| `max_components` | `int, default=20` | `20` | Largest k fitted; all are paid for unconditionally. |
+| `max_components` | `int` | `20` | Largest k fitted; all are paid for unconditionally. |
 | `n_folds`, `n_inits` | `int, optional` | `2`, `3` | As in `estimate`. |
-| `threshold_components` | `float, default=1e-5` | `1e-05` | Parsimony rule for metric_method='valid': the smallest k whose validation log-likelihood is within this threshold of the best wins, so noise-level improvements do not inflate k. |
-| `reg_covar`, `threshold_fit` | `float, optional` | `1e-06`, `1e-05` | As in `estimate`. |
+| `threshold_components` | `float` | `1e-5` | Parsimony rule for metric_method='valid': the smallest k whose validation log-likelihood is within this threshold of the best wins, so noise-level improvements do not inflate k. |
+| `reg_covar`, `threshold_fit` | `float, optional` | `1e-6`, `1e-5` | As in `estimate`. |
 | `max_iter`, `seed` | `int, optional` | `500`, `0` | As in `estimate`. |
-| `em_chunk` | `int, default=8` | `8` | As in `estimate`, an integer here. |
-| `init_type` | `str, default='random_responsibilities'` | `'random_responsibilities'` | As in `estimate`. |
+| `em_chunk` | `int` | `8` | As in `estimate`, an integer here. |
+| `init_type` | `str` | `'random_responsibilities'` | As in `estimate`. |
 | `scale` | `float, optional` | `None` | As in `estimate`. |
-| `metric_method` | `{'valid', 'aic', 'bic'}, default='valid'` | `'valid'` | 'valid' scores held-out log-likelihood with the parsimony rule. 'aic'/'bic' follow GMM-MI: each k's best CV parameters are refit on the full data, the criterion is computed on it, and the minimising k wins; the returned parameters are still the CV-selected ones. |
+| `metric_method` | `{'valid', 'aic', 'bic'}` | `'valid'` | 'valid' scores held-out log-likelihood with the parsimony rule. 'aic'/'bic' follow GMM-MI: each k's best CV parameters are refit on the full data, the criterion is computed on it, and the minimising k wins; the returned parameters are still the CV-selected ones. |
 | `n_chunk` | `int, optional` | `None` | As in `estimate`. |
 | `init_chunk` | `int, optional` | `None` | Replicates per batch for the initialisation stage (default em_chunk), as in `select_sequential`. |
 
@@ -139,4 +141,4 @@ of the sequential search, and is the fast option on GPU.
 
 ---
 
-_This file was generated by `docs/make_api_docs.py` from the docstrings of gmm-mi-torch 0.11.0; edit the docstrings, not this file._
+_This file was generated by `docs/make_api_docs.py` from the docstrings; edit the docstrings, not this file._

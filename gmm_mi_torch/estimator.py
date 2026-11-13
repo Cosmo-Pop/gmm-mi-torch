@@ -779,18 +779,23 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     ------
     ValueError
         Raised before any fitting.
+
         Unknown options: `quantity`, `protocol`, `preprocess`, `tie_rank`,
         `metric_method` (or any but 'valid' under protocol='sequential'),
         `init_type`, or a string `em_chunk` or `mc_chunk` other than 'auto'.
+
         Precision and device: a `dtype` other than float32/float64; a
         `device` that is not 'cpu'/'cuda[:i]', is unavailable or is out of
         range.
+
         Data: `X` not 2-D, with the wrong number of columns, with NaN/inf
         values, or not representable at `dtype` after standardisation;
         preprocess='gaussianise' with a KL quantity.
+
         Folds: n_folds < 2, more folds than samples, or a smallest training
         fold of fewer than n_variables + 1 samples.
-        Counts and thresholds: n_bootstrap < 0 or > 2**20; |seed| > 2**62;
+
+        Counts and thresholds: n_bootstrap < 0 or > 2^20; |seed| > 2^62;
         mc_samples, max_components, n_inits, max_iter,
         fixed_components_number, patience, n_chunk, em_chunk or mc_chunk
         below 1; reg_covar or threshold_fit not > 0; threshold_components
@@ -818,8 +823,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         return_fit=True with preprocess='gaussianise' (the model lives in
         rank-probit space); components of a requested
         fixed_components_number that died in the CV fit.
+
         Once per skipped k: protocol='sequential' met a non-finite
         validation metric (k skipped without consuming patience).
+
         Once per em_fit call (each CV fit, the aic/bic and return_fit
         refits, the bootstrap), counting replicates: replicates that
         exhausted `max_iter`; replicates finished on the centred legacy
@@ -827,8 +834,10 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         precision (expected for surplus components during selection at
         float32). Once per validation-scoring call, likewise, for
         replicates scored with the legacy kernels.
+
         Once per halving: a CUDA out-of-memory error halved a stage's
         replicate batch and retried.
+
         Once per covariance factorisation that needs it, which can repeat
         across EM iterations and stages, counting components: extra diagonal
         regularisation; an all-zero or a non-finite covariance replaced

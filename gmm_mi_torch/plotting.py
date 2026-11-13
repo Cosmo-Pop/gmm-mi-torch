@@ -164,7 +164,8 @@ def find_contours(contour_levels):
 
 def draw_ellipse(mean, covariance, weight, ax=None, fill=False, marker='X',
                  contour_levels=[2], weight_size=1000, label=None, component_count=0, **kwargs):
-    """Draw the error ellipse corresponding to a given mean vector and Gaussian covariance matrix.
+    """
+    Draw the error ellipse corresponding to a given mean vector and Gaussian covariance matrix.
     Since this is done in the context of Gaussian mixture models (GMMs), the weight is also indicated
     with a marker whose size is proportional to the weight value. Based on
     https://www.visiondummy.com/2014/04/draw-error-ellipse-representing-covariance-matrix/.
@@ -177,7 +178,7 @@ def draw_ellipse(mean, covariance, weight, ax=None, fill=False, marker='X',
         The covariance matrix of the Gaussian distribution.
     weight : float
         The weight associated with this GMM component.
-    ax : instance of the axes.Axes class from pyplot, default='None'
+    ax : instance of the axes.Axes class from pyplot, default=None
         The panel where to draw the ellipse.
     fill : bool, default=False
         Whether to fill the contours or not.
@@ -465,8 +466,9 @@ def swap_leg_handles(ax, i1=-1, i2=-2):
     return handles, labels
 
 def plot_multivariate_normal(ax=None, mean=0, cov=1, alpha=1, color='black', lw=5, ls='--'):
-    """Plot Gaussian distribution in 1D.
-    
+    """
+    Plot Gaussian distribution in 1D.
+
     Parameters
     ----------
     ax : instance of the axes.Axes class from pyplot, default=None
@@ -475,7 +477,7 @@ def plot_multivariate_normal(ax=None, mean=0, cov=1, alpha=1, color='black', lw=
         The mean of the Gaussian distribution.
     cov : float, default=1
         The covariance of the Gaussian distribution.        
-    alpha : float, default=2
+    alpha : float, default=1
         Transparency of the line. Must be between 0 and 1.
     color : str, default='black'
         Line color.
