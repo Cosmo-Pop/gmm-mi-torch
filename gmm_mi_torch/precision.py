@@ -24,11 +24,11 @@ class _pinned_precision:
     """
     Context manager: full-precision float32 matmuls inside the block.
 
-    Float32 matmuls run at full (ieee) precision inside the block, with any
-    ambient torch.autocast region suspended (an enclosing mixed-precision
-    context would otherwise run the cancellation-critical GEMMs at
-    bf16/fp16, shifting both the estimate and the selected k). The caller's
-    effective settings are restored on exit. Reentrant.
+    Full precision means ieee. Any ambient torch.autocast region is suspended
+    inside the block (an enclosing mixed-precision context would otherwise run
+    the cancellation-critical GEMMs at bf16/fp16, shifting both the estimate
+    and the selected k). The caller's effective settings are restored on exit.
+    Reentrant.
 
     Restore and inheritance (torch >= 2.9): the per-backend getters
     resolve an inherited ('none') knob to its parent's value, and torch

@@ -26,9 +26,10 @@ _MULTINOMIAL_MAX_CATEGORIES = 1 << 24
 _MC_SEED_OFFSET = 50_000
 _MC_CAT_STRIDE = 1 << 20
 
-# bootstrap resample stream: seed + _BOOTSTRAP_SEED_OFFSET; category ci of
-# estimate_categorical uses seed + _CATEGORY_SEED_STRIDE * ci in place of
-# seed throughout; design notes: "Random streams"
+# bootstrap resample stream: seed + _BOOTSTRAP_SEED_OFFSET. In
+# estimate_categorical, category ci runs its selection and its bootstrap
+# on seed + _CATEGORY_SEED_STRIDE * ci (its Monte Carlo stream is set
+# apart by _MC_CAT_STRIDE instead); design notes: "Random streams"
 _BOOTSTRAP_SEED_OFFSET = 10_000
 _CATEGORY_SEED_STRIDE = 997
 

@@ -605,9 +605,9 @@ def _hard_assignments(Xc, x2c, Cc, al, big):
 
 def _finish_kmeans_params(w, mu, cov, Nk, al, eye):
     """
-    Zero empty or dead components; give them harmless means and covariances.
+    Zero the weights of empty or dead components and renormalise the rest.
 
-    The remaining weights are renormalised.
+    Those components get harmless means and covariances.
 
     Parameters
     ----------
@@ -635,9 +635,7 @@ def _finish_kmeans_params(w, mu, cov, Nk, al, eye):
 
 def _kmeans_assign_stats(sl, X, x2, centres, alive, reg_covar, n_chunk):
     """
-    Compute k-means hard-assignment statistics for one replicate chunk.
-
-    The statistics use the full data.
+    Compute k-means hard-assignment statistics on the full data, per chunk.
 
     The chunk callback of `_init_params`'s 'kmeans' and 'randomized_kmeans'
     inits. Covariances are normalised by N, not by the component counts, as

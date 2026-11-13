@@ -15,7 +15,7 @@ from .precision import _check_chunk_arg
 
 def _cuda_free_bytes(dev):
     """
-    Count the bytes this process can still allocate on a CUDA device.
+    Return the bytes this process can still allocate on a CUDA device.
 
     The driver's free memory plus torch's cached-but-unallocated blocks (ours
     to reuse), capped by torch.cuda.set_per_process_memory_fraction when one is
