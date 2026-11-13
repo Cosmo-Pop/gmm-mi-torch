@@ -149,7 +149,7 @@ This is also available as a runnable file: [`examples/mi_grid_multigpu.py`](exam
 
 ## Known limitations
 
-Mechanisms and measurements for each are in [docs/design_notes.md](docs/design_notes.md).
+Mechanisms and measurements for each are in [docs/design_notes.md](docs/design_notes.md); guidance on using `estimate` (component selection, standardisation, preprocessing, initialisation, memory and reproducibility) is in [docs/estimate_notes.md](docs/estimate_notes.md).
 
 - **Finite-sample bias.** GMM MI estimates carry a positive finite-sample bias that the bootstrap errorbar does not include; below 100 samples (per dataset, or per category) the estimator warns.
 - **Heavily tied or zero-inflated data.** No tie convention makes the GMM fit of heavily tied data reliable; `preprocess='none'` is the more reliable choice there (under `'gaussianise'`, random tie-ranks bias the estimate low when ties are shared between columns).

@@ -189,12 +189,12 @@ streams are decoupled from each other (compiled from the module constants):
 | initialisation, sequential protocol and fixed k (candidate k = K) | seed + K |
 | initialisation, batched protocol | seed |
 | default init, replicate r | per-replicate seed drawn from the init generator |
-| bootstrap resample | seed + 10_000 |
+| bootstrap resample | seed + 10_000 (`_BOOTSTRAP_SEED_OFFSET`) |
 | bootstrap above 2^24, replicate r | per-replicate seed drawn from the bootstrap generator |
 | CV fold assignment (CPU generator) | seed + 30_000 |
 | gaussianise tie-breaking (one CPU generator, advanced per column) | seed + 40_000 |
 | Monte-Carlo integration, replicate r | seed + 50_000 + r |
-| `estimate_categorical`, category ci: selection and bootstrap | as above with seed + 997 ci |
+| `estimate_categorical`, category ci: selection and bootstrap | as above with seed + 997 ci (`_CATEGORY_SEED_STRIDE`) |
 | `estimate_categorical`, category ci: MC, replicate r | seed + 50_000 + ci 2^20 + r |
 
 n_bootstrap is capped at 2^20 and |seed| at 2^62 at entry so the offsets stay

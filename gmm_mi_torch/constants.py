@@ -26,6 +26,12 @@ _MULTINOMIAL_MAX_CATEGORIES = 1 << 24
 _MC_SEED_OFFSET = 50_000
 _MC_CAT_STRIDE = 1 << 20
 
+# bootstrap resample stream: seed + _BOOTSTRAP_SEED_OFFSET; category ci of
+# estimate_categorical uses seed + _CATEGORY_SEED_STRIDE * ci in place of
+# seed throughout; design notes: "Random streams"
+_BOOTSTRAP_SEED_OFFSET = 10_000
+_CATEGORY_SEED_STRIDE = 997
+
 # sample block of the default-init draw; design notes: _INIT_DRAW_BLOCK
 _INIT_DRAW_BLOCK = 1 << 14
 

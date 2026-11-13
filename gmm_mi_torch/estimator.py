@@ -21,8 +21,8 @@ from typing import NamedTuple
 import torch
 
 from .constants import (
-    _MC_CAT_STRIDE, _MC_SEED_OFFSET, _MULTINOMIAL_MAX_CATEGORIES,
-    _TIE_SEED_OFFSET)
+    _BOOTSTRAP_SEED_OFFSET, _CATEGORY_SEED_STRIDE, _MC_CAT_STRIDE,
+    _MC_SEED_OFFSET, _MULTINOMIAL_MAX_CATEGORIES, _TIE_SEED_OFFSET)
 from .precision import _as_array, _entry_precision, _validate_entry_args
 from .chunking import (
     _cuda_free_bytes, _em_bytes_per_replicate, _em_fixed_bytes,
@@ -44,7 +44,7 @@ from .em import EMResult, ValLLResult, val_ll  # noqa: F401
 
 
 # ----------------------------------------------------------------------
-# estimators (all from one joint fit, marginals by masking)
+# integrands: each quantity from one joint fit, marginals by masking
 # ----------------------------------------------------------------------
 
 def _integrand_MI(pts, w, mu, cov, chol):
@@ -955,7 +955,8 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
                            muf[0][alive].double() * D + mean64,
                            cov_s[0].double() * (D[:, None] * D[None, :]),
                            chol=chol_s[0].double() * D[:, None])
-    g = torch.Generator(device=X.device).manual_seed(seed + 10_000)
+    g = torch.Generator(device=X.device).manual_seed(
+        seed + _BOOTSTRAP_SEED_OFFSET)
     if n_bootstrap >= 1:
         s = _bootstrap_counts(N, B, X.dtype, X.device, g)
     else:
@@ -1278,12 +1279,13 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         Xc = X[Y == cats[ci]]
         Nc = Xc.shape[0]
         # per-category seed; design notes: estimate_categorical, seeds
-        seed_c = seed + 997 * ci
+        seed_c = seed + _CATEGORY_SEED_STRIDE * ci
         # each category's selection runs on its own seed
         k_c, (w1, mu1, cov1) = _select_and_fit(Xc, selection,
                                                {**fit, 'seed': seed_c})
         k_bests.append(k_c)
-        g = torch.Generator(device=X.device).manual_seed(seed_c + 10_000)
+        g = torch.Generator(device=X.device).manual_seed(
+            seed_c + _BOOTSTRAP_SEED_OFFSET)
         if n_bootstrap >= 1:
             s = _bootstrap_counts(Nc, B, X.dtype, X.device, g)
         else:
