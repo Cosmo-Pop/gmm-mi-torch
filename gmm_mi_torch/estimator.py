@@ -650,23 +650,19 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         validation metric; 'sequential' is GMM-MI's original protocol
         (increment k, stop early via threshold and patience). See Notes.
     n_bootstrap : int, default=50
-        Bootstrap realisations for the errorbar, batched per `em_chunk`; more
-        give a smoother distribution and more reliable errorbars, at higher
-        cost. 0 skips the bootstrap (a single fit on the full data).
+        Bootstrap realisations for the errorbar, batched per `em_chunk`. 0
+        skips the bootstrap (a single fit on the full data).
     mc_samples : int, default=100_000
-        Number of Monte Carlo samples used to integrate the estimator for
-        each bootstrap replicate. Higher values reduce the MC contribution to
-        the error at linear cost in time.
+        Monte Carlo samples per bootstrap replicate for the integral; more
+        reduce the MC error, at linear cost in time.
     max_components : int, default=20
-        Largest number of GMM components considered in selection. The batched
-        protocol pays for all of them unconditionally, so keep this to a
-        plausible ceiling for the data.
+        Largest number of components considered. The batched protocol fits
+        them all, so keep this to a plausible ceiling for the data.
     n_folds : int, default=2
-        Number of cross-validation folds. Each fold should remain large
-        enough to be representative of the data.
+        Cross-validation folds; each should stay representative of the data.
     n_inits : int, default=3
-        Number of GMM initialisations per fold. Higher values reduce the
-        chance of a local optimum, at proportional cost (batched away on GPU).
+        Initialisations per fold; more reduce the chance of a local optimum,
+        at proportional cost (batched away on GPU).
     reg_covar : float, default=1e-6
         Constant added to every covariance diagonal to prevent singularities,
         relative to each variable's variance (the data are standardised; see
@@ -674,11 +670,9 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         regularise nothing.
     threshold_fit : float, default=1e-5
         EM convergence threshold on the change in mean per-sample
-        log-likelihood. Smaller values give more converged fits at the cost
-        of more EM iterations; equivalent to `tol` in sklearn GMMs.
+        log-likelihood (sklearn's `tol`).
     max_iter : int, default=500
-        Maximum EM iterations per fit. Convergence should normally be reached
-        via `threshold_fit` well before this.
+        Maximum EM iterations per fit.
     seed : int, default=0
         Seed controlling initialisations, CV splits, bootstrap resampling, MC
         integration and gaussianise's tie-breaking. Bitwise reproducible on
@@ -763,75 +757,33 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     Raises
     ------
     ValueError
-        Raised before any fitting.
-
-        Unknown options: `quantity`, `protocol`, `preprocess`, `tie_rank`,
-        `metric_method` (or any but 'valid' under protocol='sequential'),
-        `init_type`, or a string `em_chunk` or `mc_chunk` other than 'auto'.
-
-        Precision and device: a `dtype` other than float32/float64; a
-        `device` that is not 'cpu'/'cuda[:i]', is unavailable or is out of
-        range.
-
-        Data: `X` not 2-D, with the wrong number of columns, with NaN/inf
-        values, or not representable at `dtype` after standardisation;
-        preprocess='gaussianise' with a KL quantity.
-
-        Folds: n_folds < 2, more folds than samples, or a smallest training
-        fold of fewer than n_variables + 1 samples.
-
-        Counts and thresholds: n_bootstrap < 0 or > 2^20; |seed| > 2^62;
-        mc_samples, max_components, n_inits, max_iter,
-        fixed_components_number, patience, n_chunk, em_chunk or mc_chunk
-        below 1; reg_covar or threshold_fit not > 0; threshold_components
-        not >= 0.
+        An unknown option, an out-of-range count, threshold, dtype or device,
+        data of the wrong shape or with NaN/inf values, or folds too small for
+        the data; raised before any fitting. The full list: Notes.
     TypeError
         A non-integer count, seed, em_chunk or mc_chunk (numpy integers are
-        accepted), or a non-numeric threshold_fit. A non-numeric reg_covar or
-        threshold_components fails with Python's own comparison TypeError.
-        A non-numeric `scale` fails inside the initialisation with float()'s
-        own error (ValueError for a string, TypeError otherwise).
+        accepted), or a non-numeric threshold, reg_covar or `scale`.
     RuntimeError
-        On CUDA, when by the memory model not even one replicate of the
-        first (initialisation or EM) stage fits (set `n_chunk`); when no
-        candidate k yields a finite validation metric (degenerate folds or
-        data); when a covariance cannot be factorised even after escalating
-        regularisation (raise `reg_covar`, or use float64); or when a CUDA
-        out-of-memory error persists at one replicate per batch.
+        On CUDA, when not even one replicate fits in memory (set `n_chunk`) or
+        an out-of-memory error persists at one replicate per batch; when no
+        candidate k yields a finite validation metric; or when a covariance
+        cannot be factorised (raise `reg_covar`, or use float64).
 
     Warns
     -----
     RuntimeWarning
-        Once per call: fewer than 100 samples (a finite-sample bias the
-        errorbar does not include); under preprocess='gaussianise', columns
-        with more than 1% of their samples in tied blocks of three or more;
-        return_fit=True with preprocess='gaussianise' (the model lives in
-        rank-probit space); components of a requested
-        fixed_components_number that died in the CV fit.
-
-        Once per skipped k: protocol='sequential' met a non-finite
-        validation metric (k skipped without consuming patience).
-
-        Once per em_fit call (each CV fit, the aic/bic and return_fit
-        refits, the bootstrap), counting replicates: replicates that
-        exhausted `max_iter`; replicates finished on the centred legacy
-        kernels because a component collapsed beyond the GEMM kernels'
-        precision (expected for surplus components during selection at
-        float32). Once per validation-scoring call, likewise, for
-        replicates scored with the legacy kernels.
-
-        Once per halving: a CUDA out-of-memory error halved a stage's
-        replicate batch and retried.
-
-        Once per covariance factorisation that needs it, which can repeat
-        across EM iterations and stages, counting components: extra diagonal
-        regularisation; an all-zero or a non-finite covariance replaced
-        by the identity.
+        For a result that may need a look: fewer than 100 samples, tied data
+        or return_fit under gaussianise, components that died in a fixed-k
+        fit, a skipped k in the sequential protocol, replicates that hit
+        `max_iter` or finished on the legacy kernels, a CUDA out-of-memory
+        retry, or extra covariance regularisation. The full list, with how
+        often each is issued: Notes.
 
     Notes
     -----
-    On selection, standardisation, preprocessing, initialisation, memory and
-    reproducibility: docs/estimate_notes.md in the repository.
+    On selection, standardisation, preprocessing, initialisation, memory,
+    reproducibility, and the full lists of errors and warnings:
+    docs/estimate_notes.md in the repository.
     """
     X = torch.as_tensor(_as_array(X)).detach()
     if dtype not in (torch.float32, torch.float64):
@@ -1150,8 +1102,8 @@ def estimate_categorical(X, Y, protocol='batched', n_bootstrap=50,
         NaN/inf or missing (None/NaN) labels, or mixing label types that
         cannot be ordered; a smallest category too small for `n_folds` (as
         `estimate` checks X, with d = 1); an unknown `category_weights`; and
-        the argument errors listed for `estimate` that apply to this
-        signature.
+        those of `estimate`'s argument errors that apply to this signature
+        (full list: docs/estimate_notes.md, "Errors and warnings").
     TypeError
         As in `estimate`.
     RuntimeError
