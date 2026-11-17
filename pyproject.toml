@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
 authors = [
-    { name = "Hiranya Peiris", email = "hiranya.v.peiris@gmail.com" },
+    { name = "Hiranya Peiris", email = "hiranya.peiris@ast.cam.ac.uk" },
 ]
 dependencies = [
     "torch>=2.0",
