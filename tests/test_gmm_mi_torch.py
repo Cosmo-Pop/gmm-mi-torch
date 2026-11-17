@@ -3090,7 +3090,7 @@ def test_selection_masks_single_nonfinite_metric(monkeypatch):
                 return out
             out = out.clone()
             R = out.shape[0]
-            if R >= 6:            # batched: rows of k_bad (IF = 6 at I=3, F=2)
+            if R >= 6:      # batched: rows of k_bad (6 fits per k: I=3, F=2)
                 out[(k_bad - 1) * 6] = float('nan')
             return out
         return spy

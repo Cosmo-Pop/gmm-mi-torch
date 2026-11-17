@@ -23,7 +23,7 @@ constants: [docs/design_notes.md](../design_notes.md).
 
 ---
 
-<a href="../../gmm_mi_torch/estimator.py#L489"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L453"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>class</kbd> `FittedGMM`
 
@@ -50,7 +50,7 @@ supplies.
 | `w`, `mu`, `cov` | `torch.Tensor` | - | Weights (K,), means (K, d) and covariances (K, d, d). |
 | `chol` | `torch.Tensor of shape (K, d, d), optional` | `None` | Lower Cholesky factor of `cov`; computed (and repaired if needed) from `cov` when omitted. |
 
-<a href="../../gmm_mi_torch/estimator.py#L525"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L489"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ### <kbd>method</kbd> `sample`
 
@@ -73,7 +73,7 @@ Draw `n_samples` from the mixture.
 |--------------|------|-------------|
 | - | `numpy.ndarray of shape (n_samples, d)` | The samples, in the units of the fitted model. |
 
-<a href="../../gmm_mi_torch/estimator.py#L547"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L511"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ### <kbd>method</kbd> `score_samples`
 
@@ -101,7 +101,7 @@ the expected one.
 
 ---
 
-<a href="../../gmm_mi_torch/estimator.py#L619"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L583"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `estimate`
 
@@ -206,7 +206,7 @@ https://github.com/Cosmo-Pop/gmm-mi-torch/blob/main/docs/estimate_notes.md
 
 ---
 
-<a href="../../gmm_mi_torch/estimator.py#L940"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L904"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>class</kbd> `CategoryFit`
 
@@ -230,7 +230,7 @@ Bootstrap fits of one category in `estimate_categorical` (a tuple).
 
 ---
 
-<a href="../../gmm_mi_torch/estimator.py#L1016"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L980"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `estimate_categorical`
 

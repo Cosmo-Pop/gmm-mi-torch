@@ -386,14 +386,15 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
     _validate_folds(N, n_folds)
     train, val = _cv_masks(N, n_folds, n_inits, X.dtype,
                            seed=seed + _CV_MASK_SEED_OFFSET, device=X.device)
-    IF = n_inits * n_folds
-    R = max_components * IF
+    fits_per_k = n_inits * n_folds
+    R = max_components * fits_per_k
     # (K, I, F, N) views of the (F, N) masks: em_fit/val_ll gather one
     # (chunk, N) slice per replicate chunk, so the 2(K+1)*I*F*N*itemsize
     # of repeated masks is never materialised
     train_r = train.unsqueeze(0).expand(max_components, n_inits, n_folds, N)
     val_r = val.unsqueeze(0).expand(max_components, n_inits, n_folds, N)
-    active_k = torch.arange(1, max_components + 1, device=X.device).repeat_interleave(IF)
+    active_k = torch.arange(1, max_components + 1,
+                            device=X.device).repeat_interleave(fits_per_k)
     g = torch.Generator(device=X.device).manual_seed(seed)
     w0, mu0, cov0 = _init_params(X, max_components, R, reg_covar, generator=g,
                                  active_k=active_k, init_type=init_type,
@@ -430,7 +431,7 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
                                torch.full_like(vm, -torch.inf)).argmax(-1)
         best_f_k = v[torch.arange(max_components, device=v.device),
                      best_i_k].argmax(-1)
-        rk = torch.arange(max_components, device=X.device) * IF \
+        rk = torch.arange(max_components, device=X.device) * fits_per_k \
             + best_i_k * n_folds + best_f_k
         ones = torch.ones(1, N, dtype=X.dtype, device=X.device) \
             .expand(max_components, N)
@@ -458,6 +459,6 @@ def select_batched(X, max_components=20, n_folds=2, n_inits=3, threshold_compone
     v_k = v[k_best - 1]
     best_i = int(v_k.mean(-1).argmax())
     best_f = int(v_k[best_i].argmax())
-    r = (k_best - 1) * IF + best_i * n_folds + best_f
+    r = (k_best - 1) * fits_per_k + best_i * n_folds + best_f
     history = {k + 1: (metric_k[k].item(), None) for k in range(max_components)}
     return k_best, (w[r], mu[r], cov[r]), history

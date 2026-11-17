@@ -107,19 +107,7 @@ def _integrand_TC(pts, w, mu, cov, chol):
 
     log p(x) - sum_i log p(x_i).
 
-    Parameters
-    ----------
-    pts : torch.Tensor of shape (B, S, d)
-        Monte Carlo samples from each replicate's mixture.
-    w, mu, cov, chol : torch.Tensor
-        Mixture weights (B, K), means (B, K, d), covariances (B, K, d, d)
-        and their Cholesky factors.
-
-    Returns
-    -------
-    torch.Tensor of shape (B, S)
-        The integrand at each sample; its mean over S is the estimate, in
-        nats.
+    Arguments and result as for `_integrand_MI`.
     """
     joint = gmm_score(pts, w, mu, chol)
     marg = sum(marginal_score(pts, w, mu, cov, [i])
@@ -134,19 +122,7 @@ def _integrand_KL_forward(pts, w, mu, cov, chol):
     As in GMM-MI's estimate_KL_MC: E_{x~p(x)}[log p_x(x) - log p_y(x)], with x
     the first column of the joint samples.
 
-    Parameters
-    ----------
-    pts : torch.Tensor of shape (B, S, d)
-        Monte Carlo samples from each replicate's mixture.
-    w, mu, cov, chol : torch.Tensor
-        Mixture weights (B, K), means (B, K, d), covariances (B, K, d, d)
-        and their Cholesky factors.
-
-    Returns
-    -------
-    torch.Tensor of shape (B, S)
-        The integrand at each sample; its mean over S is the estimate, in
-        nats.
+    Arguments and result as for `_integrand_MI`.
     """
     x = pts[..., [0]]
     mu_x, cov_x = marginal_params(mu, cov, [0])
@@ -161,19 +137,7 @@ def _integrand_KL_reverse(pts, w, mu, cov, chol):
 
     E_{y~p(y)}[log p_y(y) - log p_x(y)].
 
-    Parameters
-    ----------
-    pts : torch.Tensor of shape (B, S, d)
-        Monte Carlo samples from each replicate's mixture.
-    w, mu, cov, chol : torch.Tensor
-        Mixture weights (B, K), means (B, K, d), covariances (B, K, d, d)
-        and their Cholesky factors.
-
-    Returns
-    -------
-    torch.Tensor of shape (B, S)
-        The integrand at each sample; its mean over S is the estimate, in
-        nats.
+    Arguments and result as for `_integrand_MI`.
     """
     y = pts[..., [1]]
     mu_x, cov_x = marginal_params(mu, cov, [0])
@@ -326,7 +290,7 @@ def _select_and_fit(X, selection, fit):
         (w, mu, cov) of the best CV fit, shapes (k,), (k, d), (k, d, d).
     """
     N, d = X.shape
-    IF = selection['n_inits'] * selection['n_folds']
+    fits_per_k = selection['n_inits'] * selection['n_folds']
     # compatibility rules before the fixed-k shortcut: a typo'd
     # metric_method must raise even when selection itself is skipped
     if selection['protocol'] == 'sequential':
@@ -337,12 +301,12 @@ def _select_and_fit(X, selection, fit):
         raise ValueError(f"metric_method must be one of 'valid', "
                          f"'aic', 'bic'; found '{selection['metric_method']}'")
     if selection['fixed_components_number'] is not None:
-        k_sel, r_sel = int(selection['fixed_components_number']), IF
+        k_sel, r_sel = int(selection['fixed_components_number']), fits_per_k
     elif selection['protocol'] == 'sequential':
-        k_sel, r_sel = selection['max_components'], IF
+        k_sel, r_sel = selection['max_components'], fits_per_k
     else:
         k_sel, r_sel = (selection['max_components'],
-                        selection['max_components'] * IF)
+                        selection['max_components'] * fits_per_k)
     em_chunk_sel = _resolve_chunk(
         fit['em_chunk'], r_sel,
         _em_bytes_per_replicate(N, k_sel, d, X.dtype, fit['n_chunk']),

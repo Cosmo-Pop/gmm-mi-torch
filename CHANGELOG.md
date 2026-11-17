@@ -6,7 +6,7 @@ as it stood at the tag `v0.11.2` (`git show v0.11.2:CHANGELOG.md`).
 
 ## Unreleased
 
-Documentation and docstrings only.
+Documentation, docstrings and one local variable's name only.
 
 - `docs/design_notes.md` uses the README's wording for three terms: the
   order of floating-point summation, data where two values of k score
@@ -22,6 +22,10 @@ Documentation and docstrings only.
   of floating-point summation" in place of "reduction order";
   `docs/api/em.md` is regenerated.
 - `docs/validation_summary.pdf` uses the same wording in its v0.2.0 item.
+- Names and docstrings, no behaviour change: the local variable `IF`
+  (`n_inits * n_folds`) is `fits_per_k`; three of the five integrand
+  functions refer to `_integrand_MI` for their arguments and result; the
+  design notes' Architecture section states the present layout only.
 
 ## 0.11.3 (2026-11-17)
 
