@@ -104,8 +104,8 @@ A(tbl(['Config', 'Result', 'Wall time'],
         '7 s']], widths=[210, 130, 80]))
 A(Paragraph(
     'The suite has since grown to 133 tests: at v0.10.2, 131 passed and 2 '
-    'skipped on CPU float64, and 132 passed and 1 skipped on CUDA float32 '
-    '(CHANGELOG.md).', BODY))
+    'skipped on CPU float64, and 132 passed and 1 skipped on CUDA '
+    'float32.', BODY))
 A(Paragraph(
     'Selected targets: analytic Gaussian MI under both selection protocols; '
     'pinned conditional-MI values for a dependent conditioner '
