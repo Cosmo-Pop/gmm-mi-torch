@@ -12,7 +12,7 @@ Given data `X` of shape `(n_samples, n_variables)`, `estimate` fits **one joint 
 - `'KL_forward'` / `'KL_reverse'` — KL divergence between the two 1-D marginals
 - `estimate_categorical(X, Y)` — MI between a continuous variable and a categorical one (a GMM per category), including the uniform-category-weight variant of Piras et al. (App. B)
 
-Errorbars come from a bootstrap: multinomial-count sample weights over `n_bootstrap` replicates, each warm-started from the selected fit, run as one batched EM.
+All quantities are returned in nats. Errorbars come from a bootstrap: multinomial-count sample weights over `n_bootstrap` replicates, each warm-started from the selected fit, run as one batched EM.
 
 ## Installation
 
@@ -26,7 +26,7 @@ conda activate gmm-mi-torch
 (or `python -m venv .venv && source .venv/bin/activate`). Then:
 
 ```bash
-git clone git@github.com:Cosmo-Pop/gmm-mi-torch.git
+git clone https://github.com/Cosmo-Pop/gmm-mi-torch.git
 cd gmm-mi-torch
 pip install .          # or: pip install -e ".[test]"
 ```
@@ -62,7 +62,7 @@ For a guided tour — including the common pitfalls (thresholds, initialisations
 
 ## Performance
 
-Benchmarked on an NVIDIA GB10 (DGX Spark) against the sklearn-based GMM-MI reference on a 3-component bivariate mixture (N=20 000, `max_components=8`, 50 bootstrap realisations); gmm-mi-torch numbers are v0.2.1 with default (`'auto'`) chunks. A distilled summary of the whole validation and benchmark campaign — correctness, fp32, calibration, performance, large-N scaling, known limitations — is in [docs/validation_summary.pdf](docs/validation_summary.pdf); full tables in [validation/gb10_report.md](validation/gb10_report.md) and the `validation/sweep_*` files:
+Benchmarked on an NVIDIA GB10 (DGX Spark) against the sklearn-based GMM-MI reference on a 3-component bivariate mixture (N=20 000, `max_components=8`, 50 bootstrap realisations); the gmm-mi-torch timings were measured at v0.2.1 with the default (`'auto'`) batch sizes. A distilled summary of the whole validation and benchmark campaign — correctness, fp32, calibration, performance, large-N scaling, known limitations — is in [docs/validation_summary.pdf](docs/validation_summary.pdf); full tables in [validation/gb10_report.md](validation/gb10_report.md) and the `validation/sweep_*` files:
 
 | Config | model selection | bootstrap |
 |---|---|---|
@@ -70,25 +70,25 @@ Benchmarked on an NVIDIA GB10 (DGX Spark) against the sklearn-based GMM-MI refer
 | gmm-mi-torch, CPU fp64 | 2.0 s | 0.9 s |
 | gmm-mi-torch, CUDA fp32 | **0.21 s** | **0.13 s** |
 
-On real data at production scale (beta test, October 2026): a 75-pair MI grid between VAE latents and galaxy properties, N = 30,000, `max_components=20`, 100 bootstrap realisations per pair — GMM-MI on 16 CPU cores: 53 min wall-clock; gmm-mi-torch on one A100: 7.5 min at float32, **5.1 min at float64** (114–168× less compute), with MI agreeing everywhere except the usual ≥2σ scatter at MI ≈ 0 and bootstrap errorbars matching to ~10%. On data-centre GPUs float64 is the faster dtype; the GB10-class caveat below is about rate-limited-fp64 hardware only.
+On real data at production scale (beta test, October 2026): a 75-pair MI grid between VAE latents and galaxy properties, N = 30,000, `max_components=20`, 100 bootstrap realisations per pair — GMM-MI on 16 CPU cores: 53 min wall-clock; gmm-mi-torch on one A100: 7.5 min at float32, **5.1 min at float64** (114–168× less, counting CPU-core-minutes against GPU-minutes). The two codes' MI values differ by 2σ or more only at MI ≈ 0, where both carry the estimator's positive finite-sample bias, and their bootstrap errorbars match to ~10%. On data-centre GPUs float64 is the faster dtype; the GB10-class caveat below is about rate-limited-fp64 hardware only.
 
-Since v0.2.0 the EM inner loop evaluates Gaussian log-densities and M-step moments as matrix products against per-sample quadratic features — a GMM log-density is a quadratic form in the sample, so scoring N samples against K components is one matrix multiplication, and the M-step moments are the transposed one; see [Machlica, Vaněk & Zajíc (2011)](https://ieeexplore.ieee.org/document/6118944) for the formulation. The numerical safeguards follow [Chan, Golub & LeVeque (1983)](https://www.tandfonline.com/doi/abs/10.1080/00031305.1983.10483115); they are described in [docs/design_notes.md](docs/design_notes.md) ("GEMM-formulated EM kernels").
+The EM inner loop evaluates Gaussian log-densities and M-step moments as matrix products (GEMM, general matrix multiply) against per-sample quadratic features — a GMM log-density is a quadratic form in the sample, so scoring N samples against K components is one matrix multiplication, and the M-step moments are the transposed one; see [Machlica, Vaněk & Zajíc (2011)](https://ieeexplore.ieee.org/document/6118944) for the formulation. The numerical safeguards follow [Chan, Golub & LeVeque (1983)](https://www.tandfonline.com/doi/abs/10.1080/00031305.1983.10483115); they are described in [docs/design_notes.md](docs/design_notes.md) ("GEMM-formulated EM kernels").
 
-This is several times faster than the previous broadcast kernels on both CPU and GPU at identical (float64 reduction-order) results; set `GMM_MI_TORCH_EM_KERNEL=legacy` to fall back to the previous kernels. Inputs are standardised internally (estimates are invariant; fitted models are returned in original units), which also removes float32 factorisation failures on unstandardised data.
+A second implementation of the EM step, which subtracts each component's mean from the samples before evaluating the quadratic form, is selected with `GMM_MI_TORCH_EM_KERNEL=legacy`; the warnings and the design notes call it the legacy kernels. The default kernels are roughly 3× faster per EM iteration on GPU and 2× on CPU (measured at v0.2.0), and at float64 the two give the same results up to the order of floating-point summation. Inputs are standardised internally (estimates are invariant; fitted models are returned in original units), which also removes float32 factorisation failures on unstandardised data.
 
 ### Replicate batches and reproducibility
 
-- The replicate batches `em_chunk` and `mc_chunk` default to `'auto'`. On CPU `'auto'` keeps the previous default of 8.
+- The replicate batches `em_chunk` and `mc_chunk` default to `'auto'`. On CPU `'auto'` is 8 replicates per batch.
 - On CUDA each stage's batch is sized to fill half of the free device memory (torch's cached blocks included) from per-stage peak-memory models measured on the GB10 (`validation/bench_mem_models.py`; the models are tabulated in [docs/design_notes.md](docs/design_notes.md)).
-- The batch is capped by `torch.cuda.set_per_process_memory_fraction` when one is set. There is no replicate floor (the 32-replicate floor of earlier versions only ever bound when memory was tight, exactly where it over-requested).
+- The batch is capped by `torch.cuda.set_per_process_memory_fraction` when one is set. There is no minimum batch size.
 - A CUDA out-of-memory error halves the batch and retries, with a `CUDA out of memory; retrying with chunk=...` RuntimeWarning.
 - The Monte-Carlo samples are independent of `mc_chunk` by construction: each bootstrap replicate draws them from its own seeded stream, so out-of-memory retries cannot shift them either.
-- Results are independent of `em_chunk` and `mc_chunk` bitwise on CPU at float64; at float32 on CPU also bitwise except `em_chunk=1` with a one-component model, where the M-step's single-row tail product takes a different BLAS path (3e-8 in a measured MI). On CUDA either chunk changes the matmul summation order, so same-seed runs agree to floating-point noise only with both pinned to integers AND no out-of-memory retry (the retry halves the batch regardless of pinning, so a run's chunk can depend on the memory free at the time).
-- At float32 that noise can move the selected k on knife-edge data (k=5 vs 6, MI 0.4741 vs 0.4745 against an errorbar of 0.008 in a measured example); at float64 the differences stay at reduction-order level (1e-14 to 1e-12 in the fitted means in two measured cases). A CPU run is the bit-reproducible setting (with that one float32 exception).
+- Results are independent of `em_chunk` and `mc_chunk` bitwise on CPU at float64; at float32 on CPU also bitwise except `em_chunk=1` with a one-component model, where the M-step's single-row tail product takes a different BLAS path (3e-8 in a measured MI). On CUDA either chunk changes the matmul summation order, so same-seed runs agree only to floating-point rounding unless both are set to integers and no out-of-memory retry occurs (the retry halves the batch whatever the setting, so a run's batch can depend on the memory free at the time).
+- At float32 that rounding can change the selected k on data where two values of k score almost equally (k=5 vs 6, MI 0.4741 vs 0.4745 against an errorbar of 0.008 in a measured example); at float64 the differences stay at the level set by the order of summation (1e-14 to 1e-12 in the fitted means in two measured cases). A CPU run is the bit-reproducible setting (with that one float32 exception).
 
 ### Large N and the choice of dtype
 
-Sample-dimension chunking (`n_chunk`) extends the reachable scale to N=10⁸, d=8 (total correlation in 23 min / 77.5 GiB at fp32 on 128 GB unified memory, measured at v0.2.x; that run's peak was set by the bootstrap-count construction and the repeated CV masks, which the v0.5.0 memory pass removed — see CHANGELOG — and has not been re-measured at N=10⁸).
+Sample-dimension chunking (`n_chunk`) extends the reachable scale to N=10⁸, d=8 (total correlation in 23 min / 77.5 GiB at fp32 on 128 GB unified memory, measured at v0.2.x; v0.5.0 removed the two allocations that set that run's peak, the construction of the bootstrap counts and the repeated CV masks, and the run has not been repeated at N=10⁸ since).
 
 On GPUs with rate-limited fp64 throughput (e.g. GB10), CUDA fp64 is slower than CPU fp64 — use fp32 on such devices (validated: the full test suite passes at fp32). On data-centre GPUs with full-rate fp64 (A100/H100/GH200 class), float64 costs only ~1.4x float32 end-to-end and avoids all reduced-precision caveats — prefer it there, especially for near-zero MI or spike-like marginals.
 
@@ -145,7 +145,7 @@ This is also available as a runnable file: [`examples/mi_grid_multigpu.py`](exam
 - It must be run as a script (`python examples/mi_grid_multigpu.py`): the `spawn` start method re-imports the file in each worker, so pasting the code into a notebook or an interactive Python/IPython session fails with `AttributeError: Can't get attribute ... on <module '__main__'>` followed by `BrokenProcessPool`.
 - The `spawn` start method and the environment variable set in the initializer matter — CUDA contexts do not survive `fork`, and a worker must be pinned to its GPU before the first CUDA call.
 - On one GPU this pool degenerates to a single worker and buys nothing over a plain loop; leave `max_workers` at the GPU count, never higher (an `estimate()` call already fills its GPU, so extra workers would only contend for the same devices).
-- Use processes, not threads: the float32 matmul-precision pin is process-global (see Known limitations).
+- Use processes, not threads: the float32 precision setting each call makes is process-wide (see Known limitations).
 
 ## Documentation
 
@@ -169,10 +169,10 @@ Mechanisms and measurements for each are in [docs/design_notes.md](docs/design_n
 
 - **Finite-sample bias.** GMM MI estimates carry a positive finite-sample bias that the bootstrap errorbar does not include; below 100 samples (per dataset, or per category) the estimator warns.
 - **Heavily tied or zero-inflated data.** No tie convention makes the GMM fit of heavily tied data reliable; `preprocess='none'` is the more reliable choice there (under `'gaussianise'`, random tie-ranks bias the estimate low when ties are shared between columns).
-- **Bootstrap resample on CUDA.** For N ≤ 2^24 torch's CUDA multinomial has float32 resolution: a fixed per-sample weight scatter of 0.02 at N=1e6 rising to ~0.24 near N=1e7, no regional tilt (the CPU resample has none). Above N=2^24 the index draw is a float64 uniform on both devices (bias below 3e-8 at N=1e8, no regional structure).
-- **CUDA reproducibility.** Same-seed CUDA runs agree only to floating-point noise unless `em_chunk` and `mc_chunk` are pinned and no out-of-memory retry occurs; at float32 the selected k can move on knife-edge data (see above).
+- **Bootstrap resample on CUDA.** For N ≤ 2^24 torch's CUDA multinomial has float32 resolution, so each sample's resampling weight carries a fixed factor, the same in every replicate, whose standard deviation about 1 is 0.02 at N=1e6, rising to ~0.24 near N=1e7. The factor does not depend systematically on a sample's position in the array, and its effect is a fixed shift of the bootstrap mean of order that standard deviation times one standard error; the CPU resample has no such factor. Above N=2^24 the index draw is a float64 uniform on both devices (bias below 3e-8 at N=1e8, with no dependence on position in the array).
+- **CUDA reproducibility.** Same-seed CUDA runs agree only to floating-point rounding unless `em_chunk` and `mc_chunk` are set to integers and no out-of-memory retry occurs; at float32 the selected k can change on data where two values of k score almost equally (see above).
 - **Per-replicate seeds on CPU.** CPU generators keep 32 bits of each per-replicate seed, so two replicates of one call share a stream with probability R(R−1)/2^33 (1.7e-6 at the default 120 replicates).
-- **Threads.** The float32 matmul-precision pin is process-global, not thread-local: run parallel estimates in processes, not threads.
+- **Threads.** For the duration of each call the package sets torch's float32 matrix-multiplication precision to full IEEE precision (TF32 off) and restores the caller's setting afterwards. That setting is process-wide, not per thread: run parallel estimates in processes, not threads.
 - **Categorical errorbars.** `estimate_categorical` holds the category proportions fixed across bootstrap replicates, so its errorbar excludes their multinomial sampling uncertainty (negligible except at small N with extreme imbalance).
 
 ## Tests
@@ -183,12 +183,12 @@ pytest                                                    # CPU, float64
 GMM_MI_DEVICE=cuda GMM_MI_DTYPE=float32 GMM_MI_EM_CHUNK=1000 pytest   # GPU, float32
 ```
 
-The suite checks analytic Gaussian targets, Monte-Carlo/quadrature targets for multimodal and non-Gaussian cases, chunking parity, categorical MI, and error paths. `tests/conftest.py` routes the whole suite to a device/dtype via the `GMM_MI_*` environment variables; tests that call internals directly ignore the variables (most run on CPU at float64, while a few precision guards build float32 — and, for the TF32 pin, CUDA — tensors).
+The suite checks analytic Gaussian targets, Monte-Carlo/quadrature targets for multimodal and non-Gaussian cases, chunking parity, categorical MI, and error paths. `tests/conftest.py` routes the whole suite to a device/dtype via the `GMM_MI_*` environment variables; tests that call internals directly ignore the variables (most run on CPU at float64, while a few tests of numerical precision build float32 tensors, and the test of the float32 precision setting builds CUDA ones).
 
 - Two tests are gated: the bootstrap-errorbar coverage calibration over 40 independent datasets (slow; runs under `GMM_MI_OFFLINE=1`) and the full-strength float32 spike-pair regression (runs when `GMM_MI_DEVICE=cuda` or `GMM_MI_OFFLINE=1`); a default CPU run skips both.
-- Nine further tests need a CUDA device and skip on a CPU-only host, so a green CPU-only run has not exercised them: the measured-peak pins of the memory passes (`test_init_draw_is_chunked_on_device`, `test_moment_gemm_peak_on_device`, `test_categorical_mc_peak_independent_of_categories`, `test_streamed_path_holds_no_full_weight_copies`, `test_val_ll_streams_rerouted_replicates`'s peak half, `test_streamed_init_peak_under_model`), the TF32 pin (`test_full_precision_tf32_gemm_result_cuda`), the default-device test (`test_cv_masks_survive_default_device`) and the init hopeless-case guard (`test_init_hopeless_case_raises_readably`).
+- Nine further tests need a CUDA device and skip on a CPU-only host, so a green CPU-only run has not exercised them: the measured-peak pins of the memory passes (`test_init_draw_is_chunked_on_device`, `test_moment_gemm_peak_on_device`, `test_categorical_mc_peak_independent_of_categories`, `test_streamed_path_holds_no_full_weight_copies`, `test_val_ll_streams_rerouted_replicates`'s peak half, `test_streamed_init_peak_under_model`), the float32 precision setting (`test_full_precision_tf32_gemm_result_cuda`), the default-device test (`test_cv_masks_survive_default_device`) and the error raised when not even one replicate's initialisation fits in memory (`test_init_hopeless_case_raises_readably`).
 
-For most readers, [docs/validation_summary.pdf](docs/validation_summary.pdf) is the right entry point to the validation results. The [validation/](validation/) directory additionally contains the full working report from the port's GB10 acceptance run ([validation/README.md](validation/README.md) explains its contents and provenance), kept in the repository for team review while it is private.
+For most readers, [docs/validation_summary.pdf](docs/validation_summary.pdf) is the right entry point to the validation results. The [validation/](validation/) directory holds the full working report from the port's GB10 acceptance run and the benchmark scripts behind it ([validation/README.md](validation/README.md) explains its contents and provenance).
 
 ## Acknowledgements
 
