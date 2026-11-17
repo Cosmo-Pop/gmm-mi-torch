@@ -62,7 +62,7 @@ on CUDA see `em_chunk`.
 
 ### Warns
 
-- `RuntimeWarning`: Once per call for replicates that exhausted `max_iter` without meeting `threshold_fit` (their last iterates are returned), and once for replicates finished on the centred legacy kernels because a component collapsed beyond the GEMM kernels' precision. Covariance factorisation also warns when a component needed extra diagonal regularisation, or when an all-zero or non-finite covariance was replaced by the identity.
+- `RuntimeWarning`: Once per call for replicates that exhausted `max_iter` without meeting `threshold_fit` (their last iterates are returned), and once for replicates finished on the centred legacy kernels because a component was too narrow for the default kernels' precision. Covariance factorisation also warns when a component needed extra diagonal regularisation, or when an all-zero or non-finite covariance was replaced by the identity.
 
 ---
 
@@ -128,7 +128,7 @@ Weighted mean per-sample log-likelihood of X under each replicate.
 
 ### Warns
 
-- `RuntimeWarning`: Once per call for replicates scored with the centred legacy kernels because a component collapsed beyond the GEMM kernels' precision; and, as in `em_fit`, from covariance factorisation (extra diagonal regularisation; all-zero or non-finite covariance replaced by the identity).
+- `RuntimeWarning`: Once per call for replicates scored with the centred legacy kernels because a component was too narrow for the default kernels' precision; and, as in `em_fit`, from covariance factorisation (extra diagonal regularisation; all-zero or non-finite covariance replaced by the identity).
 
 ---
 

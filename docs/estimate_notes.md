@@ -179,7 +179,7 @@ run's output can be read:
 - Once per em_fit call (each CV fit, the aic/bic and return_fit
   refits, the bootstrap), counting replicates: replicates that
   exhausted `max_iter`; replicates finished on the centred legacy
-  kernels because a component collapsed beyond the GEMM kernels'
+  kernels because a component was too narrow for the default kernels'
   precision (expected for surplus components during selection at
   float32). Once per validation-scoring call, likewise, for
   replicates scored with the legacy kernels.
