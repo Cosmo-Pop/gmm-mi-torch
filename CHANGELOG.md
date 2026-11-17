@@ -4,6 +4,31 @@ For each release: what changed for a user, and whether results at a fixed
 seed change. The record of how each release was verified is in this file
 as it stood at the tag `v0.11.2` (`git show v0.11.2:CHANGELOG.md`).
 
+## 0.11.3 (2026-11-17)
+
+Documentation, and the wording of two warnings and one error. Fixed-seed
+results are unchanged.
+
+- The two warnings issued when replicates are finished or scored with the
+  legacy kernels, and the error raised when not even one replicate fits in
+  GPU memory, now explain their terms. A warnings filter that matches the
+  old wording no longer matches; the phrase "legacy kernels" is kept.
+- README: current behaviour in place of version history, terms defined,
+  units stated, an HTTPS clone address, and a Known limitations item on
+  one-dimensional CUDA fits under torch 2.13 without the Python development
+  headers.
+- `docs/estimate_notes.md` and `docs/design_notes.md` are revised for a
+  reader outside the project: the memory models are a table, sentence
+  fragments are sentences, and the design notes gain a section on torch
+  2.13.
+- This changelog is rewritten: per release, what changed for a user and
+  whether fixed-seed results change.
+- `docs/validation_summary.pdf` states the present size of the test suite
+  and which of its statements hold for earlier versions only.
+- `estimate`'s docstring gives the URL of `docs/estimate_notes.md`; the
+  author's contact in `pyproject.toml` is the professional address;
+  `validation/briefs/` is removed.
+
 ## 0.11.2 (2026-11-13)
 
 Documentation only. The API pages move to `docs/api/`; links to the old
