@@ -64,9 +64,9 @@ A = story.append
 A(Paragraph('gmm-mi-torch: validation and benchmark summary', TITLE))
 A(Paragraph('Distilled from the GB10 acceptance campaign, July 2026, '
             'with post-campaign updates through October 2026 (Section 9). '
-            'The full working logs, task-scoped diffs and bench scripts '
-            'of the campaign are archived by the maintainers and '
-            'available on request.', SUB))
+            'The full working report and the bench scripts of the '
+            'campaign are in the validation/ directory of the '
+            'repository.', SUB))
 
 A(Paragraph('1. What was validated', H1))
 A(Paragraph(
@@ -92,15 +92,20 @@ A(Paragraph(
 
 A(Paragraph('2. Correctness: test suite', H1))
 A(Paragraph(
-    'The suite holds 25 tests (24 in CI plus one offline-gated statistical '
-    'test) in GMM-MI\'s own test style: ground-truth targets asserted within '
-    '3-sigma bootstrap bands. A conftest shim routes the unchanged suite to '
-    'any device/dtype via environment variables. Every release gate in the '
-    'campaign required the full suite green on both production configs:', BODY))
+    'At the time of the campaign the suite held 25 tests (24 run by default '
+    'plus one offline-gated statistical test) in GMM-MI\'s own test style: '
+    'ground-truth targets asserted within 3-sigma bootstrap bands. A '
+    'conftest shim routes the unchanged suite to any device/dtype via '
+    'environment variables. Every release in the campaign required the '
+    'full suite to pass on both production configs:', BODY))
 A(tbl(['Config', 'Result', 'Wall time'],
       [['CPU float64 (parity baseline)', '24 passed, 1 skipped', '51 s'],
        ['CUDA float32, em_chunk=1000 (full batch)', '24 passed, 1 skipped',
         '7 s']], widths=[210, 130, 80]))
+A(Paragraph(
+    'The suite has since grown to 133 tests: at v0.10.2, 131 passed and 2 '
+    'skipped on CPU float64, and 132 passed and 1 skipped on CUDA float32 '
+    '(CHANGELOG.md).', BODY))
 A(Paragraph(
     'Selected targets: analytic Gaussian MI under both selection protocols; '
     'pinned conditional-MI values for a dependent conditioner '
@@ -280,6 +285,11 @@ for item in [
     'N = 30,000): 53 min on 16 CPU cores vs 7.5 min (fp32) / 5.1 min '
     '(fp64) on one A100 - 114-168x less compute, with float64 the faster '
     'dtype on that hardware.',
+    'Since v0.2.1: releases v0.3.0 to v0.11.2 are described in CHANGELOG.md, '
+    'not here. Two statements above hold for earlier versions only: the '
+    'automatic batch no longer has a minimum of 32 replicates, and on CUDA '
+    'results now depend on the batch size at the level of floating-point '
+    'rounding (README).',
 ]:
     A(Paragraph(item, BULL, bulletText='-'))
 

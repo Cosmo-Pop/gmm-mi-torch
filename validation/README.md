@@ -1,9 +1,7 @@
 # Validation artifacts (GB10 acceptance run)
 
 Verbatim artifacts from the port's validation and benchmarking on an NVIDIA GB10
-(DGX Spark, 128 GB unified memory, torch 2.11.0+cu128), July 2026. Kept in the
-repository for team review while it is private; this directory can be pruned or
-moved before a public release.
+(DGX Spark, 128 GB unified memory, torch 2.11.0+cu128), July 2026.
 
 At the time these were produced the module was a flat file named
 `torch_gmm_mi.py` (its contents now live in `gmm_mi_torch/estimator.py`) and
