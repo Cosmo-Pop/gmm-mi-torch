@@ -4,6 +4,17 @@ For each release: what changed for a user, and whether results at a fixed
 seed change. The record of how each release was verified is in this file
 as it stood at the tag `v0.11.2` (`git show v0.11.2:CHANGELOG.md`).
 
+## Unreleased
+
+Documentation only.
+
+- `docs/design_notes.md` uses the README's wording for three terms: the
+  order of floating-point summation, data where two values of k score
+  almost equally, and no systematic dependence on a sample's position in
+  the array.
+- `validation/gb10_report.md` opens with a note that the briefs it refers
+  to are not kept in the repository.
+
 ## 0.11.3 (2026-11-17)
 
 Documentation, and the wording of two warnings and one error. Fixed-seed

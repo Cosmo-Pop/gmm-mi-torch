@@ -158,7 +158,8 @@ call; above it, from per-replicate float64-uniform index draws floor(u N).
   torch.multinomial's kernel draws float32 uniforms even for a float64 row,
   so each sample's inclusion weight carries a fixed, replicate-independent
   factor set by how many 2^-24 grid points its 1/N interval holds — no
-  regional tilt (index-band means within 4e-4 of 1), but a per-sample weight
+  systematic dependence on a sample's position in the array (index-band
+  means within 4e-4 of 1), but a per-sample weight
   scatter sd(w) of 0.019 at N=1e6, 0.043 at 2e6, 0.073 at 4e6, 0.113 at 8e6,
   peaking ~0.24 near N ~ 1.1e7 and vanishing at exactly 2^24 (closed form:
   per float32 binade k with m_k = 2^(24+k)/N grid points per interval,
@@ -172,7 +173,8 @@ call; above it, from per-replicate float64-uniform index draws floor(u N).
   0.7.0; see CHANGELOG) is uniform to ≤ N/2^53 on CPU, whose uniforms lie on
   the 2^-53 grid, and to ≤ N/2^52 on CUDA, where the kernel's half-step
   values above 0.5 round to even onto the 2^-52 grid (measured at torch
-  2.11): 2.2e-8 at N=1e8, with no regional structure.
+  2.11): 2.2e-8 at N=1e8, with no systematic dependence on a sample's
+  position in the array.
 - **The clamp.** The clamp to N - 1 guards only a kernel returning u = 1.0 (torch reflects it to 0.0 today),
   which would otherwise raise in scatter_add_: for every float64 u < 1 and
   N ≤ 2^53, floor(fl(u N)) ≤ N - 1, since the deficit N 2^-53 is at least
@@ -217,15 +219,18 @@ Fixed-seed results are bitwise reproducible on CPU at float64 whatever the
 chunking; at float32 on CPU also bitwise except em_chunk=1 with a
 one-component model, where the M-step's single-row tail product takes a
 different BLAS path (3e-8 in a measured MI; details below). On CUDA the
-replicate chunk `em_chunk` changes the matmul reduction order:
+replicate chunk `em_chunk` changes the order of summation inside the
+matrix products:
 
 - At float32 the blocked M-step folds the batch's replicates into one GEMM,
   whose summation order follows the batch size, so the chunk — including an
   out-of-memory retry, which pinning em_chunk does not prevent — moves
-  results at reduction order, and on knife-edge data that can move the
-  selected k (measured: k=5 vs 6, MI 0.4741 vs 0.4745 against an errorbar of
+  results through the order of floating-point summation, and on data where
+  two values of k score almost equally that can move the selected k
+  (measured: k=5 vs 6, MI 0.4741 vs 0.4745 against an errorbar of
   0.008).
-- At float64 the chunk also moves results, at the reduction-order level
+- At float64 the chunk also moves results, at the level set by the order
+  of floating-point summation
   (2026-10-24, v0.7.0, torch 2.11, two probes): an em_fit of 24 bootstrap
   replicates (N=40,000, d=2, K=6, 50 iterations) gave fitted means
   differing by 8.3e-14 between em_chunk=24 and 7 (8.1e-14 for 3), against
@@ -239,7 +244,8 @@ replicate chunk `em_chunk` changes the matmul reduction order:
   (its draw is chunk-invariant by construction); an estimate with em_chunk
   pinned at 4 and mc_chunk 10, 3 or 1 gave standard deviations differing by
   5e-18 to 2e-17 at float64 and means by 3.0e-8 at float32 — the MC
-  samples are identical, the integrand's reduction order is not. CPU was
+  samples are identical, the order of summation in the integrand is not.
+  CPU was
   bitwise throughout in these probes.
 - The CPU float32 exception (measured 2026-10-24, at v0.7.1): with a one-component model and em_chunk=1,
   `_moment_gemm`'s tail term (the N % 512 samples after the last full
@@ -305,7 +311,8 @@ means "GEMM-formulated EM kernels" below.
 EM kernel implementation. 'gemm' evaluates the Gaussian log-densities
 and the M-step moments as matrix products against per-sample quadratic
 features (see the kernel section below); 'legacy' selects the previous
-broadcast kernels. The two agree at reduction-order precision wherever
+broadcast kernels. The two agree up to the order of floating-point
+summation wherever
 the GEMM cancellation residue is below the reg_covar floor (reg_covar >=
 ~1e-13 at float64; at float32, standardised data with the reroute
 guarding collapsed components — see the kernel section). A typo must

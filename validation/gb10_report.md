@@ -1,5 +1,7 @@
 # GB10 report: GPU benchmark and fp32 validation of `torch_gmm_mi`
 
+*Note added in November 2026: "the brief" and "the extensions brief" in this report are the two task descriptions the work responded to. They are not kept in the repository. The report is otherwise as written.*
+
 **Date:** 2026-07-04
 **Machine:** NVIDIA GB10 (DGX Spark), driver 580.126.09, CUDA 13.0, ~128 GB unified memory
 **Stack:** torch 2.11.0+cu128, numpy 2.4.4, scipy 1.17.1, pytest 9.1.1, Python 3.12.3
