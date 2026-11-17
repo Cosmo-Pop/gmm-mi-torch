@@ -261,8 +261,9 @@ class _WeightChunks:
     weight sums accumulated over sample chunks at float64, cached. Row
     indices are absolute within the slice. The float64 total of per-chunk
     working-dtype sums is bitwise the full-row sum for the module's own
-    weights (0/1 masks, resample counts, ones) and reduction-order for
-    real-valued weights passed directly to em_fit/val_ll.
+    weights (0/1 masks, resample counts, ones), and agrees with it up to
+    the order of floating-point summation for real-valued weights passed
+    directly to em_fit/val_ll.
 
     Parameters
     ----------
@@ -373,7 +374,7 @@ def _run_chunked(n, chunk, fn):
     halves the chunk and retries. Results do not depend on the chunk on CPU
     (bitwise, with one float32 exception: see docs/estimate_notes.md,
     "Reproducibility"), so there the retry changes only peak memory; on CUDA
-    they move at reduction order.
+    they change only through the order of floating-point summation.
 
     Parameters
     ----------

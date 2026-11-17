@@ -19,8 +19,6 @@ of the versions stated there.
   (init types, gaussianise preprocessing, AIC/BIC selection, marginal KL,
   categorical MI, chunking), sample-dimension chunking to N=10⁸, the polished
   module's parameter renames, and the extended 24-test suite.
-- `changes.diff` — task-scoped diff of the final Part-6 changes (extended test
-  suite + one module seam) against the shipped Part-5 baseline.
 - `bench.py`, `bench_scale.py`, `bench_nchunk.py` — benchmark scripts behind
   the report's timing/memory tables.
 - `time_cpu.txt`, `time_cuda.txt` — `/usr/bin/time -v` logs of the final full

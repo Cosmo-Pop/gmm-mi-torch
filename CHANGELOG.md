@@ -6,7 +6,7 @@ as it stood at the tag `v0.11.2` (`git show v0.11.2:CHANGELOG.md`).
 
 ## Unreleased
 
-Documentation only.
+Documentation and docstrings only.
 
 - `docs/design_notes.md` uses the README's wording for three terms: the
   order of floating-point summation, data where two values of k score
@@ -14,6 +14,13 @@ Documentation only.
   the array.
 - `validation/gb10_report.md` opens with a note that the briefs it refers
   to are not kept in the repository.
+- `validation/changes.diff` is removed: it is a diff between two files
+  that are not in the repository. `validation/README.md` no longer lists
+  it, the report's note says so, and the report's one link to it is plain
+  text.
+- `val_ll`'s `em_chunk` entry and three private docstrings say "the order
+  of floating-point summation" in place of "reduction order";
+  `docs/api/em.md` is regenerated.
 
 ## 0.11.3 (2026-11-17)
 

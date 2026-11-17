@@ -721,9 +721,9 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
     default init seeds one generator per replicate from `generator` and
     draws in fixed blocks of _INIT_DRAW_BLOCK samples, so the draw is the
     same for every em_chunk and n_chunk on every device. The statistics
-    computed from it are bitwise chunk-invariant on CPU and move at
-    reduction order on CUDA, and the streamed moments agree with the
-    single pass at reduction order.
+    computed from it are bitwise chunk-invariant on CPU and change only
+    through the order of floating-point summation on CUDA, and the
+    streamed moments agree with the single pass up to that order.
 
     Parameters
     ----------
@@ -1518,7 +1518,7 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None, em_chunk=None):
         Replicates scored per batch, under the same halve-and-retry CUDA
         out-of-memory guard as `em_fit`. None scores all replicates in one
         batch. Results do not depend on it on CPU (bitwise); on CUDA they
-        move at reduction order.
+        change only through the order of floating-point summation.
 
     Returns
     -------

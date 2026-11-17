@@ -1,6 +1,6 @@
 # GB10 report: GPU benchmark and fp32 validation of `torch_gmm_mi`
 
-*Note added in November 2026: "the brief" and "the extensions brief" in this report are the two task descriptions the work responded to. They are not kept in the repository. The report is otherwise as written.*
+*Note added in November 2026: "the brief" and "the extensions brief" in this report are the two task descriptions the work responded to, and `changes.diff` is a diff between two versions of the flat-file module of July 2026. Neither the briefs nor the diff are kept in the repository. The report is otherwise as written, except that its one link to the diff is now plain text.*
 
 **Date:** 2026-07-04
 **Machine:** NVIDIA GB10 (DGX Spark), driver 580.126.09, CUDA 13.0, ~128 GB unified memory
@@ -221,7 +221,7 @@ TC values bit-identical to Part 1 in every config. `chunk` is now a clean speed/
 
 ## 9. Files
 
-[changes.diff](changes.diff) is the cumulative diff (Parts 1+2) of `torch_gmm_mi.py` and `test_torch_gmm_mi.py` against the pristine originals; `torch_gmm_mi_orig.py` is the pristine module. `conftest.py` additionally gained `GMM_MI_EM_CHUNK` routing and now wraps `estimate_categorical` as well.
+`changes.diff` is the cumulative diff (Parts 1+2) of `torch_gmm_mi.py` and `test_torch_gmm_mi.py` against the pristine originals; `torch_gmm_mi_orig.py` is the pristine module. `conftest.py` additionally gained `GMM_MI_EM_CHUNK` routing and now wraps `estimate_categorical` as well.
 
 ---
 

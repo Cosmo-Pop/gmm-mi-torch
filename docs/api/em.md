@@ -114,7 +114,7 @@ Weighted mean per-sample log-likelihood of X under each replicate.
 | `s_val` | `torch.Tensor of shape (n_replicates, n_samples)` | - | Non-negative weights selecting (and weighting) the scored samples; the replicate axis may span several leading dims, as in `em_fit`. |
 | `w`, `mu`, `cov` | `torch.Tensor` | - | Mixture parameters, shapes (R, K), (R, K, d), (R, K, d, d). |
 | `n_chunk` | `int, optional` | `None` | Stream over samples in chunks of this size (as in `estimate`). |
-| `em_chunk` | `int, optional` | `None` | Replicates scored per batch, under the same halve-and-retry CUDA out-of-memory guard as `em_fit`. None scores all replicates in one batch. Results do not depend on it on CPU (bitwise); on CUDA they move at reduction order. |
+| `em_chunk` | `int, optional` | `None` | Replicates scored per batch, under the same halve-and-retry CUDA out-of-memory guard as `em_fit`. None scores all replicates in one batch. Results do not depend on it on CPU (bitwise); on CUDA they change only through the order of floating-point summation. |
 
 ### Returns
 
