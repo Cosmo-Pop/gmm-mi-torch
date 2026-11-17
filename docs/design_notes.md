@@ -266,6 +266,30 @@ calls' matmuls at full precision, and the save/restore can race with theirs.
 Use processes, not threads, for parallel estimates (see
 `examples/mi_grid_multigpu.py`).
 
+## torch 2.13 and one-dimensional fits on CUDA
+
+torch 2.13.0 overrides the CUDA batched matrix product for operands of
+shapes (B, n, 1) and (B, 1, m) with a kernel written in Triton
+(`torch/_native/ops/bmm_outer_product`), which is compiled at first use.
+The compilation builds a small C module that includes `Python.h`; where the
+header is missing, torch raises `subprocess.CalledProcessError` and does not
+fall back to its ordinary product. A bare `torch.bmm` of those shapes fails
+in the same way.
+
+A 1×1 product has those shapes, so a fit with d = 1 reaches the kernel
+through three products: `Y^T Y` and `P mu` in `_gauss_coef`, and
+`chol eps` in `gmm_sample`. With the default kernels, fits with d = 2 and
+d = 3 (MI and KL; cMI and TC) did not reach it; the legacy kernels were not
+tested.
+
+Measured on the GB10 with torch 2.13.0+cu130, GPU float32 suite of 133
+tests: 118 passed, 14 failed and 1 skipped without the header, every
+failure in a test that calls `estimate_categorical`; 132 passed and 1
+skipped with the header on the compiler's search path; and 132 passed and 1
+skipped with `TORCH_DISABLE_NATIVE_JIT=1`, torch's switch that leaves the
+override unregistered. Under torch 2.11.0+cu128 the same fits run without
+either.
+
 ## Notes on individual constants and functions
 
 The longer explanations behind individual constants and functions, in

@@ -174,6 +174,7 @@ Mechanisms and measurements for each are in [docs/design_notes.md](docs/design_n
 - **Per-replicate seeds on CPU.** CPU generators keep 32 bits of each per-replicate seed, so two replicates of one call share a stream with probability R(R−1)/2^33 (1.7e-6 at the default 120 replicates).
 - **Threads.** For the duration of each call the package sets torch's float32 matrix-multiplication precision to full IEEE precision (TF32 off) and restores the caller's setting afterwards. That setting is process-wide, not per thread: run parallel estimates in processes, not threads.
 - **Categorical errorbars.** `estimate_categorical` holds the category proportions fixed across bootstrap replicates, so its errorbar excludes their multinomial sampling uncertainty (negligible except at small N with extreme imbalance).
+- **torch 2.13 without the Python development headers.** torch 2.13.0 evaluates GPU matrix products of the form (n×1)·(1×m), which include every 1×1 product, with a kernel that it compiles at first use, and the compilation needs `Python.h`. Where the header is missing, fits of one-dimensional data on CUDA, which include every `estimate_categorical` call, fail inside torch with a `subprocess.CalledProcessError`. Install the Python development headers (for example the `python3-dev` package), or set `TORCH_DISABLE_NATIVE_JIT=1` before importing torch. MI, KL, cMI and TC fits of two or three columns were unaffected in tests. Observed with torch 2.13.0+cu130 on the GB10; torch 2.11.0 is unaffected.
 
 ## Tests
 
