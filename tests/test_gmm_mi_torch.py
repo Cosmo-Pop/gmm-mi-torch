@@ -480,8 +480,8 @@ def test_auto_chunk_sizing(monkeypatch):
     # CPU keeps the historical default (capped at the item count); CUDA takes
     # the budget fraction of what the process can still allocate: physical
     # free memory plus torch's cached-but-free blocks, capped by a
-    # per-process memory fraction when one is set (2026-10-23 review L14).
-    # There is no replicate floor any more (L9): the 32-replicate floor only
+    # per-process memory fraction when one is set.
+    # There is no replicate floor: the 32-replicate floor only
     # bound when memory was tight, exactly where it over-requested, and its
     # fixed_bytes-blind cap still opened with a guaranteed-OOM attempt.
     E = gmm_mi_torch.estimator
@@ -796,7 +796,7 @@ def test_chol_write_back_invariant_and_warning_counts():
 
 
 def test_mc_integrand_consistent_after_repair():
-    # review finding: the MC stage sampled the joint under the REPAIRED
+    # the MC stage sampled the joint under the REPAIRED
     # factor but scored marginals from the RAW covariance, mixing two
     # mixtures. With the write-back, an independent (diagonal) repaired
     # mixture must give an MI integrand of ~0: the marginals refactorised
@@ -830,7 +830,7 @@ def test_legacy_nchunk_mstep_covariance_floor():
 
 
 def test_sequential_patience_reset_exhaustion_and_nan(monkeypatch):
-    # review finding: the patience counter never reset on improvement and
+    # the patience counter never reset on improvement and
     # the selected k assumed the misses were trailing; exhaustion returned
     # max_components regardless of scores; an all-NaN metric crashed with
     # KeyError(0). All three paths, with a scripted metric sequence.
@@ -860,7 +860,7 @@ def test_sequential_patience_reset_exhaustion_and_nan(monkeypatch):
 
 
 def test_seed_controls_cv_folds(monkeypatch):
-    # review finding: the seed was never forwarded to _cv_masks (hardcoded
+    # the seed was never forwarded to _cv_masks (hardcoded
     # 42) although the docstring promises seed controls the CV splits
     E = gmm_mi_torch.estimator
     t0, v0 = selection._cv_masks(100, 2, 1, torch.float64, seed=0)
@@ -994,7 +994,7 @@ def test_numpy_integer_seed():
 
 
 def test_nonfinite_input_rejected():
-    # review finding: NaN/inf input was never rejected — gaussianise ranked
+    # NaN/inf input was never rejected — gaussianise ranked
     # NaN rows as the largest values (fabricating MI for independent data)
     # and the 'none' path burned max_iter everywhere before a far-away
     # IndexError. Both entry points must refuse it up front.
@@ -1243,7 +1243,7 @@ def test_full_precision_pinned_at_kernel_boundary(monkeypatch):
 
 
 def test_entry_points_survive_new_fp32_api():
-    # review finding: once torch >= 2.9's fp32_precision API had been used
+    # once torch >= 2.9's fp32_precision API had been used
     # anywhere in the process, _full_precision's legacy getter raised
     # RuntimeError ('mix of the legacy and new APIs') at EVERY public entry
     # point, even on CPU. The pin must work through the new API and restore
@@ -1377,7 +1377,7 @@ def test_string_labels_estimate_categorical():
 
 
 def test_return_k_reports_live_components(monkeypatch):
-    # review finding: v0.3.0's alive-slice dropped components that died
+    # v0.3.0's alive-slice dropped components that died
     # during the CV fit without adjusting the reported k, so return_k said
     # e.g. 6 while the model actually bootstrapped, MC-integrated and
     # returned had 5, with no warning. k must report the live count, and a
@@ -1429,7 +1429,7 @@ def test_warning_stacklevels_attribute_to_caller():
 
 
 def test_requires_grad_input_detached(monkeypatch):
-    # review finding: an input tensor with requires_grad=True built and
+    # an input tensor with requires_grad=True built and
     # retained the full EM autograd graph (peak memory several times the
     # no-grad run, growing with iteration count) and return_fit=True then
     # crashed in FittedGMM on .numpy(). The entry points now run under
@@ -1459,7 +1459,7 @@ def test_requires_grad_input_detached(monkeypatch):
 
 
 def test_fp32_large_offset_cast_ordering():
-    # review finding: the cast to the working dtype preceded the internal
+    # the cast to the working dtype preceded the internal
     # standardisation, so float64 data with offset/sigma >~ 1e6 was quantised
     # at float32 before the centring could protect it (MI -18% at 1e7,
     # destroyed at 1e8, RuntimeError at timestamp scale). Standardising at
@@ -1532,7 +1532,7 @@ def _scaled_pair(scale, rho=0.8, N=600, seed=0):
 
 
 def test_return_fit_tiny_scale_units():
-    # review finding: FittedGMM factorised the ORIGINAL-units covariance, so
+    # FittedGMM factorised the ORIGINAL-units covariance, so
     # columns with std ~1e-21 (strain-scale data) tripped the absolute
     # dead test and silently returned identity covariances. The repair now
     # happens in standardised units and the back-transform runs at float64.
@@ -1577,7 +1577,7 @@ def test_return_fit_huge_scale_fp32():
 
 
 def test_mc_chunk_bitwise_invariance():
-    # review finding: the MC sample stream used to be sliced per replicate
+    # the MC sample stream used to be sliced per replicate
     # chunk, and mc_chunk='auto' is sized from free device memory at call
     # time, so a fixed seed did not reproduce on a busy GPU. Replicates now
     # draw from their own seeded streams: results are independent of
@@ -1677,7 +1677,7 @@ def test_cv_masks_survive_default_device():
         torch.set_default_device('cuda')
         m, s = estimate(X, 'MI', max_components=2, n_bootstrap=2,
                         mc_samples=1000, device='cuda', dtype=torch.float32)
-        # diff-review defect 1: the default tie_rank='random' path used to
+        # the default tie_rank='random' path used to
         # raise under a CUDA default device (CPU generator vs default-device
         # randperm — the same class as the _cv_masks fix)
         with warnings.catch_warnings():
@@ -1686,7 +1686,7 @@ def test_cv_masks_survive_default_device():
                               max_components=2, n_bootstrap=2,
                               mc_samples=1000, device='cuda',
                               dtype=torch.float32)
-        # 2026-10-23 review F8: the AIC/BIC branch held the one unpinned
+        # the AIC/BIC branch held the one unpinned
         # factory left in the module; with a CUDA default device and a
         # CPU fit it indexed a CPU tensor with a CUDA arange, after the
         # whole CV EM had been spent
@@ -1719,7 +1719,7 @@ def _zero_inflated_pair(seed, N=6000, frac=0.3, rho=0.8):
 
 
 def test_reroute_zero_inflated_fp32():
-    # review finding 1: the GEMM kernels' uncentred origin moments leave a
+    # the GEMM kernels' uncentred origin moments leave a
     # rounding residue ~ u*P*|x|^2 that swamps a reg_covar-floored spike at
     # float32 — MI biased up to +60% (1.54 vs 0.96 at seed 2) with only
     # generic repair warnings. The detector must reroute such replicates to
@@ -1742,8 +1742,8 @@ def test_reroute_zero_inflated_fp32():
 
 def test_reroute_matches_legacy_fp32(monkeypatch):
     # on the tripped class, float32 GEMM (with the reroute) and float32
-    # legacy must agree within the combined bootstrap error — the review's
-    # "missing (d)" parity statement for the rerouted regime
+    # legacy must agree within the combined bootstrap error: the
+    # parity statement for the rerouted regime
     E = gmm_mi_torch.estimator
     X = _zero_inflated_pair(2)
     kw = dict(n_bootstrap=10, fixed_components_number=2, seed=2,
@@ -1795,7 +1795,7 @@ def test_reroute_leaves_safe_classes_alone():
         m64, s64 = estimate(Xc, 'MI', dtype=torch.float64, **kw)
     assert abs(m32 - m64) <= 3 * (s32 ** 2 + s64 ** 2) ** 0.5 + 0.05
     # line-collapsed subsets (y = x exactly on 20% of rows), at the origin
-    # and displaced: the other blind-spot shape the ruling asked to pin
+    # and displaced: the other shape the detector deliberately does not flag
     rng = np.random.default_rng(2)
     base = rng.multivariate_normal([0, 0], [[1, .5], [.5, 1]], 4000)
     mask = rng.random(4000) < 0.2
@@ -1813,7 +1813,7 @@ def test_reroute_leaves_safe_classes_alone():
 
 
 def test_reroute_never_fires_at_fp64(monkeypatch):
-    # the fp64-leg guarantee from the ruling: on multimodal data at a sane
+    # the float64 guarantee: on multimodal data at a sane
     # reg_covar, the detector must never trip at float64
     E = gmm_mi_torch.estimator
     trips = []
@@ -1942,7 +1942,7 @@ def test_gaussianise_random_rank_properties():
 
 
 def test_gaussianise_ties_average_rank_regression():
-    # review finding: positional (double-argsort) tie-breaking mapped a tied
+    # positional (double-argsort) tie-breaking mapped a tied
     # block to a monotone probit ramp in row order, fabricating MI whenever
     # row order correlates with another variable. The worst case — a sorted
     # variable next to a constant column — used to return ~1.06 nats; with
@@ -2015,7 +2015,7 @@ def test_spike_pair_fp32_end_to_end():
 
 
 def test_init_draw_chunk_invariant():
-    # hardening batch 1: the default init draws its (R,N,K) responsibilities
+    # the default init draws its (R,N,K) responsibilities
     # per replicate chunk, each replicate from its own generator seeded off
     # the caller's stream, so the init (and everything downstream) is
     # independent of em_chunk and of the OOM halve-and-retry by
@@ -2088,7 +2088,7 @@ def test_init_draw_is_chunked_on_device():
 
 
 def test_cv_masks_are_expand_views(monkeypatch):
-    # hardening batch 2: select_batched used to repeat the (I*F, N) CV masks
+    # select_batched used to repeat the (I*F, N) CV masks
     # max_components times as dense working-dtype copies (finding 12:
     # 2(K+1)*I*F*N*itemsize un-chunked; 40 GiB of the README's N=1e8 peak).
     # The masks are now (K, I, F, N) expand() views of one (F, N) pair, and
@@ -2150,7 +2150,7 @@ def _moment_inputs(R, N, K, d, dtype, device):
 
 
 def test_moment_gemm_float32_block_bound():
-    # hardening batch 3 (ruling's pin 1): the block-batched float32
+    # the block-batched float32
     # _moment_gemm against a float64 einsum of the SAME float32 inputs,
     # elementwise inside the order-independent bound
     # block * 2^-24 * (|wr|^T |F|) (observed error is ~2% of it); and the
@@ -2176,7 +2176,7 @@ def test_moment_gemm_float32_block_bound():
 
 
 def test_moment_gemm_peak_on_device():
-    # ruling's pin 2: the M-step moment GEMM may hold one copy of wr plus
+    # the M-step moment GEMM may hold one copy of wr plus
     # the block outputs (theory 1 + 3q/b = 1.26 units at d=8, observed
     # 1.26-1.45 with allocator rounding); a second copy would read >= 2.26,
     # the old R-fold broadcast of F 22-23. Warm up first: the first call
@@ -2200,7 +2200,7 @@ def test_moment_gemm_peak_on_device():
 
 
 def test_byte_models_and_fixed_cost():
-    # hardening batch 4: the auto-chunk models re-derived on the GB10
+    # the auto-chunk models re-derived on the GB10
     # (validation/bench_mem_models.py). Unit-level pins on their shape;
     # the measured-peak comparison itself is the bench script's job.
     E = gmm_mi_torch.estimator
@@ -2341,7 +2341,7 @@ def test_partition_rows_gathered_per_chunk_bitwise():
 
 
 def test_bootstrap_counts_stream_and_transients(monkeypatch):
-    # hardening batch 5: the multinomial path's draw is the validated
+    # the multinomial path's draw is the validated
     # resample stream and must be bitwise the (B,N)-matrix draw it replaces
     # (the probability row is expanded, the scatter source is a view); the
     # large-N path (N > 2^24) draws one replicate at a time from
@@ -2354,9 +2354,8 @@ def test_bootstrap_counts_stream_and_transients(monkeypatch):
         g = torch.Generator().manual_seed(7)
         got = E._bootstrap_counts(N, B, dt, 'cpu', g)
         g = torch.Generator().manual_seed(7)
-        # the reference is the dense (B,N) FLOAT64 row (2026-10-23 review
-        # F2: the row is float64 whatever the working dtype, see the test
-        # below), scattered the way v0.4.0 did
+        # the reference is the dense (B,N) FLOAT64 row (the row is
+        # float64 whatever the working dtype, see the test below), scattered the way v0.4.0 did
         idx = torch.multinomial(torch.full((B, N), 1.0 / N,
                                            dtype=torch.float64), N,
                                 replacement=True, generator=g)
@@ -2478,8 +2477,8 @@ def test_oom_retry_releases_after_handler(monkeypatch):
 def test_categorical_mc_peak_independent_of_categories():
     # the categorical MC stage stacked all C per-category scores into a
     # (C,b,S) tensor; it now accumulates a running logaddexp, so the peak
-    # no longer scales with C (results differ at roundoff only; the CPU
-    # reference comparison of the hardening pass was bitwise)
+    # no longer scales with C (results differ at roundoff only; a CPU
+    # comparison of the two forms was bitwise)
     if not torch.cuda.is_available():
         pytest.skip('peak-memory measurement needs a CUDA device')
     rng = np.random.default_rng(3)
@@ -2505,7 +2504,7 @@ def test_categorical_mc_peak_independent_of_categories():
 
 
 def test_degenerate_sample_sizes_raise_or_warn():
-    # hardening batch 6: N=2-3 used to pass the fold check and return MI of
+    # N=2-3 used to pass the fold check and return MI of
     # ~5-6 nats without a word. Now: a training fold with fewer than d+1
     # samples cannot estimate a covariance -> ValueError at entry; below
     # 100 samples (per dataset / per category) a RuntimeWarning names the
@@ -2625,7 +2624,7 @@ def test_plotting_internals_hardened():
 
 
 def test_bootstrap_resample_uniform_at_float32():
-    # 2026-10-23 review F2: with the probability row at the working dtype,
+    # with the probability row at the working dtype,
     # torch's CPU multinomial accumulated a float32 CDF whose step 1/N
     # rounds differently in each binade of the running sum — regional
     # sampling weights 0.9896..1.0049 at N=1e6 (16 sigma), identical in
@@ -2647,7 +2646,7 @@ def test_bootstrap_resample_uniform_at_float32():
 
 
 def test_precision_pin_preserves_knob_inheritance():
-    # 2026-10-23 review F7: the pin recorded RESOLVED fp32_precision values
+    # the pin recorded RESOLVED fp32_precision values
     # and wrote them back explicitly, so a child knob that inherited from
     # the generic setting left estimate() pinned and no longer followed
     # the caller's later generic change. The ruled test matrix: fresh
@@ -2720,7 +2719,7 @@ def test_precision_pin_preserves_knob_inheritance():
 
 
 def test_weight_chunks_accessor():
-    # 2026-10-23 review F6: the streamed path reads weights through
+    # the streamed path reads weights through
     # _WeightChunks instead of materialising (R,N) copies. Pins: rows()
     # equals dense slicing for 2-D, 3-D and 4-D weights with and without a
     # row subset, is a view for 2-D weights, and totals() is the exact row
@@ -2786,7 +2785,7 @@ def test_streamed_compaction_bitwise_with_nd_weights():
 
 
 def test_streamed_path_holds_no_full_weight_copies():
-    # finding 4 of the 2026-10-23 review: with n_chunk << N the streamed
+    # with n_chunk << N the streamed
     # em_fit/val_ll held N-sized per-replicate weight copies (the mask
     # gather, the convergence compaction, val_ll's s_val[gi]) and peaked
     # 18-21x the model at N=4e5, n_chunk=4096, K=3 on the GB10
@@ -2816,7 +2815,7 @@ def test_streamed_path_holds_no_full_weight_copies():
 
 
 def test_val_ll_streams_rerouted_replicates():
-    # 2026-10-23 review F4: val_ll scored rerouted (collapsed) replicates in
+    # val_ll scored rerouted (collapsed) replicates in
     # one broadcast legacy pass over N while em_fit streamed them at the
     # model-derived sample chunk — 3.1x the em budget at d=2 K=20, 9.1x at
     # d=8 K=20 on the GB10, OOM-retry chains on 'auto'. Pins: the shared
@@ -2869,7 +2868,7 @@ def test_val_ll_streams_rerouted_replicates():
 
 
 def test_init_streams_with_n_chunk_same_draw():
-    # 2026-10-23 review F1: the default and k-means inits ran over the full
+    # the default and k-means inits ran over the full
     # N per replicate whatever n_chunk, binding on memory before EM at
     # large N. With n_chunk they now stream in two passes, and the draw is
     # made in fixed blocks from each replicate's generator on both paths,
@@ -3005,7 +3004,7 @@ def test_streamed_init_peak_under_model():
 
 
 def test_entry_coercions_count_like_arguments():
-    # 2026-10-23 review L13/X3 (group A1): n_chunk, threshold_fit, patience,
+    # n_chunk, threshold_fit, patience,
     # em_chunk and mc_chunk fail at entry under their own names; a float
     # n_chunk used to die inside the first streamed EM step after the init
     # stage, em_chunk=2.7 ran as 2, threshold_fit='x' died in the stop test
@@ -3072,7 +3071,7 @@ def test_mc_chunk_validated_at_entry(monkeypatch):
 
 
 def test_selection_masks_single_nonfinite_metric(monkeypatch):
-    # 2026-10-23 review L12 (A2): one non-finite replicate metric used to
+    # one non-finite replicate metric used to
     # give an IndexError ('valid'), a silently selected NaN k (aic/bic) or
     # a consumed patience step (sequential). Inject it through val_ll.
     E = gmm_mi_torch.estimator
@@ -3142,7 +3141,6 @@ def test_selection_masks_single_nonfinite_metric(monkeypatch):
 
 
 def test_device_types_other_than_cpu_cuda_rejected():
-    # L17 (A3)
     rng = np.random.default_rng(0)
     X = rng.normal(size=(300, 2))
     for dev in ('mps', 'meta', 'xpu'):
@@ -3152,7 +3150,7 @@ def test_device_types_other_than_cpu_cuda_rejected():
 
 
 def test_categorical_missing_string_labels_rejected():
-    # L19 (A4): None / NaN among string labels used to raise np.unique's
+    # None / NaN among string labels used to raise np.unique's
     # TypeError about str vs float
     rng = np.random.default_rng(0)
     X = rng.normal(size=12)
@@ -3168,7 +3166,6 @@ def test_categorical_missing_string_labels_rejected():
 
 
 def test_score_samples_dataframe_and_shape_message():
-    # L20/L21 (A5)
     pd = pytest.importorskip('pandas')
     rng = np.random.default_rng(0)
     df = pd.DataFrame(rng.multivariate_normal([0, 0], [[1, .5], [.5, 1]], 400),
@@ -3183,7 +3180,7 @@ def test_score_samples_dataframe_and_shape_message():
 
 
 def test_collapsed_component_offdiagonal_bound():
-    # 2026-10-23 review L3 (C1): both M-steps restored only the diagonal to
+    # both M-steps restored only the diagonal to
     # the reg_covar floor, leaving the off-diagonal roundoff residue of a
     # component collapsed on exact duplicates far above it; _chol's
     # escalation (scaled to the diagonal) could not reach it and the whole
@@ -3251,7 +3248,7 @@ def test_collapsed_component_offdiagonal_bound():
 
 
 # ----------------------------------------------------------------------
-# the hoisted chunk callbacks (v0.8.0, readability item 3.4): each is
+# the hoisted chunk callbacks (v0.8.0): each is
 # called directly, at CPU float64
 # ----------------------------------------------------------------------
 

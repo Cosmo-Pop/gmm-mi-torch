@@ -23,7 +23,7 @@ constants: [docs/design_notes.md](../design_notes.md).
 
 ---
 
-<a href="../../gmm_mi_torch/estimator.py#L487"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L488"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>class</kbd> `FittedGMM`
 
@@ -50,7 +50,7 @@ supplies.
 | `w`, `mu`, `cov` | `torch.Tensor` | - | Weights (K,), means (K, d) and covariances (K, d, d). |
 | `chol` | `torch.Tensor of shape (K, d, d), optional` | `None` | Lower Cholesky factor of `cov`; computed (and repaired if needed) from `cov` when omitted. |
 
-<a href="../../gmm_mi_torch/estimator.py#L523"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L524"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ### <kbd>method</kbd> `sample`
 
@@ -73,7 +73,7 @@ Draw `n_samples` from the mixture.
 |--------------|------|-------------|
 | - | `numpy.ndarray of shape (n_samples, d)` | The samples, in the units of the fitted model. |
 
-<a href="../../gmm_mi_torch/estimator.py#L545"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L546"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ### <kbd>method</kbd> `score_samples`
 
@@ -101,7 +101,7 @@ the expected one.
 
 ---
 
-<a href="../../gmm_mi_torch/estimator.py#L617"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L618"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `estimate`
 
@@ -167,7 +167,7 @@ warm-started from the CV-selected parameters.
 | `device` | `str or torch.device` | `'cpu'` | Torch device on which to fit and integrate: 'cpu', or 'cuda' / 'cuda:i' / a torch.device of those types (other backends are rejected at entry). |
 | `dtype` | `torch.dtype` | `torch.float64` | Working precision. float32 is validated and much faster on GPUs with limited fp64 throughput; float64 is the reference precision. |
 | `em_chunk` | `int or 'auto'` | `'auto'` | EM replicates (CV fits or bootstrap realisations) per batch; the initialisation and validation-LL stages batch the same way. Larger is faster on GPU at higher peak memory. 'auto' is 8 on CPU and fills half the free device memory on CUDA (see Notes). |
-| `mc_chunk` | `int or 'auto'` | `'auto'` | Bootstrap replicates whose MC integration is evaluated per batch; 'auto' as for `em_chunk`. The MC samples do not depend on it; results are bitwise invariant on CPU and move at reduction order on CUDA. |
+| `mc_chunk` | `int or 'auto'` | `'auto'` | Bootstrap replicates whose MC integration is evaluated per batch; 'auto' as for `em_chunk`. The MC samples do not depend on it; results are bitwise invariant on CPU, and on CUDA change only through the order of floating-point summation. |
 | `preprocess` | `{'none', 'gaussianise'}` | `'none'` | 'gaussianise' applies a per-variable rank-probit transform before fitting, which leaves MI, cMI and TC unchanged but can make the density much easier to fit. Not for heavily tied data, and rejected for the KL quantities (see Notes). |
 | `tie_rank` | `{'random', 'average'}` | `'random'` | How gaussianise ranks tied values: 'random' breaks each column's ties with a seeded random ordering; 'average' is the deterministic scipy rankdata convention. See Notes. |
 | `init_type` | `str` | `'random_responsibilities'` | GMM initialisation scheme (torch ports of GMM-MI's initialisations): 'random_responsibilities', 'minmax', 'kmeans' or 'randomized_kmeans'. 'random_responsibilities' is cheap and adequate for easy fits; the k-means variants are more robust on well-separated multimodal data. See Notes for their memory at large N. |
@@ -176,7 +176,7 @@ warm-started from the CV-selected parameters.
 | `metric_method` | `{'valid', 'aic', 'bic'}` | `'valid'` | Selection metric for the batched protocol. 'valid' is the validation log-likelihood with the parsimony-threshold rule; 'aic'/'bic' refit each k's best CV parameters on the full data and minimise the criterion, as in GMM-MI. |
 | `threshold_components` | `float` | `1e-5` | Parsimony threshold for the batched protocol's 'valid' metric (and the improvement threshold for the sequential protocol): metric gains smaller than this do not justify a larger k. |
 | `patience` | `int` | `1` | Sequential protocol only: consecutive non-improving k values tolerated before the search stops (as in `select_sequential`). |
-| `n_chunk` | `int, optional` | `None` | If set, the EM and validation-LL kernels stream over sample chunks of this size, bounding their peak memory by em_chunk \* n_chunk rather than N, and the default/k-means initialisation streams too. Results agree with the single pass to reduction order. See Notes. |
+| `n_chunk` | `int, optional` | `None` | If set, the EM and validation-LL kernels stream over sample chunks of this size, bounding their peak memory by em_chunk \* n_chunk rather than N, and the default/k-means initialisation streams too. Results agree with the single pass up to the order of floating-point summation. See Notes. |
 
 ### Returns
 
@@ -205,7 +205,7 @@ reproducibility, and the full lists of errors and warnings:
 
 ---
 
-<a href="../../gmm_mi_torch/estimator.py#L935"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L938"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>class</kbd> `CategoryFit`
 
@@ -229,7 +229,7 @@ Bootstrap fits of one category in `estimate_categorical` (a tuple).
 
 ---
 
-<a href="../../gmm_mi_torch/estimator.py#L1011"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/estimator.py#L1014"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `estimate_categorical`
 

@@ -777,8 +777,8 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
         akf = ak.to(dt)
         if scale is None:
             # n-ball scale rule: components jointly fill the data volume
-            # (log-sum instead of prod(): prod is a JIT kernel on CUDA and
-            # nvrtc rejects the GB10 arch)
+            # (log-sum instead of prod(): prod is a JIT kernel on CUDA, whose
+            # compilation fails on some GPUs; observed on the NVIDIA GB10)
             vol = torch.exp(torch.log(hi - lo).sum())
             s = ((vol / akf * math.gamma(d * 0.5 + 1)) ** (1.0 / d)
                  / math.sqrt(math.pi))                                # (R,)
@@ -1228,7 +1228,7 @@ def _em_step_mixed(X, F, weights_active, weight_chunks, w, mu, cov,
                 rows=active_idx[legacy_idx])
         else:
             # dense compacted weights: a view-only accessor whose
-            # totals are the one-pass sums (bitwise the old code)
+            # totals are the one-pass sums
             lll, wl, mul, covl = _em_step_nchunked(
                 X, _WeightChunks(weights_active, slice(0, n_active)),
                 w[legacy_idx], mu[legacy_idx], chol_l, logw_l,
