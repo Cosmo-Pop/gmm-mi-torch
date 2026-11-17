@@ -11,8 +11,9 @@ results are unchanged.
 
 - The two warnings issued when replicates are finished or scored with the
   legacy kernels, and the error raised when not even one replicate fits in
-  GPU memory, now explain their terms. A warnings filter that matches the
-  old wording no longer matches; the phrase "legacy kernels" is kept.
+  GPU memory, now explain their terms. A warnings filter, or a test of the
+  error's text, that matches the old wording no longer matches; the phrase
+  "legacy kernels" is kept in both warnings.
 - README: current behaviour in place of version history, terms defined,
   units stated, an HTTPS clone address, and a Known limitations item on
   one-dimensional CUDA fits under torch 2.13 without the Python development
@@ -108,10 +109,10 @@ Documentation only.
   `scale` also sets the 'minmax' initialisation's standard deviation; and on
   CUDA results depend on the batch size at float64 as well as float32
   (between batch sizes the fitted means moved by 1e-14 to 1e-12 at float64
-  and by up to 7e-3 at float32, in measured cases). A CPU run, not "float64
-  or CPU", is therefore the bit-reproducible setting, with one float32
-  exception: `em_chunk=1` with a one-component model (3e-8 in a measured
-  MI).
+  and by up to 7e-3 at float32, in measured cases). The bit-reproducible
+  setting is therefore a CPU run, and not also float64 on CUDA as the
+  documentation said at 0.6.1, with one float32 exception: `em_chunk=1`
+  with a one-component model (3e-8 in a measured MI).
 
 ## 0.7.0 (2026-10-24)
 
@@ -139,12 +140,13 @@ floating-point summation.
 - `n_chunk`, `threshold_fit`, `patience` and `em_chunk` are checked at
   entry, and a non-integer `em_chunk` or `mc_chunk` raises instead of being
   truncated silently (until 0.7.2 `mc_chunk` is checked only after
-  component selection). `device` accepts only 'cpu' and 'cuda[:i]'. Missing values among
-  string labels raise a readable error.
+  component selection). `device` accepts only 'cpu' and 'cuda[:i]'. Missing
+  values among string labels raise a readable error.
 - A non-finite metric at one k no longer breaks selection: the batched
-  protocol's 'valid' metric ranks the finite k only, 'aic' and 'bic' ignore
-  a non-finite criterion, and the sequential protocol skips that k with a
-  warning.
+  protocol's 'valid' metric ranks the finite k only (it was an IndexError),
+  'aic' and 'bic' ignore a non-finite criterion (a NaN k was selected
+  silently), and the sequential protocol skips that k with a warning and
+  without using up `patience` (the search could end early).
 - Automatic batch sizing: the minimum of 32 replicates is removed, and
   batches respect `torch.cuda.set_per_process_memory_fraction`.
 - A float32 fit of duplicated points with `reg_covar` ~1e-10 completes with
@@ -159,7 +161,7 @@ Fixed-seed results change at float32 whenever there is a bootstrap, and on
 CUDA with the default initialisation. Two further cases change only through
 the order of floating-point summation: with `n_chunk`, direct calls of
 `em_fit` or `val_ll` with real-valued weights; and, at float32, the
-validation scores of replicates finished on the legacy kernels. Single-pass
+validation scores of replicates scored with the legacy kernels. Single-pass
 float64 results on CPU are bitwise 0.5.0.
 
 - The bootstrap's probability row is float64 whatever the working dtype. At
@@ -167,7 +169,10 @@ float64 results on CPU are bitwise 0.5.0.
   the array (a 16-sigma departure from uniform at N=1e6), a bias on
   index-ordered data that the errorbar could not show. The float32 resample
   is now bitwise the float64 one on CPU and CUDA, and uniform on CPU (for
-  the CUDA draw see 0.6.1).
+  the CUDA draw see 0.6.1). On CUDA torch's multinomial needs more working
+  memory for the float64 row, 8.3 instead of 5.1 times the float32 weights,
+  which matters only near N = 2^24 with a large `n_bootstrap` on a small
+  GPU.
 - The default and k-means initialisations stream with `n_chunk`. In 0.5.0
   they ran over the full N whatever `n_chunk` was, and could exhaust memory
   before EM started. When not even one replicate fits, a RuntimeError names
@@ -175,6 +180,10 @@ float64 results on CPU are bitwise 0.5.0.
 - With `n_chunk`, the EM and scoring stages no longer copy the
   (replicates, N) weights: `em_fit` went from 18 to 1.06 times its memory
   model (float32, N=4e5, 32 replicates, `n_chunk=4096`).
+- `val_ll` scores replicates rerouted to the legacy kernels in sample
+  chunks, as `em_fit` fits them. The CV scoring stage had peaked at 3.1
+  (d=2, K=20) to 9.1 (d=8, K=20) times the memory its batch was sized for;
+  it now stays below it (0.28 to 0.99 on the measured rows).
 - On torch >= 2.9 a float32 precision setting that the caller had left
   inherited is restored as inherited; it used to come back fixed at its
   resolved value. One case cannot be told apart: a setting made explicitly
@@ -186,9 +195,10 @@ float64 results on CPU are bitwise 0.5.0.
 
 Fixed-seed results change with the default initialisation
 (`init_type='random_responsibilities'`), by the scatter between
-initialisations, and for N > 2^24. Everything else is bitwise 0.4.0 on CPU;
-on CUDA at float32 the M-step also changes through the order of
-floating-point summation.
+initialisations, and for N > 2^24. On CPU the kernel-level results, the
+'minmax' and k-means selections, the bootstrap resample and the Monte-Carlo
+stage are bitwise 0.4.0; on CUDA at float32 the M-step also changes through
+the order of floating-point summation.
 
 - Lower peak memory in the initialisation, the CV masks, the M-step and the
   bootstrap counts: for example 183 MiB to 3 MiB per CV mask at N=2e5, and
@@ -197,10 +207,16 @@ floating-point summation.
   re-measured.
 - The default initialisation draws each replicate from its own generator, so
   the draw does not depend on `em_chunk` or on an out-of-memory retry.
+- On CUDA the automatic batch counts memory that torch has cached but is
+  not using as free; every stage after the first had been sized against the
+  free memory less that cache. Automatic batch sizes therefore change, and
+  on CUDA results change with the batch size through the order of
+  floating-point summation (see 0.7.1).
 - A training fold with fewer than d+1 samples is a ValueError (N = 2-3 used
   to return MI of 5-6 nats silently), and below 100 samples a RuntimeWarning
-  names the finite-sample bias. `device` accepts 'cuda:1' and torch.device
-  objects. `FittedGMM.score_samples` accepts 1-D input.
+  names the finite-sample bias. `device` accepts 'cuda:1', torch.device
+  objects and integers, and a device that cannot be parsed or is absent is
+  rejected at entry. `FittedGMM.score_samples` accepts 1-D input.
 - Plotting: repeated mass levels and coarse grids no longer crash the
   contours, and a constant column gives a readable error.
 
@@ -233,8 +249,8 @@ shift by up to 2 N `threshold_fit`.
   and bfloat16 working dtypes are rejected at entry.
 - `return_fit`: the covariance is factorised in standardised units and
   transformed back at float64, so data at a scale of 1e-21, or of 1e20 at
-  float32, no longer return identity covariances. `FittedGMM`'s attributes are float64 numpy
-  arrays.
+  float32, no longer return identity covariances. `FittedGMM`'s attributes
+  are float64 numpy arrays.
 - Each bootstrap replicate draws its Monte-Carlo samples from its own seeded
   stream, so the samples do not depend on `mc_chunk` or on an out-of-memory
   retry. |seed| <= 2^62 and `n_bootstrap` <= 2^20 are enforced.
@@ -282,7 +298,16 @@ dropped before the bootstrap.
   mixture and scored marginals from another; it now uses the repaired one
   throughout.
 - Sequential selection: the patience counter resets on improvement and the
-  best-scoring k is returned. `patience` is an argument of both estimators.
+  best-scoring k is returned. With `patience=2` and improvements at k=1 and
+  k=3 the old counter returned k=2, and a search that ran out of candidates
+  returned `max_components` whatever the scores. `patience` is an argument
+  of both estimators.
+- An empty validation fold scores -inf. It used to score 0.0, which beat
+  every real fit when the best fold was chosen.
+- With the legacy kernels and `n_chunk`, float32 rounding could push the
+  variance of a collapsed component below the `reg_covar` floor, or
+  negative; that M-step now restores the floor and accumulates at float64,
+  as the default kernels do.
 - The seed controls the CV folds; they were fixed at seed 42.
 - Invalid settings are rejected at entry with a ValueError: `n_folds` < 2 or
   > N, an unknown `quantity`, `protocol` or `metric_method` (the last, when
