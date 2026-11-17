@@ -937,7 +937,7 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
         Once per call for replicates that exhausted `max_iter` without
         meeting `threshold_fit` (their last iterates are returned), and once
         for replicates finished on the centred legacy kernels because a
-        component collapsed beyond the GEMM kernels' precision. Covariance
+        component was too narrow for the default kernels' precision. Covariance
         factorisation also warns when a component needed extra diagonal
         regularisation, or when an all-zero or non-finite covariance was
         replaced by the identity.
@@ -1537,7 +1537,7 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None, em_chunk=None):
     -----
     RuntimeWarning
         Once per call for replicates scored with the centred legacy kernels
-        because a component collapsed beyond the GEMM kernels' precision;
+        because a component was too narrow for the default kernels' precision;
         and, as in `em_fit`, from covariance factorisation (extra diagonal
         regularisation; all-zero or non-finite covariance replaced by the
         identity).

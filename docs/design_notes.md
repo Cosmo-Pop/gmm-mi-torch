@@ -274,7 +274,9 @@ shapes (B, n, 1) and (B, 1, m) with a kernel written in Triton
 The compilation builds a small C module that includes `Python.h`; where the
 header is missing, torch raises `subprocess.CalledProcessError` and does not
 fall back to its ordinary product. A bare `torch.bmm` of those shapes fails
-in the same way.
+in the same way. torch keeps the compiled kernel in a cache
+(`~/.triton/cache` by default), so the failure appears only where the
+kernel has not been compiled before.
 
 A 1×1 product has those shapes, so a fit with d = 1 reaches the kernel
 through three products: `Y^T Y` and `P mu` in `_gauss_coef`, and

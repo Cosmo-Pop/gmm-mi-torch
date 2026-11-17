@@ -2355,7 +2355,8 @@ def test_bootstrap_counts_stream_and_transients(monkeypatch):
         got = E._bootstrap_counts(N, B, dt, 'cpu', g)
         g = torch.Generator().manual_seed(7)
         # the reference is the dense (B,N) FLOAT64 row (the row is
-        # float64 whatever the working dtype, see the test below), scattered the way v0.4.0 did
+        # float64 whatever the working dtype, see the test below),
+        # scattered the way v0.4.0 did
         idx = torch.multinomial(torch.full((B, N), 1.0 / N,
                                            dtype=torch.float64), N,
                                 replacement=True, generator=g)
