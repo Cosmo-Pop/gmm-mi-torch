@@ -283,8 +283,9 @@ def _rank_gaussianise(X, tie_rank='average', generator=None):
             f"choice.", RuntimeWarning, stacklevel=4)
         # 4: _rank_gaussianise -> estimate -> _entry_precision -> caller
     p = torch.stack(cols, 1) / (N + 1.0)
-    # ndtri/erfinv are JIT (nvrtc) kernels on CUDA and nvrtc rejects the
-    # GB10 arch; this is one-off data prep, so run the probit on CPU
+    # ndtri/erfinv are JIT (nvrtc) kernels on CUDA, whose compilation fails
+    # on some GPUs (observed on the NVIDIA GB10); this is one-off data prep,
+    # so run the probit on CPU
     return torch.special.ndtri(p.cpu()).to(dtype=X.dtype, device=X.device)
 
 
@@ -698,7 +699,8 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     mc_chunk : int or 'auto', default='auto'
         Bootstrap replicates whose MC integration is evaluated per batch;
         'auto' as for `em_chunk`. The MC samples do not depend on it; results
-        are bitwise invariant on CPU and move at reduction order on CUDA.
+        are bitwise invariant on CPU, and on CUDA change only through the
+        order of floating-point summation.
     preprocess : {'none', 'gaussianise'}, default='none'
         'gaussianise' applies a per-variable rank-probit transform before
         fitting, which leaves MI, cMI and TC unchanged but can make the
@@ -738,7 +740,8 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
         If set, the EM and validation-LL kernels stream over sample chunks of
         this size, bounding their peak memory by em_chunk * n_chunk rather
         than N, and the default/k-means initialisation streams too. Results
-        agree with the single pass to reduction order. See Notes.
+        agree with the single pass up to the order of floating-point
+        summation. See Notes.
 
     Returns
     -------
