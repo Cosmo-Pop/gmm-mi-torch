@@ -35,9 +35,8 @@ from .selection import (
     _cv_fit_for_k, _validate_device, _validate_folds, select_batched,
     select_sequential)
 
-# public names this module defined up to v0.9.0 and does not use
-# itself, imported so `from gmm_mi_torch.estimator import ...` still
-# finds them
+# public names defined in other modules and not used here, imported so
+# that `from gmm_mi_torch.estimator import ...` finds them
 from .constants import LOG2PI  # noqa: F401
 from .gaussian import log_gauss  # noqa: F401
 from .em import EMResult, ValLLResult, val_ll  # noqa: F401
@@ -360,11 +359,13 @@ def _select_and_fit(X, selection, fit):
         if init_bytes > free:
             stage = ("EM stage" if fit['init_type'] == 'minmax'
                      else f"initialisation stage of init_type='{fit['init_type']}'")
-            remedy = ("set n_chunk, which streams the samples (reduction-order "
-                      "cost only), or use float32"
+            remedy = ("set n_chunk, which streams the samples (results "
+                      "change only at the level of floating-point "
+                      "rounding), or use float32"
                       if fit['init_type'] == 'minmax' else
                       "set n_chunk, which streams the initialisation over "
-                      "sample chunks (reduction-order cost only), or use "
+                      "sample chunks (results change only at the level of "
+                      "floating-point rounding), or use "
                       "init_type='minmax', which allocates nothing of this size")
             raise RuntimeError(
                 f"by the memory model, the {stage} needs "
@@ -789,7 +790,8 @@ def estimate(X, quantity='MI', protocol='batched', n_bootstrap=50,
     -----
     On selection, standardisation, preprocessing, initialisation, memory,
     reproducibility, and the full lists of errors and warnings:
-    docs/estimate_notes.md in the repository.
+    docs/estimate_notes.md in the repository,
+    https://github.com/Cosmo-Pop/gmm-mi-torch/blob/main/docs/estimate_notes.md
     """
     X = torch.as_tensor(_as_array(X)).detach()
     if dtype not in (torch.float32, torch.float64):

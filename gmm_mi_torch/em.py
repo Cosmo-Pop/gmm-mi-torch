@@ -960,11 +960,13 @@ def em_fit(X, s, w, mu, cov, reg_covar=1e-6, threshold_fit=1e-5, max_iter=500, e
     n_rerouted = sum(o.n_rerouted for o in outs)
     if n_rerouted:
         warnings.warn(
-            f"{n_rerouted} of {R} EM replicate(s) carried a component "
-            f"collapsed beyond the GEMM kernels' precision at this dtype "
-            f"and finished on the (slower, centred) legacy kernels — "
-            f"expected for surplus components during selection at "
-            f"float32, not a data problem",
+            f"{n_rerouted} of {R} EM replicate(s) had a component so narrow "
+            f"that the default EM step, which evaluates the Gaussian "
+            f"densities as matrix products (GEMM), loses precision at this "
+            f"dtype; they were finished with the slower step that subtracts "
+            f"each component's mean first (the legacy kernels). This is "
+            f"expected for surplus components during selection at float32 "
+            f"and is not a data problem",
             RuntimeWarning, stacklevel=3)
     if len(outs) == 1:
         return outs[0][:4]
@@ -1550,9 +1552,11 @@ def val_ll(X, s_val, w, mu, cov, n_chunk=None, em_chunk=None):
     n_rerouted = sum(o.n_rerouted for o in outs)
     if n_rerouted:
         warnings.warn(
-            f"{n_rerouted} of {R} replicate(s) carried a component "
-            f"collapsed beyond the GEMM kernels' precision at this dtype "
-            f"and were scored with the (slower, centred) legacy kernels",
+            f"{n_rerouted} of {R} replicate(s) had a component so narrow "
+            f"that the default scoring, which evaluates the Gaussian "
+            f"densities as matrix products (GEMM), loses precision at this "
+            f"dtype; they were scored with the slower form that subtracts "
+            f"each component's mean first (the legacy kernels)",
             RuntimeWarning, stacklevel=3)   # val_ll -> _full_precision -> caller
     vals = [o.values for o in outs]
     return vals[0] if len(vals) == 1 else torch.cat(vals)

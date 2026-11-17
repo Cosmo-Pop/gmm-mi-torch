@@ -285,7 +285,7 @@ for item in [
     'N = 30,000): 53 min on 16 CPU cores vs 7.5 min (fp32) / 5.1 min '
     '(fp64) on one A100 - 114-168x less compute, with float64 the faster '
     'dtype on that hardware.',
-    'Since v0.2.1: releases v0.3.0 to v0.11.2 are described in CHANGELOG.md, '
+    'Since v0.2.1: releases from v0.3.0 on are described in CHANGELOG.md, '
     'not here. Two statements above hold for earlier versions only: the '
     'automatic batch no longer has a minimum of 32 replicates, and on CUDA '
     'results now depend on the batch size at the level of floating-point '

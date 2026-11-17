@@ -66,7 +66,7 @@ on CUDA see `em_chunk`.
 
 ---
 
-<a href="../../gmm_mi_torch/em.py#L1377"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/em.py#L1379"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>class</kbd> `EMResult`
 
@@ -96,7 +96,7 @@ A tuple, so slicing (`res[:4]`) and positional reads still work.
 
 ---
 
-<a href="../../gmm_mi_torch/em.py#L1501"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/em.py#L1503"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `val_ll`
 
@@ -132,7 +132,7 @@ Weighted mean per-sample log-likelihood of X under each replicate.
 
 ---
 
-<a href="../../gmm_mi_torch/em.py#L1603"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/em.py#L1607"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>class</kbd> `ValLLResult`
 
