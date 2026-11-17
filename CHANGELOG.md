@@ -21,6 +21,7 @@ Documentation and docstrings only.
 - `val_ll`'s `em_chunk` entry and three private docstrings say "the order
   of floating-point summation" in place of "reduction order";
   `docs/api/em.md` is regenerated.
+- `docs/validation_summary.pdf` uses the same wording in its v0.2.0 item.
 
 ## 0.11.3 (2026-11-17)
 
