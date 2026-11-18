@@ -4,9 +4,10 @@ For each release: what changed for a user, and whether results at a fixed
 seed change. The record of how each release was verified is in this file
 as it stood at the tag `v0.11.2` (`git show v0.11.2:CHANGELOG.md`).
 
-## Unreleased
+## 0.11.4 (2026-11-18)
 
-Documentation, docstrings and one local variable's name only.
+Documentation, docstrings and one local variable's name. No behaviour
+change; fixed-seed results are unchanged.
 
 - `docs/design_notes.md` uses the README's wording for three terms: the
   order of floating-point summation, data where two values of k score
