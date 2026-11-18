@@ -43,7 +43,8 @@ Documentation, docstrings and one local variable's name only.
   on repeated values, reproducibility and the CUDA resample, and the tests
   that a CPU-only run skips. The beta test cites Van den Bussche et al.
   (2026); the GH200 is named as an H100 node, also in the validation
-  summary; float32 and float64 replace fp32 and fp64.
+  summary; float32 and float64 replace fp32 and fp64. The validation
+  summary is described as a three-page summary of the results.
 
 ## 0.11.3 (2026-11-17)
 

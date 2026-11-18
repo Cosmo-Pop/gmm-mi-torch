@@ -180,7 +180,7 @@ GMM_MI_DEVICE=cuda GMM_MI_DTYPE=float32 GMM_MI_EM_CHUNK=1000 pytest   # GPU, flo
 
 A CPU-only run skips two tests that run only when an environment variable is set, and nine that need a CUDA device; [tests/README.md](tests/README.md) lists them.
 
-For most readers, [docs/validation_summary.pdf](docs/validation_summary.pdf) is the right entry point to the validation results. The [validation/](validation/) directory holds the full working report from the port's GB10 acceptance run and the benchmark scripts behind it ([validation/README.md](validation/README.md) explains its contents and provenance).
+[docs/validation_summary.pdf](docs/validation_summary.pdf) is a three-page summary of the validation and benchmark results. The [validation/](validation/) directory holds the full working report from the port's GB10 acceptance run and the benchmark scripts behind it ([validation/README.md](validation/README.md) explains its contents and provenance).
 
 ## Acknowledgements
 
