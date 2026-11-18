@@ -2090,7 +2090,8 @@ def test_init_draw_is_chunked_on_device():
 def test_cv_masks_are_expand_views(monkeypatch):
     # select_batched used to repeat the (I*F, N) CV masks
     # max_components times as dense working-dtype copies (finding 12:
-    # 2(K+1)*I*F*N*itemsize un-chunked; 40 GiB of the README's N=1e8 peak).
+    # 2(K+1)*I*F*N*itemsize un-chunked; 40 GiB of the N=1e8 peak in
+    # docs/performance_notes.md).
     # The masks are now (K, I, F, N) expand() views of one (F, N) pair, and
     # em_fit/val_ll gather each chunk's rows — same values, no copies.
     E = gmm_mi_torch.estimator

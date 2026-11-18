@@ -26,6 +26,13 @@ Documentation, docstrings and one local variable's name only.
   (`n_inits * n_folds`) is `fits_per_k`; three of the five integrand
   functions refer to `_integrand_MI` for their arguments and result; the
   design notes' Architecture section states the present layout only.
+- The README is shorter. Its section on replicate batches and
+  reproducibility and its paragraph on N=1e8 are now
+  `docs/performance_notes.md`, and its description of the test suite is
+  `tests/README.md`, both word for word. The README cites Piras et al.
+  (2023) at the top and says that numpy is not installed with the
+  package. The notebook, the validation summary and one test comment
+  point to the new files.
 
 ## 0.11.3 (2026-11-17)
 

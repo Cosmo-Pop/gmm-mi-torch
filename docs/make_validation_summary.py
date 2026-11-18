@@ -290,7 +290,7 @@ for item in [
     'not here. Two statements above hold for earlier versions only: the '
     'automatic batch no longer has a minimum of 32 replicates, and on CUDA '
     'results now depend on the batch size at the level of floating-point '
-    'rounding (README).',
+    'rounding (docs/performance_notes.md).',
 ]:
     A(Paragraph(item, BULL, bulletText='-'))
 
