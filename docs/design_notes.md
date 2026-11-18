@@ -478,6 +478,11 @@ With a stable sort, the order within each tied block is exactly the
 permutation's, that is uniformly random, while untied values keep their
 exact ranks.
 
+No tie convention makes the GMM fit of heavily tied data reliable, and
+`preprocess='none'` is the more reliable choice there: under
+'gaussianise', random tie ranks bias the estimate low when ties are shared
+between columns (joint zero inflation).
+
 ### `_select_and_fit`
 
 The batched protocol pads parameters to K = max_components, and any
@@ -546,3 +551,10 @@ init stream at K=30 equals category ci's bootstrap stream
 (997*10 + 30 = 10_000). It needs >= 11 categories AND max_components >= 30
 (default 10), and the streams drive different data, so it is documented
 rather than re-seeded under the validated init/bootstrap offsets.
+
+### `estimate_categorical`, errorbar
+
+The category proportions are held fixed across bootstrap replicates, so
+the errorbar covers the density fits but not the multinomial sampling
+uncertainty of the proportions themselves, which is negligible except at
+small N with extreme imbalance.

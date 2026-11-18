@@ -33,6 +33,11 @@ Documentation, docstrings and one local variable's name only.
   (2023) at the top and says that numpy is not installed with the
   package. The notebook, the validation summary and one test comment
   point to the new files.
+- README corrections: on data-centre GPUs float64 costs about the same as
+  float32, or less (the earlier "~1.4x" was measured at v0.1.1, before the
+  present kernels); `estimate_categorical` with string labels needs numpy.
+  The design notes gain the two Known limitations details the README no
+  longer carries (tie ranks under 'gaussianise'; the categorical errorbar).
 
 ## 0.11.3 (2026-11-17)
 

@@ -34,7 +34,7 @@ cd gmm-mi-torch
 pip install .
 ```
 
-The only runtime dependency is `torch`. numpy arrays are accepted as input, but numpy is not installed with the package; the Quickstart below needs it (`pip install numpy`). The plotting helpers need `numpy`, `matplotlib` and `scipy` (`pip install ".[plot]"`), and the tests need `pytest`, `numpy >= 2.0` and `scipy` (`pip install -e ".[test]"`).
+The only runtime dependency is `torch`. numpy arrays are accepted as input, but numpy is not installed with the package; the Quickstart below needs it, and so does `estimate_categorical` when the category labels are strings (`pip install numpy`). The plotting helpers need `numpy`, `matplotlib` and `scipy` (`pip install ".[plot]"`), and the tests need `pytest`, `numpy >= 2.0` and `scipy` (`pip install -e ".[test]"`).
 
 ## Quickstart
 
@@ -75,7 +75,7 @@ On a 3-component bivariate mixture (N=20 000, `max_components=8`, 50 bootstrap r
 
 On real data at production scale (beta test, October 2026): a 75-pair MI grid between VAE latents and galaxy properties, N = 30,000, `max_components=20`, 100 bootstrap realisations per pair — GMM-MI on 16 CPU cores: 53 min wall-clock; gmm-mi-torch on one A100: 7.5 min at float32, **5.1 min at float64** (114–168× less, counting CPU-core-minutes against GPU-minutes). The two codes' MI values differ by 2σ or more only at MI ≈ 0, where both carry the estimator's positive finite-sample bias, and their bootstrap errorbars match to ~10%. On data-centre GPUs float64 is the faster dtype; the GB10-class caveat below is about rate-limited-fp64 hardware only.
 
-On GPUs with rate-limited fp64 throughput (e.g. GB10), CUDA fp64 is slower than CPU fp64 — use fp32 on such devices (validated: the full test suite passes at fp32). On data-centre GPUs with full-rate fp64 (A100/H100/GH200 class), float64 costs only ~1.4x float32 end-to-end and avoids all reduced-precision caveats — prefer it there, especially for near-zero MI or spike-like marginals.
+On GPUs with rate-limited fp64 throughput (e.g. GB10), CUDA fp64 is slower than CPU fp64 — use fp32 on such devices (validated: the full test suite passes at fp32). On data-centre GPUs with full-rate fp64 (A100/H100/GH200 class), float64 costs about the same as float32, or less, and avoids all reduced-precision caveats — prefer it there, especially for near-zero MI or spike-like marginals.
 
 The EM inner loop evaluates Gaussian log-densities and M-step moments as matrix products (GEMM, general matrix multiply) against per-sample quadratic features — a GMM log-density is a quadratic form in the sample, so scoring N samples against K components is one matrix multiplication, and the M-step moments are the transposed one; see [Machlica, Vaněk & Zajíc (2011)](https://ieeexplore.ieee.org/document/6118944) for the formulation. The numerical safeguards follow [Chan, Golub & LeVeque (1983)](https://www.tandfonline.com/doi/abs/10.1080/00031305.1983.10483115); they are described in [docs/design_notes.md](docs/design_notes.md) ("GEMM-formulated EM kernels").
 
