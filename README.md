@@ -15,7 +15,7 @@ Given data `X` of shape `(n_samples, n_variables)`, `estimate` fits one joint GM
 - `'KL_forward'` / `'KL_reverse'`: KL divergence between the two 1-D marginals
 - `estimate_categorical(X, Y)`: MI between a continuous variable and a categorical one (a GMM per category)
 
-All quantities are returned in nats. The errorbar is the standard deviation over a bootstrap: multinomial-count sample weights over `n_bootstrap` replicates, each warm-started from the selected fit, run as one batched EM.
+All quantities are returned in nats. The errorbar is the standard deviation of the estimate over `n_bootstrap` bootstrap resamples of the data. A resample is represented by a weight per sample (the number of times that sample was drawn), not by a copy of the data; each refit starts from the selected model, and all of them run together as one batched EM.
 
 ## Installation
 
@@ -34,7 +34,7 @@ cd gmm-mi-torch
 pip install .
 ```
 
-The only runtime dependency is `torch`. numpy arrays are accepted as input, but numpy is not installed with the package; the Quickstart below needs it, and so does `estimate_categorical` when the category labels are strings (`pip install numpy`). The plotting helpers need `numpy`, `matplotlib` and `scipy` (`pip install ".[plot]"`), and the tests need `pytest`, `numpy >= 2.0` and `scipy` (`pip install -e ".[test]"`).
+The only runtime dependency is `torch`. `numpy` arrays are accepted as input, but `numpy` is not installed with the package; the Quickstart below needs it, and so does `estimate_categorical` when the category labels are strings (`pip install numpy`). The plotting helpers need `numpy`, `matplotlib` and `scipy` (`pip install ".[plot]"`), and the tests need `pytest`, `numpy >= 2.0` and `scipy` (`pip install -e ".[test]"`).
 
 ## Quickstart
 
@@ -59,7 +59,10 @@ Z = rng.normal(2.0 * Y, 1.0)
 mi_mean, mi_std = estimate_categorical(Z, Y, max_components=3)
 ```
 
-The full hyperparameter set (selection protocols `'batched'`/`'sequential'`, `metric_method='valid'/'aic'/'bic'`, init types, `preprocess='gaussianise'`, `fixed_components_number`, chunking knobs, …) is documented in the `estimate` and `estimate_categorical` docstrings, and guidance on using `estimate` (component selection, standardisation, preprocessing, initialisation, memory and reproducibility) is in [docs/estimate_notes.md](docs/estimate_notes.md); parameter names follow GMM-MI where a counterpart exists (`reg_covar`, `threshold_fit`, `threshold_components`, `max_components`, …). `estimate(..., return_fit=True)` additionally returns the selected model for inspection and plotting (`gmm_mi_torch.plotting` has the fitted-ellipse, data-vs-model contour, MI-matrix heatmap and errorbar-validation helpers used in the walkthrough).
+- The full hyperparameter set (selection protocols `'batched'`/`'sequential'`, `metric_method='valid'/'aic'/'bic'`, init types, `preprocess='gaussianise'`, `fixed_components_number`, chunking knobs, …) is documented in the `estimate` and `estimate_categorical` docstrings.
+- Guidance on using `estimate` (component selection, standardisation, preprocessing, initialisation, memory and reproducibility) is in [docs/estimate_notes.md](docs/estimate_notes.md).
+- Parameter names follow GMM-MI where a counterpart exists (`reg_covar`, `threshold_fit`, `threshold_components`, `max_components`, …).
+- `estimate(..., return_fit=True)` additionally returns the selected model for inspection and plotting; `gmm_mi_torch.plotting` has the fitted-ellipse, data-vs-model contour, MI-matrix heatmap and errorbar-validation helpers used in the walkthrough.
 
 For a guided tour — including the common pitfalls (thresholds, initialisations, hard-boundary data) and how to diagnose them — see [notebooks/walkthrough_and_pitfalls.ipynb](notebooks/walkthrough_and_pitfalls.ipynb), adapted from Davide Piras's GMM-MI walkthrough.
 
@@ -73,11 +76,11 @@ On a 3-component bivariate mixture (N=20 000, `max_components=8`, 50 bootstrap r
 | gmm-mi-torch, CPU float64 | 2.0 s | 0.9 s |
 | gmm-mi-torch, CUDA float32 | 0.21 s | 0.13 s |
 
-On real data at production scale (beta test, October 2026): a 75-pair MI grid between VAE latents and galaxy properties, N = 30,000, `max_components=20`, 100 bootstrap realisations per pair — GMM-MI on 16 CPU cores: 53 min wall-clock; gmm-mi-torch on one A100: 7.5 min at float32, **5.1 min at float64** (114–168× less, counting CPU-core-minutes against GPU-minutes). The two codes' MI values differ by 2σ or more only at MI ≈ 0, where both carry the estimator's positive finite-sample bias, and their bootstrap errorbars match to ~10%. On data-centre GPUs float64 is the faster dtype; the GB10-class caveat below is about rate-limited-fp64 hardware only.
+On real data at production scale (beta test, October 2026): the MI of each of 75 pairs of variables, the latent variables of a variational autoencoder against galaxy properties (as in [Van den Bussche et al. 2026](https://arxiv.org/abs/2606.11308)), N = 30,000, `max_components=20`, 100 bootstrap realisations per pair — GMM-MI on 16 CPU cores: 53 min wall-clock; gmm-mi-torch on one A100: 7.5 min at float32, **5.1 min at float64** (114–168× less, counting CPU-core-minutes against GPU-minutes). The two codes' MI values differ by 2σ or more only at MI ≈ 0, where both carry the estimator's positive finite-sample bias, and their bootstrap errorbars match to ~10%. On data-centre GPUs float64 is the faster dtype; the GB10-class caveat below is about hardware with slow float64 only.
 
-On GPUs with rate-limited fp64 throughput (e.g. GB10), CUDA fp64 is slower than CPU fp64 — use fp32 on such devices (validated: the full test suite passes at fp32). On data-centre GPUs with full-rate fp64 (A100/H100/GH200 class), float64 costs about the same as float32, or less, and avoids all reduced-precision caveats — prefer it there, especially for near-zero MI or spike-like marginals.
+On GPUs whose float64 arithmetic runs much slower than their float32 (the GB10 and consumer cards), CUDA float64 is slower than CPU float64 — use float32 there (the full test suite passes at float32). On data-centre GPUs, where float64 runs at full speed (A100 and H100, including the GH200), float64 costs about the same as float32, or less, and avoids all reduced-precision caveats — prefer it there, especially for near-zero MI or spike-like marginals.
 
-The EM inner loop evaluates Gaussian log-densities and M-step moments as matrix products (GEMM, general matrix multiply) against per-sample quadratic features — a GMM log-density is a quadratic form in the sample, so scoring N samples against K components is one matrix multiplication, and the M-step moments are the transposed one; see [Machlica, Vaněk & Zajíc (2011)](https://ieeexplore.ieee.org/document/6118944) for the formulation. The numerical safeguards follow [Chan, Golub & LeVeque (1983)](https://www.tandfonline.com/doi/abs/10.1080/00031305.1983.10483115); they are described in [docs/design_notes.md](docs/design_notes.md) ("GEMM-formulated EM kernels").
+The EM inner loop evaluates Gaussian log-densities and M-step moments as matrix products (GEMM, general matrix multiply) against per-sample quadratic features (each sample's coordinates and their pairwise products) — a GMM log-density is a quadratic form in the sample, so scoring N samples against K components is one matrix multiplication, and the M-step moments are the transposed one; see [Machlica, Vaněk & Zajíc (2011)](https://ieeexplore.ieee.org/document/6118944) for the formulation. The numerical safeguards follow [Chan, Golub & LeVeque (1983)](https://www.tandfonline.com/doi/abs/10.1080/00031305.1983.10483115); they are described in [docs/design_notes.md](docs/design_notes.md) ("GEMM-formulated EM kernels").
 
 A second implementation of the EM step, which subtracts each component's mean from the samples before evaluating the quadratic form, is selected with `GMM_MI_TORCH_EM_KERNEL=legacy`; the warnings and the design notes call it the legacy kernels. The default kernels are roughly 3× faster per EM iteration on GPU and 2× on CPU (measured at v0.2.0), and at float64 the two give the same results up to the order of floating-point summation. Inputs are standardised internally (estimates are invariant; fitted models are returned in original units), which also removes float32 factorisation failures on unstandardised data.
 
@@ -141,7 +144,7 @@ This is also available as a runnable file: [`examples/mi_grid_multigpu.py`](exam
 ## Documentation
 
 The API reference in `docs/api/`, one page per module, is generated from the docstrings
-(`python docs/make_api_docs.py`, which needs the `docs` extra):
+(`python docs/make_api_docs.py`; `pip install ".[docs]"` installs what it needs):
 
 - [docs/api/estimator.md](docs/api/estimator.md): `estimate`, `estimate_categorical`, `FittedGMM`
 - [docs/api/em.md](docs/api/em.md): `em_fit`, `val_ll`
@@ -159,10 +162,10 @@ measurements behind its constants.
 
 Mechanisms and measurements for each are in [docs/design_notes.md](docs/design_notes.md).
 
-- GMM MI estimates carry a positive finite-sample bias that the bootstrap errorbar does not include; below 100 samples the estimator warns.
-- Heavily tied or zero-inflated data are not fitted reliably under any tie convention; `preprocess='none'` is the more reliable choice there.
-- On CUDA, same-seed runs agree only to floating-point rounding unless `em_chunk` and `mc_chunk` are set to integers and no out-of-memory retry occurs. A CPU run is the bit-reproducible setting, with one float32 exception described in [docs/estimate_notes.md](docs/estimate_notes.md).
-- On CUDA with N ≤ 2^24, the bootstrap resample weights carry a fixed per-sample factor with a standard deviation of 0.02 at N=1e6, rising to about 0.24 near N=1e7; the CPU resample has none.
+- MI estimates from a GMM fit carry a positive finite-sample bias that the bootstrap errorbar does not include; below 100 samples the estimator warns.
+- Data with many repeated values, or with a large share of exact zeros, are not fitted reliably by a GMM, however `preprocess='gaussianise'` ranks the repeats; `preprocess='none'` is the more reliable choice there.
+- On CUDA, two runs with the same seed agree only to floating-point rounding, unless `em_chunk` and `mc_chunk` are set to integers and neither run meets a CUDA out-of-memory error (after one, the batch is halved and the stage repeated). A CPU run reproduces bit for bit, with one float32 exception described in [docs/estimate_notes.md](docs/estimate_notes.md).
+- On CUDA with N ≤ 2^24, the bootstrap does not draw every sample with exactly equal probability: each sample's probability differs from 1/N by a fixed factor, with a standard deviation of 0.02 at N=1e6, rising to about 0.24 near N=1e7. The CPU resample is uniform.
 - Run parallel estimates in processes, not threads: each call sets torch's float32 matrix-multiplication precision for the whole process while it runs.
 - `estimate_categorical` holds the category proportions fixed across bootstrap replicates, so its errorbar excludes their sampling uncertainty.
 - **torch 2.13 without the Python development headers.** torch 2.13.0 evaluates GPU matrix products of the form (n×1)·(1×m), which include every 1×1 product, with a kernel that it compiles at first use, and the compilation needs `Python.h`. Where the header is missing, fits of one-dimensional data on CUDA, which include every `estimate_categorical` call, fail inside torch with a `subprocess.CalledProcessError`. Install the Python development headers (for example the `python3-dev` package), or set `TORCH_DISABLE_NATIVE_JIT=1` before importing torch. MI, KL, cMI and TC fits of two or three columns were unaffected in tests with the default kernels. Observed with torch 2.13.0+cu130 on the GB10; torch 2.11.0 is unaffected.
@@ -175,7 +178,7 @@ pytest                                                    # CPU, float64
 GMM_MI_DEVICE=cuda GMM_MI_DTYPE=float32 GMM_MI_EM_CHUNK=1000 pytest   # GPU, float32
 ```
 
-A CPU-only run skips two gated tests and nine that need a CUDA device; [tests/README.md](tests/README.md) lists them.
+A CPU-only run skips two tests that run only when an environment variable is set, and nine that need a CUDA device; [tests/README.md](tests/README.md) lists them.
 
 For most readers, [docs/validation_summary.pdf](docs/validation_summary.pdf) is the right entry point to the validation results. The [validation/](validation/) directory holds the full working report from the port's GB10 acceptance run and the benchmark scripts behind it ([validation/README.md](validation/README.md) explains its contents and provenance).
 

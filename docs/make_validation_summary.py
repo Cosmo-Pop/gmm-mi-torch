@@ -178,7 +178,8 @@ A(Paragraph(
     'in one pass what sklearn does across loops. Hardware caveat: on GPUs '
     'with rate-limited float64 throughput (such as the GB10), CUDA float64 '
     'is slower than CPU float64 - use float32 there. On data-centre GPUs '
-    '(A100/H100/GH200 class) float64 costs about the same as float32, or '
+    '(A100 and H100, including the GH200) float64 costs about the same as '
+    'float32, or '
     'less, and is the recommended dtype.', BODY))
 
 A(Paragraph('6. Large-N scaling (n_chunk)', H1))
