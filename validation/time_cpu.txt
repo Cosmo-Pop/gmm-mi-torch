@@ -1,4 +1,4 @@
-	Command being timed: "env PYTHONPATH=/tmp/claude-35026/-home-hvp20-GMM-MI-torch-port/db67f6ea-30a3-4841-a52c-b1c288b3838d/scratchpad/pylibs /home/hvp20/archie/bin/python -m pytest test_torch_gmm_mi.py -q"
+	Command being timed: "env PYTHONPATH=<test libraries> python -m pytest test_torch_gmm_mi.py -q"
 	User time (seconds): 469.98
 	System time (seconds): 215.88
 	Percent of CPU this job got: 1302%

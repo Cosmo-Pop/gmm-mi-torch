@@ -34,7 +34,7 @@ cd gmm-mi-torch
 pip install .
 ```
 
-The only runtime dependency is `torch`. `numpy` arrays are accepted as input, but `numpy` is not installed with the package; the Quickstart below needs it, and so does `estimate_categorical` when the category labels are strings (`pip install numpy`). The plotting helpers need `numpy`, `matplotlib` and `scipy` (`pip install ".[plot]"`), and the tests need `pytest`, `numpy >= 2.0` and `scipy` (`pip install -e ".[test]"`).
+The only runtime dependency is `torch`. The package declares Python 3.9 and torch 2.0 as its minimum versions; it is tested on Python 3.12 with torch 2.11 and torch 2.13. `numpy` arrays are accepted as input, but `numpy` is not installed with the package; the Quickstart below needs it, and so does `estimate_categorical` when the category labels are strings (`pip install numpy`). The plotting helpers need `numpy`, `matplotlib` and `scipy` (`pip install ".[plot]"`), and the tests need `pytest`, `numpy >= 2.0` and `scipy` (`pip install -e ".[test]"`).
 
 ## Quickstart
 

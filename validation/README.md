@@ -22,7 +22,8 @@ of the versions stated there.
 - `bench.py`, `bench_scale.py`, `bench_nchunk.py` — benchmark scripts behind
   the report's timing/memory tables.
 - `time_cpu.txt`, `time_cuda.txt` — `/usr/bin/time -v` logs of the final full
-  suite runs (CPU float64 and CUDA float32).
+  suite runs (CPU float64 and CUDA float32); the local paths in their command
+  lines are replaced by placeholders.
 
 ## Throughput scoping (August 2026)
 

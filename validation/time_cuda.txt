@@ -1,4 +1,4 @@
-	Command being timed: "env GMM_MI_DEVICE=cuda GMM_MI_DTYPE=float32 GMM_MI_EM_CHUNK=1000 PYTHONPATH=/tmp/claude-35026/-home-hvp20-GMM-MI-torch-port/db67f6ea-30a3-4841-a52c-b1c288b3838d/scratchpad/pylibs /home/hvp20/archie/bin/python -m pytest test_torch_gmm_mi.py -q"
+	Command being timed: "env GMM_MI_DEVICE=cuda GMM_MI_DTYPE=float32 GMM_MI_EM_CHUNK=1000 PYTHONPATH=<test libraries> python -m pytest test_torch_gmm_mi.py -q"
 	User time (seconds): 10.07
 	System time (seconds): 1.32
 	Percent of CPU this job got: 135%
