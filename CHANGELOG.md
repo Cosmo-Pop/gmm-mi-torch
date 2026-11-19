@@ -4,6 +4,38 @@ For each release: what changed for a user, and whether results at a fixed
 seed change. The record of how each release was verified is in this file
 as it stood at the tag `v0.11.2` (`git show v0.11.2:CHANGELOG.md`).
 
+## 0.11.5 (2026-11-19)
+
+A fix for fits on a GPU under torch 2.13. Fixed-seed results are
+unchanged, on CPU and on CUDA.
+
+- Under torch 2.13.0, on a system without the Python development headers
+  (`Python.h`), versions up to 0.11.4 fail on CUDA with a
+  `subprocess.CalledProcessError` raised inside torch in these cases: every
+  fit of one-dimensional data, which includes every `estimate_categorical`
+  call, on either kernel; with the default kernels, a fit of two or more
+  columns at float32 when the number of samples, or the length of a
+  streamed chunk (`n_chunk`), is one more than a multiple of 512 (for
+  example N = 1025), and at float64 when a streamed chunk has a single
+  sample. torch 2.13.0 evaluates every GPU matrix product whose inner
+  dimension is 1 with a kernel that it compiles at first use, and the
+  compilation needs the headers; once compiled, the kernel is cached, so
+  the failure appears only where it has never been built. With those
+  versions, install the headers (for example the `python3-dev` package),
+  or set `TORCH_DISABLE_NATIVE_JIT=1` before importing torch. 0.11.5 needs
+  neither.
+- The six matrix products in the package whose inner dimension can be 1
+  are computed elementwise on a GPU, through one private helper; on a GPU
+  this gives the same values bit for bit, and on CPU the matrix product is
+  kept. `docs/design_notes.md` lists the six products; its section is now
+  called "torch 2.13 and fits on CUDA".
+- Three new tests: the elementwise form against the matrix product, and
+  two that need a CUDA device and check that a one-dimensional fit, and
+  two-column fits with a one-sample block or chunk, issue no GPU matrix
+  product whose inner dimension is 1. The README and `tests/README.md`
+  count eleven tests that need a CUDA device.
+- README: the Known limitations item on torch 2.13 is removed.
+
 ## 0.11.4 (2026-11-18)
 
 Documentation, docstrings and one local variable's name. No behaviour
