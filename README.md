@@ -168,7 +168,6 @@ Mechanisms and measurements for each are in [docs/design_notes.md](docs/design_n
 - On CUDA with N ≤ 2²⁴, the bootstrap does not draw every sample with exactly equal probability: each sample's probability differs from 1/N by a fixed factor, with a standard deviation of 0.02 at N=10⁶, rising to about 0.24 near N=10⁷. The CPU resample is uniform.
 - Run parallel estimates in processes, not threads: each call sets torch's float32 matrix-multiplication precision for the whole process while it runs.
 - `estimate_categorical` holds the category proportions fixed across bootstrap replicates, so its errorbar excludes their sampling uncertainty.
-- **torch 2.13 without the Python development headers.** torch 2.13.0 evaluates GPU matrix products of the form (n×1)·(1×m), which include every 1×1 product, with a kernel that it compiles at first use, and the compilation needs `Python.h`. Where the header is missing, fits of one-dimensional data on CUDA, which include every `estimate_categorical` call, fail inside torch with a `subprocess.CalledProcessError`. Install the Python development headers (for example the `python3-dev` package), or set `TORCH_DISABLE_NATIVE_JIT=1` before importing torch. MI, KL, cMI and TC fits of two or three columns were unaffected in tests with the default kernels. Observed with torch 2.13.0+cu130 on the GB10; torch 2.11.0 is unaffected.
 
 ## Tests
 

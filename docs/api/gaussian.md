@@ -11,7 +11,7 @@ component log-densities, mixture scores, sampling and analytic marginals.
 
 ---
 
-<a href="../../gmm_mi_torch/gaussian.py#L101"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/gaussian.py#L128"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `log_gauss`
 
@@ -39,7 +39,7 @@ X: (R,N,d), mu: (R,K,d), chol: (R,K,d,d) lower.  Returns (R,N,K).
 
 ---
 
-<a href="../../gmm_mi_torch/gaussian.py#L131"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/gaussian.py#L158"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `gmm_score`
 
@@ -64,7 +64,7 @@ Mixture log-density of X under each replicate.
 
 ---
 
-<a href="../../gmm_mi_torch/gaussian.py#L153"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/gaussian.py#L180"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `gmm_sample`
 
@@ -90,7 +90,7 @@ Draw samples from each replicate's mixture.
 
 ---
 
-<a href="../../gmm_mi_torch/gaussian.py#L182"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/gaussian.py#L209"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `marginal_params`
 
@@ -119,7 +119,7 @@ exactly consistent with the joint fit.
 
 ---
 
-<a href="../../gmm_mi_torch/gaussian.py#L207"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../../gmm_mi_torch/gaussian.py#L234"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>function</kbd> `marginal_score`
 

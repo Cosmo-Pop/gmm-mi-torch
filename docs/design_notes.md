@@ -80,7 +80,8 @@ batched torch.matmul over (R, nb) against a (1, nb, b, q) F, which expanded
 and copied F R times (q/K responsibility buffers every M-step, 23x at d=8,
 K=2) and copied wr too whenever N % block != 0. The tail block stays a 3-D
 broadcast matmul that copies nothing: a folded-row tail would add a copy of
-its own and change the tail-only regime's summation order.
+its own and change the tail-only regime's summation order. On a GPU a tail of
+one sample is computed elementwise (see "torch 2.13 and fits on CUDA").
 
 ## Memory models
 
@@ -271,31 +272,82 @@ calls' matmuls at full precision, and the save/restore can race with theirs.
 Use processes, not threads, for parallel estimates (see
 `examples/mi_grid_multigpu.py`).
 
-## torch 2.13 and one-dimensional fits on CUDA
+## torch 2.13 and fits on CUDA
 
 torch 2.13.0 overrides the CUDA batched matrix product for operands of
-shapes (B, n, 1) and (B, 1, m) with a kernel written in Triton
-(`torch/_native/ops/bmm_outer_product`), which is compiled at first use.
-The compilation builds a small C module that includes `Python.h`; where the
-header is missing, torch raises `subprocess.CalledProcessError` and does not
-fall back to its ordinary product. A bare `torch.bmm` of those shapes fails
-in the same way. torch keeps the compiled kernel in a cache
-(`~/.triton/cache` by default), so the failure appears only where the
-kernel has not been compiled before.
+shapes (B, n, 1) and (B, 1, m), that is, whenever the inner dimension is
+1, with a kernel written in Triton (`torch/_native/ops/bmm_outer_product`),
+which is compiled at first use. The compilation builds a small C module
+that includes `Python.h`; where the header is missing, torch raises
+`subprocess.CalledProcessError` and does not fall back to its ordinary
+product. A bare `torch.bmm` of those shapes fails in the same way. torch
+keeps the compiled kernel in a cache (`~/.triton/cache` by default), so the
+failure appears only where the kernel has not been compiled before. CPU
+products are not affected.
 
-A 1×1 product has those shapes, so a fit with d = 1 reaches the kernel
-through three products: `Y^T Y` and `P mu` in `_gauss_coef`, and
-`chol eps` in `gmm_sample`. With the default kernels, fits with d = 2 and
-d = 3 (MI and KL; cMI and TC) did not reach it; the legacy kernels were not
-tested.
+Six matrix products in the package can have an inner dimension of 1:
 
-Measured on the GB10 with torch 2.13.0+cu130, GPU float32 suite of 133
-tests: 118 passed, 14 failed and 1 skipped without the header, every
-failure in a test that calls `estimate_categorical`; 132 passed and 1
-skipped with the header on the compiler's search path; and 132 passed and 1
-skipped with `TORCH_DISABLE_NATIVE_JIT=1`, torch's switch that leaves the
-override unregistered. Under torch 2.11.0+cu128 the same fits run without
-either.
+| Function | Product | Inner dimension 1 when |
+|---|---|---|
+| `_gauss_coef` (`em.py`) | `Y^T Y`, the precision matrix | d = 1; default kernels |
+| `_gauss_coef` | `P mu` | d = 1; default kernels |
+| `_moment_gemm` (`em.py`), float64 | `wr^T F`, the M-step moments | a streamed chunk has one sample; default kernels |
+| `_moment_gemm`, float32 | `wr^T F` on the samples after the last full block of 512 | the number of samples, or a streamed chunk's length, is one more than a multiple of 512; default kernels |
+| `_init_params` (`em.py`), `randomized_kmeans` | `L eps`, the random shift of the means | d = 1; both kernels |
+| `gmm_sample` (`gaussian.py`) | `chol eps` | d = 1, in every Monte Carlo stage; both kernels |
+
+Up to version 0.11.4 these were ordinary matrix products, so under torch
+2.13 without the header every fit of one-dimensional data on CUDA failed
+(every `estimate_categorical` call among them). With the default kernels
+so did a fit of two or more columns at float32 when N mod 512 = 1 (N =
+1025, for example) or a streamed chunk's length was one more than a
+multiple of 512, and at float64 when a streamed chunk had a single sample.
+The list
+comes from a survey under torch 2.13 in which torch's kernel was replaced
+by a recorder of the calling line: over the GPU test suite at float32 and
+float64 on both kernels, and 52 further cases (one-sample tails and chunks,
+K = 1, every `init_type` at d = 1 and d = 2, both protocols, every
+quantity, `return_fit`), these six lines reached it and no others. The
+other matrix products cannot take the shape: `F @ coef^T` has inner
+dimension q = d + d(d+1)/2 ≥ 2, and the blocked moment product has inner
+dimension 512.
+
+Since version 0.11.5 the six products go through one helper, `_matmul` in
+`gaussian.py`. On a GPU, when the left operand's last dimension is 1, it
+returns the broadcast elementwise product `a * b`; otherwise it returns
+`a @ b`. With an inner dimension of 1 every element of the product is a single
+term, so no sum is taken, and the elementwise product has the same shape
+and the same values. Under torch 2.11 on the GB10, `torch.matmul(a, b)` and
+`a * b` on the GPU agreed bit for bit on the five operand shapes of the six
+lines, at float32 and float64: 84,000 elements per dtype, drawn over forty
+decades of magnitude, with and without zeros of both signs, infinities,
+NaN and subnormal numbers. On CPU the two differ in the sign of an exact
+zero (the matrix product returns +0), and CPU products are not affected by
+the override, so the helper keeps the matrix product there and CPU results
+are unchanged by construction. Version 0.11.5 reproduces the results of
+0.11.4 bit for bit, on CUDA and on CPU, on both kernels, over fits that
+reach every one of the six lines (`estimate_categorical`; `em_fit`,
+`val_ll`, `gmm_sample` and `randomized_kmeans` at d = 1; two-column fits
+with N = 1025 and with a last chunk of one sample).
+
+Two tests that need a CUDA device check, with a dispatch spy
+(`torch.utils._python_dispatch.TorchDispatchMode`, which sees the products
+torch actually issues), that a one-dimensional fit and two-column fits
+with a one-sample block or chunk issue no matrix product whose inner
+dimension is 1. Which products torch sends to which kernel is torch's
+choice and can change between versions, so the project's release checks
+also run the GPU test suite under torch 2.13 without the header.
+
+Measured on the GB10 with torch 2.13.0+cu130, without the header and with
+an empty kernel cache: version 0.11.4 failed 14 tests of its GPU suite of
+133 at float32 and at float64, with the default and with the legacy
+kernels, every failure in a test that calls `estimate_categorical`; its
+float32 suite passed with the header on the compiler's search path, and
+with `TORCH_DISABLE_NATIVE_JIT=1`, torch's switch that leaves the override
+unregistered. Version 0.11.5 passes its GPU suite of 136 in all four runs
+with neither: 135 passed and 1 skipped with the default kernels, 133 passed
+and 3 skipped with the legacy kernels, at both dtypes. torch 2.11.0+cu128
+has no such override.
 
 ## Notes on individual constants and functions
 
