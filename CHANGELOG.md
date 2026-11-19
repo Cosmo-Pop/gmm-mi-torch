@@ -4,9 +4,9 @@ For each release: what changed for a user, and whether results at a fixed
 seed change. The record of how each release was verified is in this file
 as it stood at the tag `v0.11.2` (`git show v0.11.2:CHANGELOG.md`).
 
-## Unreleased
+## 0.11.6 (2026-11-19)
 
-Documentation only.
+Documentation only. Fixed-seed results are unchanged.
 
 - README: the versions the package is tested on (Python 3.12 with torch
   2.11 and torch 2.13), beside the declared minimums.
