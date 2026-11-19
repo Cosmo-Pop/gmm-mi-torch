@@ -183,7 +183,7 @@ A CPU-only run skips two tests that run only when an environment variable is set
 
 ## Acknowledgements
 
-Benedict Van Den Bussche beta-tested the port extensively on production-scale astrophysical MI grids against the reference implementation; the chunk auto-sizing, the float32 robustness fixes and the validation numbers quoted above all trace back to his reports. Davide Piras reviewed the repository and road-tested the examples.
+Benedict Van Den Bussche beta-tested the port extensively on production-scale astrophysical MI grids against the reference implementation; the chunk auto-sizing, the float32 robustness fixes and the validation numbers quoted above all trace back to his reports. Davide Piras reviewed the repository and road-tested the examples. Gurjeet Jagwani and Stephen Thorp reviewed the documentation.
 
 ## License and attribution
 

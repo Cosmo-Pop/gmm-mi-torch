@@ -12,6 +12,8 @@ Documentation only.
   2.11 and torch 2.13), beside the declared minimums.
 - `validation/time_cpu.txt` and `validation/time_cuda.txt`: the local
   paths in their command lines are replaced by placeholders.
+- README, Acknowledgements: Gurjeet Jagwani and Stephen Thorp, for their
+  review of the documentation.
 
 ## 0.11.5 (2026-11-19)
 
