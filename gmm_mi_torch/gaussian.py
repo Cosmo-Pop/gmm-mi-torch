@@ -13,6 +13,33 @@ from .constants import LOG2PI
 # batched Gaussian machinery
 # ----------------------------------------------------------------------
 
+def _matmul(a, b):
+    """
+    Matrix product, elementwise on a GPU when the inner dimension is 1.
+
+    Used at the products whose inner dimension can be 1. Such a product
+    has one term per element, so on a GPU the broadcast product a * b,
+    which has the same shape and the same values, is used in its place;
+    on CPU the matrix product is kept.
+
+    Parameters
+    ----------
+    a : torch.Tensor of shape (..., n, p)
+        Left operand.
+    b : torch.Tensor of shape (..., p, m)
+        Right operand, broadcastable against a as for `torch.matmul`.
+
+    Returns
+    -------
+    torch.Tensor of shape (..., n, m)
+        The product a @ b.
+    """
+    # outer products on a GPU; design notes: "torch 2.13 and fits on CUDA"
+    if a.is_cuda and a.shape[-1] == 1:
+        return a * b
+    return a @ b
+
+
 def _chol(cov, return_repaired=False):
     """
     Cholesky of (R,K,d,d) covariances; returns (chol, cov).
@@ -176,7 +203,7 @@ def gmm_sample(w, mu, chol, n_samples, generator=None):
         chol, 1, idx[..., None, None].expand(R, n_samples, d, d))
     eps = torch.randn(R, n_samples, d, dtype=mu.dtype, device=mu.device,
                       generator=generator)
-    return mu_s + (chol_s @ eps.unsqueeze(-1)).squeeze(-1)
+    return mu_s + _matmul(chol_s, eps.unsqueeze(-1)).squeeze(-1)
 
 
 def marginal_params(mu, cov, idx):

@@ -14,7 +14,7 @@ from .precision import _full_precision
 from .chunking import (
     _WeightChunks, _as_weight_chunks, _init_sample_chunk,
     _legacy_sample_chunk, _n_rows, _rows, _run_chunked)
-from .gaussian import _chol, gmm_score, log_gauss
+from .gaussian import _chol, _matmul, gmm_score, log_gauss
 
 
 # ----------------------------------------------------------------------
@@ -116,10 +116,10 @@ def _gauss_coef(w, mu, cov):
     d = cov.shape[-1]
     L, _ = _chol(cov)
     Y = _tri_inv(L)
-    P = (Y.transpose(-2, -1) @ Y).double()                 # (R,K,d,d)
+    P = _matmul(Y.transpose(-2, -1), Y).double()          # (R,K,d,d)
     logdet = torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1).double()
     mu64 = mu.double()
-    Pm = (P @ mu64.unsqueeze(-1)).squeeze(-1)              # (R,K,d)
+    Pm = _matmul(P, mu64.unsqueeze(-1)).squeeze(-1)       # (R,K,d)
     c = (mu64 * Pm).sum(-1)                                # (R,K)
     iu = torch.triu_indices(d, d, device=cov.device)
     off = (iu[0] != iu[1]).to(P.dtype)
@@ -289,7 +289,7 @@ def _moment_gemm(wr, F):
     R, N, K = wr.shape
     q = F.shape[-1]
     if F.dtype == torch.float64:
-        return torch.matmul(wr.transpose(1, 2), F.unsqueeze(0))
+        return _matmul(wr.transpose(1, 2), F.unsqueeze(0))
     nb = N // _MSTEP_BLOCK
     S = torch.zeros(R, K, q, dtype=torch.float64, device=F.device)
     if nb > 0:
@@ -304,7 +304,7 @@ def _moment_gemm(wr, F):
         # folded-row tail would add a copy of its own and change the
         # tail-only regime's summation order)
         N0 = nb * _MSTEP_BLOCK
-        S += torch.matmul(wr[:, N0:].transpose(1, 2), F[N0:].unsqueeze(0)).double()
+        S += _matmul(wr[:, N0:].transpose(1, 2), F[N0:].unsqueeze(0)).double()
     return S
 
 
@@ -824,7 +824,7 @@ def _init_params(X, K, R, reg_covar, generator=None, active_k=None,
             eps = torch.randn(R, K, d, dtype=dt, device=dev,
                               generator=generator)
             L, cov = _chol(cov)
-            push = (L @ eps.unsqueeze(-1)).squeeze(-1)
+            push = _matmul(L, eps.unsqueeze(-1)).squeeze(-1)
             mu = torch.where((w > 0)[..., None], mu + s * push, mu)
         return w, mu, cov
 

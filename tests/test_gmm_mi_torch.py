@@ -3434,3 +3434,123 @@ def test_hoisted_mc_stage_categorical():
                            full[1:3])
         total += full
     assert (total > 0).all()                     # well-separated categories
+
+
+# the products whose inner dimension can be 1 (gaussian._matmul): their
+# operand shapes, as given to the matrix product
+_OUTER_PRODUCT_SHAPES = (
+    ((7, 5, 1), (7, 1, 3)),          # (B,n,1) @ (B,1,m)
+    ((4, 3, 1, 1), (4, 3, 1, 1)),    # d = 1: Y^T Y, P mu, L eps
+    ((9, 1, 1), (9, 1, 1)),          # d = 1: chol eps in gmm_sample
+    ((4, 3, 1), (1, 1, 5)),          # a chunk or tail of one sample
+    ((4, 3, 1), (1, 1, 2)),          # the same, d = 1
+)
+
+
+def _bits(x):
+    x = x.contiguous().view(-1)
+    return x.view(torch.int32 if x.dtype == torch.float32 else torch.int64)
+
+
+def test_matmul_helper_matches_matmul():
+    # the elementwise form of an outer product, and gaussian._matmul, equal
+    # torch.matmul bit for bit on every device present. The reference is
+    # the CPU product: on a GPU, torch 2.13 sends these shapes to a kernel
+    # it compiles at first use, which this test must not depend on, and the
+    # CPU product of one term is the correctly rounded product, as is the
+    # elementwise one on either device
+    g = torch.Generator().manual_seed(0)
+    devices = ['cpu'] + (['cuda'] if torch.cuda.is_available() else [])
+    for dev in devices:
+        for dt in (torch.float32, torch.float64):
+            for sa, sb in _OUTER_PRODUCT_SHAPES:
+                for _ in range(20):
+                    a = torch.randn(*sa, dtype=dt, generator=g)
+                    b = torch.randn(*sb, dtype=dt, generator=g)
+                    ref = torch.matmul(a, b)
+                    a_d, b_d = a.to(dev), b.to(dev)
+                    for got in (a_d * b_d, gaussian._matmul(a_d, b_d)):
+                        got = got.cpu()
+                        assert got.shape == ref.shape and got.dtype == dt
+                        assert torch.equal(_bits(got), _bits(ref))
+
+
+def _outer_products_on_cuda(fn):
+    """
+    Run fn and record the CUDA matrix products with inner dimension 1 that
+    the package issues.
+
+    Parameters
+    ----------
+    fn : callable
+        Called with no arguments.
+
+    Returns
+    -------
+    collections.Counter
+        Counts keyed by the package line that issued the product.
+    """
+    import collections
+    import traceback
+    from torch.utils._python_dispatch import TorchDispatchMode
+    pkg = os.path.dirname(os.path.abspath(gaussian.__file__)) + os.sep
+    # torch 2.11 lowers a broadcast product to aten::mm, torch 2.13 sent
+    # the same product to aten::bmm; for the add forms the first matrix
+    # is the second argument
+    first = {'aten::mm': 0, 'aten::bmm': 0, 'aten::addmm': 1,
+             'aten::baddbmm': 1}
+    sites = collections.Counter()
+
+    class Spy(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            i = first.get(func._schema.name)
+            if i is not None and args[i].is_cuda and args[i].shape[-1] == 1:
+                fr = [f for f in traceback.extract_stack()
+                      if os.path.abspath(f.filename).startswith(pkg)]
+                key = (f'{os.path.basename(fr[-1].filename)}:{fr[-1].lineno}'
+                       if fr else 'outside the package')
+                sites[f'{func._schema.name} {key}'] += 1
+            return func(*args, **(kwargs or {}))
+
+    with Spy():
+        fn()
+    return sites
+
+
+def test_no_outer_product_matmul_one_dimensional_cuda():
+    # a one-dimensional fit (estimate_categorical) issues no CUDA matrix
+    # product with inner dimension 1: torch 2.13 sends those to a kernel
+    # it compiles at first use, which fails without the Python headers.
+    # randomized_kmeans reaches the initialisation's product as well
+    if not torch.cuda.is_available():
+        pytest.skip('the products in question are CUDA products')
+    rng = np.random.default_rng(4)
+    Y = rng.integers(0, 2, 600)
+    X = rng.normal(2.0 * Y, 1.0)
+    for dt in (torch.float32, torch.float64):
+        out = []
+        sites = _outer_products_on_cuda(lambda: out.append(estimate_categorical(
+            X, Y, max_components=2, n_bootstrap=2, mc_samples=500,
+            init_type='randomized_kmeans', device='cuda', dtype=dt)))
+        assert not sites, (dt, dict(sites))
+        assert np.isfinite(out[0][0])
+
+
+def test_no_outer_product_matmul_one_sample_tail_cuda():
+    # a two-column fit whose M-step meets a block or chunk of one sample
+    # issues no CUDA matrix product with inner dimension 1: at float32,
+    # N mod 512 = 1; at float64, a last streamed chunk of one sample
+    if not torch.cuda.is_available():
+        pytest.skip('the products in question are CUDA products')
+    rng = np.random.default_rng(5)
+    z = rng.normal(size=(1025, 2))
+    X = np.column_stack([z[:, 0], 0.6 * z[:, 0] + 0.8 * z[:, 1]])
+    kw = dict(max_components=2, n_bootstrap=2, mc_samples=500, device='cuda')
+    cases = ((X, dict(dtype=torch.float32)),
+             (X[:1000], dict(dtype=torch.float64, n_chunk=333)))
+    for data, extra in cases:
+        out = []
+        sites = _outer_products_on_cuda(
+            lambda: out.append(estimate(data, 'MI', **kw, **extra)))
+        assert not sites, (extra, dict(sites))
+        assert np.isfinite(out[0][0])
